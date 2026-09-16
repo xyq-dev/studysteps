@@ -1,0 +1,8 @@
+pnpm-lock.yaml
+dist
+coverage
+node_modules
+.vite
+*.tsbuildinfo
+docs/PROJECT_PLAN.docx
+.local

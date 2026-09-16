@@ -1,0 +1,361 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountStatus {
+  ACTIVE
+  LOCKED
+  DISABLED
+  DELETION_PENDING
+  DELETED
+}
+
+enum StudentStatus {
+  ONBOARDING
+  ACTIVE
+  RESTRICTED
+  DELETION_PENDING
+  DELETED
+}
+
+enum AgeBand {
+  UNDER_14
+  AGE_14_TO_17
+  AGE_18_PLUS
+}
+
+enum GuardianRole {
+  PRIMARY_GUARDIAN
+}
+
+enum GuardianLinkStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum SessionScope {
+  GUARDIAN
+  STUDENT
+}
+
+enum ChallengePurpose {
+  SIGN_IN
+  GUARDIAN_STEP_UP
+}
+
+model Account {
+  id           String        @id @default(uuid()) @db.Uuid
+  status       AccountStatus @default(ACTIVE)
+  authVersion  Int           @default(1) @map("auth_version")
+  version      Int           @default(1)
+  lockedUntil  DateTime?     @map("locked_until") @db.Timestamptz(3)
+  disabledAt   DateTime?     @map("disabled_at") @db.Timestamptz(3)
+  deletedAt    DateTime?     @map("deleted_at") @db.Timestamptz(3)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  identities   AuthIdentity[]
+  links        GuardianLink[]
+  createdStudents StudentProfile[] @relation("StudentCreatedBy")
+  ageConfirmedStudents StudentProfile[] @relation("StudentAgeConfirmedBy")
+  grantedConsents ConsentRecord[] @relation("ConsentGrantedBy")
+  withdrawnConsents ConsentRecord[] @relation("ConsentWithdrawnBy")
+  revokedLinks GuardianLink[] @relation("LinkRevokedBy")
+  guardianSessions DeviceSession[] @relation("GuardianSessions")
+  issuedStudentSessions DeviceSession[] @relation("IssuedStudentSessions")
+  challenges   AuthChallenge[]
+  pairings     DevicePairing[]
+
+  @@map("accounts")
+}
+
+model AuthIdentity {
+  id                   String   @id @default(uuid()) @db.Uuid
+  accountId            String   @map("account_id") @db.Uuid
+  kind                 String
+  provider             String
+  encryptedIdentifier  Bytes   @map("encrypted_identifier")
+  encryptionKeyVersion String  @map("encryption_key_version")
+  verifiedAt           DateTime @map("verified_at") @db.Timestamptz(3)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  account              Account  @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  lookups              AuthIdentityLookup[]
+  challenges           AuthChallenge[]
+
+  @@unique([id, provider, kind])
+  @@unique([id, accountId, provider, kind])
+  @@map("auth_identities")
+}
+
+model AuthIdentityLookup {
+  id                   String       @id @default(uuid()) @db.Uuid
+  authIdentityId       String       @map("auth_identity_id") @db.Uuid
+  kind                 String
+  provider             String
+  lookupKeyVersion     String       @map("lookup_key_version")
+  subjectLookupDigest  String       @map("subject_lookup_digest")
+  createdAt            DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  identity             AuthIdentity @relation(fields: [authIdentityId, provider, kind], references: [id, provider, kind], onDelete: Restrict)
+  challenges           AuthChallenge[] @relation("ChallengeLookupAlias")
+
+  @@unique([provider, kind, lookupKeyVersion, subjectLookupDigest])
+  @@unique([authIdentityId, lookupKeyVersion])
+  @@unique([authIdentityId, provider, kind, lookupKeyVersion, subjectLookupDigest])
+  @@map("auth_identity_lookups")
+}
+
+model StudentProfile {
+  id                      String        @id @default(uuid()) @db.Uuid
+  status                  StudentStatus @default(ONBOARDING)
+  nickname                String
+  avatarPresetId          String        @map("avatar_preset_id")
+  ageBand                 AgeBand       @map("age_band")
+  ageConfirmationSource   String        @map("age_confirmation_source")
+  ageConfirmedAt          DateTime      @map("age_confirmed_at") @db.Timestamptz(3)
+  ageConfirmedByAccountId String        @map("age_confirmed_by_account_id") @db.Uuid
+  stageCode               String?       @map("stage_code")
+  schoolSystemCode        String?       @map("school_system_code")
+  gradeCode               String?       @map("grade_code")
+  gradeLabel              String?       @map("grade_label")
+  termCode                String?       @map("term_code")
+  timezone                String        @default("Asia/Shanghai")
+  createdByAccountId      String        @map("created_by_account_id") @db.Uuid
+  version                 Int           @default(1)
+  restrictedAt            DateTime?     @map("restricted_at") @db.Timestamptz(3)
+  deletedAt               DateTime?     @map("deleted_at") @db.Timestamptz(3)
+  createdAt               DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy               Account       @relation("StudentCreatedBy", fields: [createdByAccountId], references: [id], onDelete: Restrict)
+  ageConfirmedBy          Account       @relation("StudentAgeConfirmedBy", fields: [ageConfirmedByAccountId], references: [id], onDelete: Restrict)
+  links                   GuardianLink[]
+  consents                ConsentRecord[]
+  studentSessions         DeviceSession[]
+  pairings                DevicePairing[]
+
+  @@map("student_profiles")
+}
+
+model GuardianLink {
+  id                   String             @id @default(uuid()) @db.Uuid
+  accountId            String             @map("account_id") @db.Uuid
+  studentProfileId     String             @map("student_profile_id") @db.Uuid
+  role                 GuardianRole       @default(PRIMARY_GUARDIAN)
+  permissionSetKey     String             @default("PRIMARY_GUARDIAN_V1") @map("permission_set_key")
+  status               GuardianLinkStatus @default(ACTIVE)
+  activeFrom           DateTime           @default(now()) @map("active_from") @db.Timestamptz(3)
+  revokedAt            DateTime?          @map("revoked_at") @db.Timestamptz(3)
+  revokedByAccountId   String?            @map("revoked_by_account_id") @db.Uuid
+  revocationReasonCode String?            @map("revocation_reason_code")
+  version              Int                @default(1)
+  createdAt            DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  account              Account            @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  student              StudentProfile     @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  revokedBy            Account?           @relation("LinkRevokedBy", fields: [revokedByAccountId], references: [id], onDelete: Restrict)
+  consents             ConsentRecord[]
+  issuedSessions       DeviceSession[]
+  pairings             DevicePairing[]
+
+  @@unique([id, studentProfileId])
+  @@unique([id, studentProfileId, accountId])
+  @@index([accountId, status, studentProfileId])
+  @@index([studentProfileId, status])
+  @@map("guardian_links")
+}
+
+model ConsentPolicy {
+  id                       String                   @id @default(uuid()) @db.Uuid
+  policyKey                String                   @map("policy_key")
+  locale                   String
+  currentDocumentVersionId String?                  @map("current_document_version_id") @db.Uuid
+  version                  Int                      @default(1)
+  createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
+  documents                ConsentDocumentVersion[]
+  records                  ConsentRecord[]
+
+  @@unique([policyKey, locale])
+  @@map("consent_policies")
+}
+
+model ConsentDocumentVersion {
+  id                     String         @id @default(uuid()) @db.Uuid
+  consentPolicyId        String         @map("consent_policy_id") @db.Uuid
+  version                String
+  contentFormat          String         @map("content_format")
+  contentBody            String         @map("content_body")
+  contentDigest          String         @map("content_digest")
+  scopeCanonicalJson     String         @map("scope_canonical_json")
+  scopeDigest            String         @map("scope_digest")
+  scopeSchemaVersion     String         @map("scope_schema_version")
+  digestAlgorithmVersion String         @map("digest_algorithm_version")
+  publishedAt            DateTime?      @map("published_at") @db.Timestamptz(3)
+  createdAt              DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  policy                 ConsentPolicy  @relation(fields: [consentPolicyId], references: [id], onDelete: Restrict)
+  records                ConsentRecord[]
+
+  @@unique([consentPolicyId, version])
+  @@unique([id, consentPolicyId])
+  @@map("consent_document_versions")
+}
+
+model ConsentRecord {
+  id                     String                 @id @default(uuid()) @db.Uuid
+  studentProfileId       String                 @map("student_profile_id") @db.Uuid
+  guardianLinkId         String                 @map("guardian_link_id") @db.Uuid
+  consentPolicyId        String                 @map("consent_policy_id") @db.Uuid
+  documentVersionId      String                 @map("document_version_id") @db.Uuid
+  scopeSnapshot          String                 @map("scope_snapshot")
+  scopeDigest            String                 @map("scope_digest")
+  scopeSchemaVersion     String                 @map("scope_schema_version")
+  digestAlgorithmVersion String                 @map("digest_algorithm_version")
+  ageBandSnapshot        AgeBand                @map("age_band_snapshot")
+  grantedByAccountId     String                 @map("granted_by_account_id") @db.Uuid
+  grantedAt              DateTime               @map("granted_at") @db.Timestamptz(3)
+  withdrawnByAccountId   String?                @map("withdrawn_by_account_id") @db.Uuid
+  withdrawnAt            DateTime?              @map("withdrawn_at") @db.Timestamptz(3)
+  withdrawalReasonCode   String?                @map("withdrawal_reason_code")
+  supersededAt           DateTime?              @map("superseded_at") @db.Timestamptz(3)
+  version                Int                    @default(1)
+  createdAt              DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  student                StudentProfile         @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  link                   GuardianLink           @relation(fields: [guardianLinkId, studentProfileId, grantedByAccountId], references: [id, studentProfileId, accountId], onDelete: Restrict)
+  policy                 ConsentPolicy          @relation(fields: [consentPolicyId], references: [id], onDelete: Restrict)
+  document               ConsentDocumentVersion @relation(fields: [documentVersionId, consentPolicyId], references: [id, consentPolicyId], onDelete: Restrict)
+  grantedBy              Account                @relation("ConsentGrantedBy", fields: [grantedByAccountId], references: [id], onDelete: Restrict)
+  withdrawnBy            Account?               @relation("ConsentWithdrawnBy", fields: [withdrawnByAccountId], references: [id], onDelete: Restrict)
+
+  @@map("consent_records")
+}
+
+model DeviceSession {
+  id                       String         @id @default(uuid()) @db.Uuid
+  scope                    SessionScope
+  accountId                String?        @map("account_id") @db.Uuid
+  studentProfileId         String?        @map("student_profile_id") @db.Uuid
+  issuedByGuardianLinkId   String?        @map("issued_by_guardian_link_id") @db.Uuid
+  issuedByAccountId        String?        @map("issued_by_account_id") @db.Uuid
+  origin                   String
+  credentialDigest         String         @unique @map("credential_digest")
+  csrfDigest               String         @map("csrf_digest")
+  accountAuthVersionAtIssue Int?          @map("account_auth_version_at_issue")
+  issuerAuthVersionAtIssue Int?           @map("issuer_auth_version_at_issue")
+  deviceInstallationDigest String         @map("device_installation_digest")
+  deviceLabel              String?        @map("device_label")
+  authenticatedAt          DateTime       @map("authenticated_at") @db.Timestamptz(3)
+  stepUpVerifiedAt         DateTime?      @map("step_up_verified_at") @db.Timestamptz(3)
+  lastSeenAt               DateTime?      @map("last_seen_at") @db.Timestamptz(3)
+  expiresAt                DateTime       @map("expires_at") @db.Timestamptz(3)
+  revokedAt                DateTime?      @map("revoked_at") @db.Timestamptz(3)
+  revocationReasonCode     String?        @map("revocation_reason_code")
+  replacedBySessionId      String?        @unique @map("replaced_by_session_id") @db.Uuid
+  version                  Int            @default(1)
+  createdAt                DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  account                  Account?       @relation("GuardianSessions", fields: [accountId], references: [id], onDelete: Restrict)
+  student                  StudentProfile? @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  issuedByLink             GuardianLink?  @relation(fields: [issuedByGuardianLinkId, studentProfileId, issuedByAccountId], references: [id, studentProfileId, accountId], onDelete: Restrict)
+  issuedByAccount          Account?       @relation("IssuedStudentSessions", fields: [issuedByAccountId], references: [id], onDelete: Restrict)
+  replacedBy               DeviceSession? @relation("SessionReplacement", fields: [replacedBySessionId], references: [id], onDelete: Restrict)
+  replaces                 DeviceSession[] @relation("SessionReplacement")
+  challenges               AuthChallenge[]
+  createdPairings          DevicePairing[] @relation("PairingCreatedBySession")
+  consumedPairings         DevicePairing[] @relation("PairingConsumedBySession")
+
+  @@unique([id, studentProfileId])
+  @@unique([id, accountId])
+  @@map("device_sessions")
+}
+
+/// GUARDIAN_STEP_UP rows are also checked by trigger ss_auth_challenges_step_up_bound
+/// in migration 20260914170000_stp004_step_up_bound_session.
+/// Parent-key CHECKs (identity/account all-or-nothing; lookup alias complete when
+/// identity is stamped) live in 20260915160000_stp004_parent_keys_cycle_clock.
+model AuthChallenge {
+  id                         String            @id @default(uuid()) @db.Uuid
+  purpose                    ChallengePurpose
+  identityKind               String            @map("identity_kind")
+  provider                   String
+  accountId                  String?           @map("account_id") @db.Uuid
+  authIdentityId             String?           @map("auth_identity_id") @db.Uuid
+  boundSessionId             String?           @map("bound_session_id") @db.Uuid
+  deviceInstallationDigest   String            @map("device_installation_digest")
+  destinationLookupDigest    String            @map("destination_lookup_digest")
+  destinationLookupKeyVersion String           @map("destination_lookup_key_version")
+  encryptedDestination       Bytes?            @map("encrypted_destination")
+  codeDigest                 String            @map("code_digest")
+  codeDigestKeyVersion       String            @map("code_digest_key_version")
+  attemptCount               Int               @default(0) @map("attempt_count")
+  maxAttempts                Int               @default(5) @map("max_attempts")
+  expiresAt                  DateTime          @map("expires_at") @db.Timestamptz(3)
+  consumedAt                 DateTime?         @map("consumed_at") @db.Timestamptz(3)
+  lockedAt                   DateTime?         @map("locked_at") @db.Timestamptz(3)
+  createdAt                  DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  account                    Account?          @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  identity                   AuthIdentity?     @relation(fields: [authIdentityId, accountId, provider, identityKind], references: [id, accountId, provider, kind], onDelete: Restrict)
+  lookup                     AuthIdentityLookup? @relation("ChallengeLookupAlias", fields: [authIdentityId, provider, identityKind, destinationLookupKeyVersion, destinationLookupDigest], references: [authIdentityId, provider, kind, lookupKeyVersion, subjectLookupDigest], onDelete: Restrict, onUpdate: Restrict)
+  boundSession               DeviceSession?    @relation(fields: [boundSessionId], references: [id], onDelete: Restrict)
+
+  @@map("auth_challenges")
+}
+
+model DevicePairing {
+  id                     String         @id @default(uuid()) @db.Uuid
+  studentProfileId       String         @map("student_profile_id") @db.Uuid
+  issuedByGuardianLinkId String         @map("issued_by_guardian_link_id") @db.Uuid
+  createdByAccountId     String         @map("created_by_account_id") @db.Uuid
+  createdBySessionId     String         @map("created_by_session_id") @db.Uuid
+  codeDigest             String         @map("code_digest")
+  digestKeyVersion       String         @map("digest_key_version")
+  attemptCount           Int            @default(0) @map("attempt_count")
+  maxAttempts            Int            @default(5) @map("max_attempts")
+  expiresAt              DateTime       @map("expires_at") @db.Timestamptz(3)
+  consumedAt             DateTime?      @map("consumed_at") @db.Timestamptz(3)
+  consumedBySessionId    String?        @unique @map("consumed_by_session_id") @db.Uuid
+  revokedAt              DateTime?      @map("revoked_at") @db.Timestamptz(3)
+  lockedAt               DateTime?      @map("locked_at") @db.Timestamptz(3)
+  version                Int            @default(1)
+  createdAt              DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  student                StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  link                   GuardianLink   @relation(fields: [issuedByGuardianLinkId, studentProfileId, createdByAccountId], references: [id, studentProfileId, accountId], onDelete: Restrict)
+  createdByAccount       Account        @relation(fields: [createdByAccountId], references: [id], onDelete: Restrict)
+  createdBySession       DeviceSession  @relation("PairingCreatedBySession", fields: [createdBySessionId, createdByAccountId], references: [id, accountId], onDelete: Restrict)
+  consumedBySession      DeviceSession? @relation("PairingConsumedBySession", fields: [consumedBySessionId, studentProfileId], references: [id, studentProfileId], onDelete: Restrict)
+
+  @@unique([digestKeyVersion, codeDigest])
+  @@map("device_pairings")
+}
+
+model IdempotencyRecord {
+  id             String    @id @default(uuid()) @db.Uuid
+  actorScope     String    @map("actor_scope")
+  actorId        String    @map("actor_id")
+  operation      String
+  keyDigest      String    @map("key_digest")
+  requestDigest  String    @map("request_digest")
+  resourceType   String?   @map("resource_type")
+  resourceId     String?   @map("resource_id")
+  responseStatus Int?      @map("response_status")
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  @@unique([actorScope, actorId, operation, keyDigest])
+  @@map("idempotency_records")
+}
+
+model RateLimitBucket {
+  id              String   @id @default(uuid()) @db.Uuid
+  bucketKey       String   @map("bucket_key")
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(3)
+  count           Int
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([bucketKey, windowStartedAt])
+  @@map("rate_limit_buckets")
+}
