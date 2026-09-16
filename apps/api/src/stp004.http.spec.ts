@@ -1,4 +1,8 @@
-import { hasIsolatedPostgres, loadStp004Env } from './test/load-stp004-env';
+import {
+  assertStp004IntegrationReady,
+  loadStp004Env,
+  shouldSkipStp004Isolation,
+} from './test/load-stp004-env';
 import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import request from 'supertest';
@@ -33,12 +37,13 @@ class CookieJar {
   }
 }
 
-describe.skipIf(!hasIsolatedPostgres)('STP 004 HTTP / cookie / CSRF', () => {
+describe.skipIf(shouldSkipStp004Isolation())('STP 004 HTTP / cookie / CSRF', () => {
   let app: INestApplication;
   let inbox: TestAuthDelivery;
 
   beforeAll(async () => {
     loadStp004Env();
+    assertStp004IntegrationReady();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();
     app.use(cookieParser());

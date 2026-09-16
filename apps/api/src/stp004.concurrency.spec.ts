@@ -12,7 +12,11 @@ import { TestAuthDelivery } from './auth/test-delivery.adapter';
 import { PolicyPublishService, TEST_POLICY_SCOPE } from './students/policy-publish.service';
 import { RuntimeConfig } from './common/runtime-config';
 import { digestCanonical, hmacHex, sha256Hex } from './common/crypto';
-import { hasIsolatedPostgres, loadStp004Env } from './test/load-stp004-env';
+import {
+  assertStp004IntegrationReady,
+  loadStp004Env,
+  shouldSkipStp004Isolation,
+} from './test/load-stp004-env';
 import { backendPid, waitForAdvisoryWaiter, waitForWaiterOnHolder } from './test/lock-barrier';
 import { StudentsService } from './students/students.service';
 
@@ -49,7 +53,7 @@ class CookieJar {
   }
 }
 
-describe.skipIf(!hasIsolatedPostgres)('STP 004 business concurrency with overlapping transactions', () => {
+describe.skipIf(shouldSkipStp004Isolation())('STP 004 business concurrency with overlapping transactions', () => {
   let app: INestApplication;
   let inbox: TestAuthDelivery;
   let publisher: PolicyPublishService;
@@ -59,6 +63,7 @@ describe.skipIf(!hasIsolatedPostgres)('STP 004 business concurrency with overlap
 
   beforeAll(async () => {
     loadStp004Env();
+    assertStp004IntegrationReady();
     await prisma.$connect();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();

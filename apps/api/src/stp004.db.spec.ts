@@ -2,13 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import pg from 'pg';
 import { PrismaClient } from '@prisma/client';
-import { hasIsolatedPostgres, loadStp004Env } from './test/load-stp004-env';
+import {
+  assertStp004IntegrationReady,
+  loadStp004Env,
+  shouldSkipStp004Isolation,
+} from './test/load-stp004-env';
 import { digestCanonical } from './common/crypto';
 import { backendPid, waitForWaiterOnHolder } from './test/lock-barrier';
 
 const connectionString = process.env.STP004_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '';
 
-describe.skipIf(!hasIsolatedPostgres)('STP 004 PostgreSQL constraints and overlapping transactions', () => {
+describe.skipIf(shouldSkipStp004Isolation())('STP 004 PostgreSQL constraints and overlapping transactions', () => {
   const prisma = new PrismaClient({ datasourceUrl: connectionString });
   const admin = process.env.STP004_ADMIN_DATABASE_URL
     ? new PrismaClient({ datasourceUrl: process.env.STP004_ADMIN_DATABASE_URL })
@@ -16,6 +20,7 @@ describe.skipIf(!hasIsolatedPostgres)('STP 004 PostgreSQL constraints and overla
 
   beforeAll(async () => {
     loadStp004Env();
+    assertStp004IntegrationReady();
     await prisma.$connect();
     const scope = {
       nickname: true,

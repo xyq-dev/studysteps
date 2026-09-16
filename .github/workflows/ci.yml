@@ -9,7 +9,27 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://studysteps:studysteps@127.0.0.1:5432/studysteps
+      APP_ENV: test
+      AUTH_TEST_MODE: '1'
+      NODE_ENV: test
+      CI_PG_DB: studysteps
+      CI_PG_APP_USER: stp004_api
+      STP004_ADMIN_DATABASE_URL: postgresql://stp004_admin:ci-ephemeral-admin@127.0.0.1:5432/studysteps
+      DATABASE_URL: postgresql://stp004_admin:ci-ephemeral-admin@127.0.0.1:5432/studysteps
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: stp004_admin
+          POSTGRES_PASSWORD: ci-ephemeral-admin
+          POSTGRES_DB: studysteps
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stp004_admin -d studysteps"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +42,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.14.0'
           cache: pnpm
 
       - name: Frozen install
@@ -30,6 +50,9 @@ jobs:
 
       - name: Prisma generate
         run: pnpm prisma:generate
+
+      - name: Prepare isolated PostgreSQL
+        run: node ./scripts/stp004-ci-prepare.mjs
 
       - name: Lint
         run: pnpm lint

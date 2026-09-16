@@ -11,7 +11,11 @@ import { TestAuthDelivery } from './auth/test-delivery.adapter';
 import { StudentsService } from './students/students.service';
 import { PolicyPublishService } from './students/policy-publish.service';
 import { sha256Hex } from './common/crypto';
-import { hasIsolatedPostgres, loadStp004Env } from './test/load-stp004-env';
+import {
+  assertStp004IntegrationReady,
+  loadStp004Env,
+  shouldSkipStp004Isolation,
+} from './test/load-stp004-env';
 
 const ORIGIN = 'http://127.0.0.1:5173';
 const connectionString = process.env.STP004_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '';
@@ -38,7 +42,7 @@ class CookieJar {
   }
 }
 
-describe.skipIf(!hasIsolatedPostgres)('STP 004 Codex review counterexamples 1-8', () => {
+describe.skipIf(shouldSkipStp004Isolation())('STP 004 Codex review counterexamples 1-8', () => {
   let app: INestApplication;
   let inbox: TestAuthDelivery;
   let students: StudentsService;
@@ -47,6 +51,7 @@ describe.skipIf(!hasIsolatedPostgres)('STP 004 Codex review counterexamples 1-8'
 
   beforeAll(async () => {
     loadStp004Env();
+    assertStp004IntegrationReady();
     await prisma.$connect();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();
