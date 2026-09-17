@@ -192,15 +192,25 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 HTTP / cookie / CSRF', () 
     const payload = {
       profile: { nickname: '小树', avatarPresetId: 'avatar-03', timezone: 'Asia/Shanghai', extra: 'ignored' },
       ageConfirmation: { band: 'UNDER_14', source: 'GUARDIAN_DECLARATION' },
-      education: {
-        stageCode: 'primary',
-        schoolSystemCode: 'liusan',
-        gradeCode: 'g3',
-        gradeLabel: '三年级',
-        termCode: '2026-1',
-      },
       consentAcceptances: [{ policyKey: docs.body.policyKey, version: docs.body.version }],
     };
+    const rejectedEducation = await agent()
+      .post('/v1/students')
+      .set('Origin', ORIGIN)
+      .set('Cookie', first.cookies.header())
+      .set('X-CSRF-Token', first.cookies.get('stp_csrf') ?? '')
+      .set('Idempotency-Key', randomUUID())
+      .send({
+        ...payload,
+        education: {
+          stageCode: 'PRIMARY',
+          schoolSystemCode: 'SIX_THREE',
+          gradeCode: 'G3',
+          gradeLabel: '三年级',
+          termCode: 'FULL_YEAR',
+        },
+      });
+    expect(rejectedEducation.status).toBe(400);
     const created = await agent()
       .post('/v1/students')
       .set('Origin', ORIGIN)
@@ -229,25 +239,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 HTTP / cookie / CSRF', () 
     expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
 
     const studentId = created.body.profile.id;
-    const patchedEdu = await agent()
-      .patch(`/v1/students/${studentId}`)
-      .set('Origin', ORIGIN)
-      .set('Cookie', first.cookies.header())
-      .set('X-CSRF-Token', first.cookies.get('stp_csrf') ?? '')
-      .set('Idempotency-Key', randomUUID())
-      .send({
-        kind: 'EDUCATION',
-        expectedVersion: created.body.profile.version,
-        education: {
-          stageCode: 'primary',
-          schoolSystemCode: 'liusan',
-          gradeCode: 'g4',
-          gradeLabel: '四年级',
-          termCode: '2026-1',
-        },
-      });
-    expect(patchedEdu.body.ageBand).toBe('UNDER_14');
-    expect(patchedEdu.body.education.gradeCode).toBe('g4');
+    const createdDetail = await agent().get(`/v1/students/${studentId}`).set('Cookie', first.cookies.header());
+    expect(createdDetail.body.ageBand).toBe('UNDER_14');
+    expect(createdDetail.body.education.gradeConfigId).toBeNull();
+    expect(createdDetail.body.education.gradeCode).toBeNull();
+    expect(createdDetail.body.learningAccess.reason).toBe('ACADEMIC_CONFIGURATION_PENDING');
 
     const other = await signIn('13800138003');
     const hidden = await agent().get(`/v1/students/${studentId}`).set('Cookie', other.cookies.header());

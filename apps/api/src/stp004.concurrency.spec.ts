@@ -281,6 +281,21 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 business concurrency with 
     const baseline = await currentPolicyVersion();
     const { cookies } = await signIn(freshPhone());
     const student = await createStudent(cookies, '授权先完成');
+    const grade = await prisma.gradeConfig.findFirstOrThrow({
+      where: { schoolSystemCode: 'SIX_THREE', stageCode: 'PRIMARY', gradeCode: 'G1' },
+    });
+    const assigned = await agent()
+      .patch(`/v1/students/${student.studentId}`)
+      .set(writeHeaders(cookies))
+      .send({
+        kind: 'EDUCATION',
+        expectedVersion: student.version,
+        gradeConfigId: grade.id,
+        termCode: 'FULL_YEAR',
+        changeKind: 'SET',
+      });
+    expect(assigned.status).toBeLessThan(300);
+    const studentVersion = assigned.body.version as number;
     const link = await prisma.guardianLink.findFirstOrThrow({
       where: { studentProfileId: student.studentId, status: 'ACTIVE' },
     });
@@ -296,7 +311,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 business concurrency with 
         .post(`/v1/students/${student.studentId}/consents`)
         .set(writeHeaders(cookies))
         .send({
-          expectedStudentVersion: student.version,
+          expectedStudentVersion: studentVersion,
           acceptances: [{ policyKey: student.policyKey, version: student.policyVersion }],
         }),
     );

@@ -121,13 +121,6 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 in-phase acceptance matrix
     cookies: CookieJar,
     nickname: string,
     extra: Record<string, unknown> = {},
-    education?: {
-      stageCode: string;
-      schoolSystemCode: string;
-      gradeCode: string;
-      gradeLabel: string;
-      termCode: string;
-    },
   ) {
     const docs = await agent().get('/v1/consent-documents?ageBand=UNDER_14').set('Cookie', cookies.header());
     const created = await agent()
@@ -137,7 +130,6 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 in-phase acceptance matrix
         ...extra,
         profile: { nickname, avatarPresetId: 'avatar-03', timezone: 'Asia/Shanghai' },
         ageConfirmation: { band: 'UNDER_14', source: 'GUARDIAN_DECLARATION' },
-        education,
         consentAcceptances: [{ policyKey: docs.body.policyKey, version: docs.body.version }],
       });
     if (created.status !== 201) {
@@ -169,13 +161,26 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 in-phase acceptance matrix
 
   it('AGE-1 age-band change without new consent restricts and revokes student access', async () => {
     const auth = await signIn();
-    const student = await createStudent(auth.cookies, '跨段', {}, {
-      stageCode: 'primary',
-      schoolSystemCode: 'liusan',
-      gradeCode: 'g3',
-      gradeLabel: '三年级',
-      termCode: '2026-1',
-    });
+    const student = await createStudent(auth.cookies, '跨段');
+    const catalog = await agent().get('/v1/grade-configs').set('Cookie', auth.cookies.header());
+    const grade = catalog.body.items.find(
+      (item: { schoolSystemCode: string; stageCode: string; gradeCode: string }) =>
+        item.schoolSystemCode === 'SIX_THREE' && item.stageCode === 'PRIMARY' && item.gradeCode === 'G3',
+    );
+    expect(grade).toBeTruthy();
+    const latestBeforeAge = await agent().get(`/v1/students/${student.studentId}`).set('Cookie', auth.cookies.header());
+    const educationSet = await agent()
+      .patch(`/v1/students/${student.studentId}`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        kind: 'EDUCATION',
+        expectedVersion: latestBeforeAge.body.version,
+        gradeConfigId: grade.id,
+        termCode: 'FULL_YEAR',
+        changeKind: 'SET',
+      });
+    expect(educationSet.status).toBeLessThan(300);
+    expect(educationSet.body.education.gradeCode).toBe('G3');
     const firstPairing = await issuePairing(auth.cookies, student.studentId);
     const consumed = await agent()
       .post('/v1/auth/session')
@@ -207,7 +212,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 in-phase acceptance matrix
     expect(patched.status).toBeLessThan(300);
     expect(patched.body.status).toBe('RESTRICTED');
     expect(patched.body.ageBand).toBe('AGE_14_TO_17');
-    expect(patched.body.education.gradeCode).toBe('g3');
+    expect(patched.body.education.gradeCode).toBe('G3');
     expect(patched.body.education.gradeLabel).toBe('三年级');
     const stale = await agent().get(`/v1/students/${student.studentId}`).set('Cookie', studentCookies.header());
     expect(stale.status).toBe(401);

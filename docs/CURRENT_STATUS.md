@@ -1,14 +1,30 @@
 # StudySteps 当前状态
 
-更新日期：2026年9月16日
+更新日期：2026年9月17日
 
 ## 状态摘要
 
 文档交接已经完成。STP 003 已在本地建立可重复安装、检查、测试和构建的 TypeScript 工作区骨架。这不等于完成 M0、STP 001 或 STP 002，也不等于接口已冻结或业务功能已验收。
 
-STP 004 **继续进行中，不得标为完成**。不得写“第 1–8 项均修复”。2026-09-15 四项修复及第四条迁移 `20260915160000` 已在 fresh／two-mig **复核通过**（见实施报告第 10–11 节）。2026-09-16 只归档文档，未改业务代码或迁移，未重跑检查。TIME-2 仍只覆盖 idle／absolute／节流刷新。原库污染、既定延期（T02-D、T11-D、T11-3／CON-3 学习写入）、非阻塞测试补强已分册登记，**不**混作本轮四项或第四条迁移的阻塞。原库 `stp004_identity` 只读，expand 与第四条仍未应用于原库。环境检查通过不能代替业务验收。`Implementation Gate = LOCAL_CODE_AUTHORIZED`。
+STP 004 **继续进行中，不得标为完成**。不得写“第 1–8 项均修复”。2026-09-15 四项修复及第四条迁移 `20260915160000` 已在 fresh／two-mig **复核通过**（见实施报告第 10–11 节）。GitHub Actions **CI #1**（run [`35049218151`](https://github.com/xyq-dev/studysteps/actions/runs/35049218151)，SHA `576da3d`）**success**：当时四条迁移已应用、应用角色 `stp004_api` 非超管、api **84 passed / 0 skipped**，五套 STP004 集成测试均执行。CI 绿不能代替 STP 004 业务收口。T02-D 已在 STP 005 本地隔离库与 Playwright 执行，**待 CI 复跑**。STP 005 2026-09-16「四项阻塞已修复」声明已被反例推翻（`created_at` 可伪造取得 leftover 资格；`AGE_BAND_NOT_SUPPORTED` 曾被当成 consentCurrent）。2026-09-17 仅修订未发布的第五／第六条迁移与 activation 失败关闭，**未 commit、未标产品验收**（`docs/STP005_IMPLEMENTATION_REPORT.md` 第 11–12 节）。原库 `stp004_identity` 只读；既有 `stp004_identity_fresh`／`stp005_four_to_six` 仍为旧第五／第六条账本，未 deploy 修订版。本轮测试只打在 `stp005_rev_fresh` 与夹具 `stp005_rev_four_to_six`。`Implementation Gate = LOCAL_CODE_AUTHORIZED`（STP 004 与本轮 STP 005 代码授权；不覆盖 STP 006／009）。
 
 下文「STP 004 实现前审查」是 **2026-09-13 代码开始前快照**（当时 API 仅 `/health`、无业务 Prisma 模型）。它不是当前代码状态。当前实现状态以本段、`docs/TASKS.md` 的 STP 004 条目和上述报告为准。
+
+## 2026-09-16 Git 与 CI
+
+| 项目 | 事实 |
+| --- | --- |
+| 分支 | `main` 跟踪 `origin/main` |
+| HEAD | `576da3da1e8083305b644ddc8fe16bf582b50648` |
+| origin | `https://github.com/xyq-dev/studysteps.git` |
+| Actions | [CI #1](https://github.com/xyq-dev/studysteps/actions/runs/35049218151) success；job `check` 1m 36s |
+| 迁移 | CI #1 日志：四条 STP 004 迁移均 `Applying migration` 后成功；`stp004_api` nosuperuser。工作区现有六条迁移。旧第五／第六条仍只存在于 `stp004_identity_fresh` 与 `stp005_four_to_six`（checksum `3f20970f…`／`fbb1a0e7…`），**未 reset、未改账本**。修订版仅应用到 `stp005_rev_fresh` 与 `stp005_rev_four_to_six`（当时 checksum `2e765521…`／`93ffc8d0…`）。提交文件第五条为去掉末尾多余空行后的 `6f51d8e5…`。GitHub Actions **未跑本轮** |
+| `pnpm test`（CI #1） | domain 10、contracts 6、ui/admin/web 各 1、api **84 passed / 0 skipped**；五套 `stp004.{concurrency,matrix,db,review,http}` 均执行 |
+| `pnpm test`（本机 2026-09-16，历史） | domain 21、contracts 7、ui/admin/web 各 1、api **105 passed / 0 skipped**。当时宣称的「四项已修复」已被 2026-09-17 反例推翻，见实施报告第 11–12 节 |
+| `pnpm test`（本机 2026-09-17 三阻塞修订） | domain 22、contracts 7、ui/admin/web 各 1、api **107 passed / 0 skipped**；目标库 `stp005_rev_fresh`／夹具 `stp005_rev_four_to_six`；exit 0 |
+| STP 005 | 2026-09-16 四项声明不成立。2026-09-17 已固化：伪造更早 `created_at` 不能取得 leftover；脏 assigned／未发布 current 使第六条失败且无版本回填；`AGE_18_PLUS` 与政策查询异常不能得到 ACTIVE／`allowed=true`；合法四→修订五→修订六原元组指纹保持。未 commit。不得标产品验收 |
+
+下方「已核验的工作区事实」表保留 STP 003／审查时快照，其中“无 HEAD／CI 未跑”不是 2026-09-16 现状。
 
 ## STP 004 实现前审查（2026-09-13 历史快照，非当前代码）
 
@@ -104,6 +120,7 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 | `docs/TASKS.md` | 已更新 | STP 003 保持已完成；STP 004 标记为实现前审查完成、代码受阻 |
 | `docs/CURSOR_PROMPTS.md` | 已保留 | 首个代码批次提示词 |
 | `docs/STP004_DESIGN.md` | 已完成 | STP 004 实现前设计、迁移影响、API、安全边界与验收矩阵 |
+| `docs/STP005_DESIGN.md` | 设计基线＋本轮授权后实现对照 | 39 模板、单通道 PATCH、7.7 目录锁；实现证据见 `STP005_IMPLEMENTATION_REPORT.md` |
 | `docs/CURSOR_STP004_PROMPT.md` | 已完成 | 独立的条件式 Cursor 实施提示词；当前门禁仍阻塞 |
 
 `PROJECT_PLAN.md` 的转换核验基线：
@@ -132,9 +149,9 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 | 接手 | 文档转换与任务拆分 | 已完成 | 仅代表文档交付完成 |
 | M0 | STP 001 固定 P0 规则与页面清单 | 进行中（本阶段范围文档已出；全量 M0 未冻结） | 六份专题文档已按 STP 004 范围抽取，不宣称全量评审完成 |
 | M0 | STP 002 关键页面高保真与状态 | 待开始 | 高保真稿未完成 |
-| M1 | STP 003 独立仓库与 CI 基础 | 已完成 | 本地骨架、锁文件与根命令已验收；远端仍为空，CI 未在 GitHub 跑过 |
-| M1 | STP 004 档案与授权基础 | 进行中 | 本阶段第 11 节及 WD／FAIL／RATE／TIME-2／CFG 已有隔离库证据；2026-09-15 四项修复与第四条迁移在 fresh／two-mig 复核通过；2026-09-16 仅文档归档；不得标完成；原库污染／既定延期／非阻塞补强分册登记；不得写“第 1–8 项均修复” |
-| 基础内容 | STP 005 学段与模板种子 | 待开始 | 当前无配置、种子或 36 个模板 |
+| M1 | STP 003 独立仓库与 CI 基础 | 已完成 | 本地骨架、锁文件与根命令已验收；远端 `main@576da3d`；CI #1 run 35049218151 success |
+| M1 | STP 004 档案与授权基础 | 进行中 | 隔离库证据见实施报告第 10–11 节；CI #1 五套集成测试 84/0 未 skip；不得标完成；T02-D 本地已在 STP 005 执行、待 CI；不得写“第 1–8 项均修复” |
+| 基础内容 | STP 005 学段与模板种子 | 本地实现已验证，待 CI | 第五／第六条迁移已打隔离库与 four-to-six 夹具；T02-D 本地执行；未 commit；不得标产品验收；不宣称 M0／STP 002 冻结 |
 | M2 | STP 006 计划与任务生成 | 待开始 | 依赖基础契约、档案和年级配置 |
 | M2 | STP 007 完成与计时 | 待开始 | 依赖 STP 006 的稳定任务实例模型 |
 | M3 | STP 008 报告与家庭协作 | 待开始 | 依赖可靠的完成、调整和计时记录 |
@@ -153,12 +170,12 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 以下工程细节已在 STP 003 选定一部分，其余仍待对应任务验证：
 
 - 已选定：pnpm workspace、Node 22 目标、上表依赖版本、本地 origin 绑定。
-- 仍未选定：认证、验证码、部署、监控等供应商及环境参数；GitHub 分支保护与 CI 实际运行；测试设备、性能测试资源和备份实现。
+- 仍未选定：认证、验证码、部署、监控等供应商及环境参数；GitHub 分支保护；测试设备、性能测试资源和备份实现。CI 已有 #1 成功记录，不代表分支保护已开。
 
 这些事项不阻塞继续整理页面与纯业务规则。涉及真实第三方、生产环境、真实用户或收费时，必须另行获得明确授权。
 
 ## 下一步
 
-1. STP 004 本阶段应执行矩阵已有隔离库证据。四项修复与第四条迁移复核通过见实施报告第 10–11 节。T02-D、T11-D、学习写入仍为既定延期，不是本轮四项阻塞。
-2. 不要开始 STP 005，不要把 STP 004 标为完成，不要写“第 1–8 项均修复”。
-3. commit／push 需另行授权；本轮未提交。原库保持只读；expand 与 `20260915160000` 未应用于原库。
+1. STP 004 仍进行中。CI #1（run 35049218151）已记录；T11-D、学习写入仍延期。不要把 STP 004 标完成，不要写“第 1–8 项均修复”。
+2. STP 005 2026-09-16「四项已修复」不成立；2026-09-17 三阻塞修订见 `docs/STP005_IMPLEMENTATION_REPORT.md` 第 12 节。待 CI：修订第五／第六条 deploy、`stp005_rev_*` 夹具、api 107 用例。Playwright 不在 CI 工作流中。不得宣称 M0／STP 002／接口已冻结。任务实例年级快照留 STP 006。
+3. 本轮代码与文档未 commit。原库 `stp004_identity` 与旧 fresh／旧 four-to-six 保持只读，账本未改。

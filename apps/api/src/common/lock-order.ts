@@ -14,6 +14,7 @@ export type LockIds = {
   lookupIds?: string[];
   accountIds?: string[];
   studentIds?: string[];
+  gradeConfigIds?: string[];
   policies?: PolicyLock[];
   linkIds?: string[];
   consentIds?: string[];
@@ -54,6 +55,7 @@ export function normalizeLockIds(ids: LockIds): {
   lookupIds: string[];
   accountIds: string[];
   studentIds: string[];
+  gradeConfigIds: string[];
   policies: PolicyLock[];
   linkIds: string[];
   consentIds: string[];
@@ -68,6 +70,7 @@ export function normalizeLockIds(ids: LockIds): {
     lookupIds: uniqSorted(ids.lookupIds),
     accountIds: uniqSorted(ids.accountIds),
     studentIds: uniqSorted(ids.studentIds),
+    gradeConfigIds: uniqSorted(ids.gradeConfigIds),
     policies: uniqPolicies(ids.policies),
     linkIds: uniqSorted(ids.linkIds),
     consentIds: uniqSorted(ids.consentIds),
@@ -85,6 +88,7 @@ export function mergeLockIds(left: LockIds, right: LockIds): LockIds {
     lookupIds: [...(left.lookupIds ?? []), ...(right.lookupIds ?? [])],
     accountIds: [...(left.accountIds ?? []), ...(right.accountIds ?? [])],
     studentIds: [...(left.studentIds ?? []), ...(right.studentIds ?? [])],
+    gradeConfigIds: [...(left.gradeConfigIds ?? []), ...(right.gradeConfigIds ?? [])],
     policies: [...(left.policies ?? []), ...(right.policies ?? [])],
     linkIds: [...(left.linkIds ?? []), ...(right.linkIds ?? [])],
     consentIds: [...(left.consentIds ?? []), ...(right.consentIds ?? [])],
@@ -108,6 +112,7 @@ export function lockIdsContain(planned: LockIds, discovered: LockIds): boolean {
     includesAll(left.lookupIds, right.lookupIds) &&
     includesAll(left.accountIds, right.accountIds) &&
     includesAll(left.studentIds, right.studentIds) &&
+    includesAll(left.gradeConfigIds, right.gradeConfigIds) &&
     includesAll(
       left.policies.map((item) => item.id),
       right.policies.map((item) => item.id),
@@ -180,6 +185,12 @@ export async function acquireLocks(tx: Prisma.TransactionClient, raw: LockIds): 
     await lockTable(
       tx,
       Prisma.sql`SELECT id FROM student_profiles WHERE id IN (${uuidIn(ids.studentIds)}) ORDER BY id FOR UPDATE`,
+    );
+  }
+  if (ids.gradeConfigIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT id FROM grade_configs WHERE id IN (${uuidIn(ids.gradeConfigIds)}) ORDER BY id FOR SHARE`,
     );
   }
   if (ids.policies.length > 0) {

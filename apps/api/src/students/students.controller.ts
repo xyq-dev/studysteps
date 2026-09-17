@@ -76,6 +76,17 @@ export class StudentsController {
     return this.students.patch(session, studentId, input, idempotencyKey);
   }
 
+  @Get('students/:studentId/education-changes')
+  async educationChanges(
+    @Param('studentId') studentId: string,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardRead(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.students.listEducationChanges(session, studentId);
+  }
+
   @Get('students/:studentId/consents')
   async listConsents(@Param('studentId') studentId: string, @Req() request: Request, @Res({ passthrough: true }) res: Response) {
     const session = await this.guardRead(request);

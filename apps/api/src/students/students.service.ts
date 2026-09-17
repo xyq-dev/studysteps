@@ -4,15 +4,22 @@ import {
   asProfileStatus,
   decideAgeBand,
   encodeCrockford,
+  applyConsentProbeFailure,
+  consentCurrentFromVerifiedProbe,
+  evaluateActivation,
+  evaluateEducationChange,
   formatPairingCode,
   guardianListIncludes,
   guardianMay,
   isDeletionStatus,
+  isEducationSnapshotMatchingVersion,
   isExpired,
   nextAttemptState,
   normalizePairingCode,
   replayWithdrawEffect,
   studentMayReadSelf,
+  type EducationChangeKind,
+  type EducationSnapshot,
   type GuardianAction,
 } from '@studysteps/domain';
 import {
@@ -45,6 +52,7 @@ import {
   discoverStudentAuthorizationGraph,
 } from './student-authorization';
 import { collectForwardLineageIds, issueReplacementSession, revokeActiveLineage } from '../auth/session-lineage';
+import { CatalogService } from '../catalog/catalog.service';
 
 @Injectable()
 export class StudentsService {
@@ -54,6 +62,7 @@ export class StudentsService {
     private readonly identity: IdentityService,
     private readonly idempotency: IdempotencyService,
     private readonly rateLimit: RateLimitService,
+    private readonly catalog: CatalogService,
   ) {}
 
   private get config() {
@@ -85,9 +94,14 @@ export class StudentsService {
         where: { accountId: current.accountId!, status: 'ACTIVE' },
         include: { student: true },
       });
-      const items = links
-        .filter((link) => guardianListIncludes(link.student.status))
-        .map((link) => this.summary(link.student));
+      const items = [];
+      for (const link of links) {
+        if (!guardianListIncludes(link.student.status)) {
+          continue;
+        }
+        const activation = await this.activationFor(tx, link.student);
+        items.push(this.summary({ ...link.student, status: activation.status }));
+      }
       await this.identity.touchLastSeenLocked(tx, current, now);
       return items;
     }, graph);
@@ -159,11 +173,12 @@ export class StudentsService {
           ageConfirmedAt: now,
           ageConfirmedByAccountId: session.accountId!,
           createdByAccountId: session.accountId!,
-          stageCode: input.education?.stageCode,
-          schoolSystemCode: input.education?.schoolSystemCode,
-          gradeCode: input.education?.gradeCode,
-          gradeLabel: input.education?.gradeLabel,
-          termCode: input.education?.termCode,
+          stageCode: null,
+          schoolSystemCode: null,
+          gradeCode: null,
+          gradeLabel: null,
+          termCode: null,
+          gradeConfigId: null,
         },
       });
       const link = await tx.guardianLink.create({
@@ -215,7 +230,7 @@ export class StudentsService {
 
   async patch(session: DeviceSession, studentId: string, input: PatchStudentInput, idempotencyKey: string) {
     this.assertGuardian(session);
-    if (input.kind === 'AGE') {
+    if (input.kind === 'AGE' || input.kind === 'EDUCATION') {
       this.identity.requireStepUp(session);
     }
     const action: GuardianAction =
@@ -228,17 +243,30 @@ export class StudentsService {
     const actor = this.actor(session);
     const requestDigest = this.idempotency.requestDigest({ operation: 'students.patch', studentId, input });
     const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'students.patch', idempotencyKey);
+    const preview = await this.prisma.studentProfile.findUnique({ where: { id: studentId } });
+    const gradeConfigIds = [
+      ...(input.kind === 'EDUCATION' && input.gradeConfigId ? [input.gradeConfigId] : []),
+      ...(preview?.gradeConfigId ? [preview.gradeConfigId] : []),
+    ];
     const graph = await this.collectStudentGraph(studentId, {
       accountIds: [session.accountId!],
       sessionIds: [session.id],
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      gradeConfigIds,
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
       await acquireLocks(tx, locked);
       assertLockSetComplete(locked, await this.discoverStudentGraph(tx, studentId, session));
       const now = await readLockedNow(tx);
-      const student = await this.reauthorize(tx, session, studentId, action, input.kind === 'AGE', now);
+      const student = await this.reauthorize(
+        tx,
+        session,
+        studentId,
+        action,
+        input.kind === 'AGE' || input.kind === 'EDUCATION',
+        now,
+      );
       const begun = await this.idempotency.begin(tx, actor, 'students.patch', idempotencyKey, requestDigest, now);
       if (begun.kind === 'REPLAY' && begun.resourceId) {
         const presented = await this.present(await tx.studentProfile.findUniqueOrThrow({ where: { id: begun.resourceId } }), tx);
@@ -287,35 +315,72 @@ export class StudentsService {
         if (!current) {
           await this.revokeStudentAccess(tx, studentId, now, 'AGE_POLICY_MISSING');
         }
-      } else {
+      } else if (input.kind === 'BASIC') {
         const updated = await tx.studentProfile.updateMany({
           where: { id: student.id, version: student.version },
-          data:
-            input.kind === 'BASIC'
-              ? {
-                  nickname: input.nickname ?? student.nickname,
-                  avatarPresetId: input.avatarPresetId ?? student.avatarPresetId,
-                  timezone: input.timezone ?? student.timezone,
-                  version: { increment: 1 },
-                }
-              : {
-                  stageCode: input.education.stageCode,
-                  schoolSystemCode: input.education.schoolSystemCode,
-                  gradeCode: input.education.gradeCode,
-                  gradeLabel: input.education.gradeLabel,
-                  termCode: input.education.termCode,
-                  version: { increment: 1 },
-                },
+          data: {
+            nickname: input.nickname ?? student.nickname,
+            avatarPresetId: input.avatarPresetId ?? student.avatarPresetId,
+            timezone: input.timezone ?? student.timezone,
+            version: { increment: 1 },
+          },
         });
         if (updated.count === 0) {
           throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
         }
+      } else {
+        await this.applyEducation(tx, session, student, input, now);
       }
       const latest = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
       await this.idempotency.complete(tx, begun.recordId, 'StudentProfile', latest.id, 200, now);
       const presented = await this.present(latest, tx);
       await this.identity.touchLastSeenLocked(tx, session, now);
       return presented;
+    }, graph);
+  }
+
+  async listEducationChanges(session: DeviceSession, studentId: string) {
+    const graph = await this.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const current = await this.identity.assertSessionCurrent(tx, session, { now });
+      await this.authorizeLocked(tx, current, studentId, 'PROFILE_READ');
+      const items = await tx.studentEducationHistory.findMany({
+        where: { studentProfileId: studentId },
+        orderBy: { createdAt: 'desc' },
+      });
+      await this.identity.touchLastSeenLocked(tx, current, now);
+      return {
+        items: items.map((item) => ({
+          id: item.id,
+          changeKind: item.changeKind,
+          from: {
+            gradeConfigId: item.fromGradeConfigId,
+            stageCode: item.fromStageCode,
+            schoolSystemCode: item.fromSchoolSystemCode,
+            gradeCode: item.fromGradeCode,
+            gradeLabel: item.fromGradeLabel,
+            termCode: item.fromTermCode,
+          },
+          to: {
+            gradeConfigId: item.toGradeConfigId,
+            stageCode: item.toStageCode,
+            schoolSystemCode: item.toSchoolSystemCode,
+            gradeCode: item.toGradeCode,
+            gradeLabel: item.toGradeLabel,
+            termCode: item.toTermCode,
+          },
+          effectiveLocalDate: item.effectiveLocalDate,
+          timezoneSnapshot: item.timezoneSnapshot,
+          createdAt: item.createdAt.toISOString(),
+        })),
+      };
     }, graph);
   }
 
@@ -463,9 +528,19 @@ export class StudentsService {
         where: { id: studentId },
         data: { status: 'ONBOARDING', restrictedAt: null, version: { increment: 1 } },
       });
-      await this.idempotency.complete(tx, begun.recordId, 'ConsentRecord', created.id, 200, now);
       const latest = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
-      const presented = await this.present(latest, tx);
+      const activation = await this.activationFor(tx, latest);
+      if (activation.status !== latest.status) {
+        await tx.studentProfile.update({
+          where: { id: studentId },
+          data: { status: activation.status },
+        });
+      }
+      await this.idempotency.complete(tx, begun.recordId, 'ConsentRecord', created.id, 200, now);
+      const presented = await this.present(
+        await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } }),
+        tx,
+      );
       await this.identity.touchLastSeenLocked(tx, session, now);
       return presented;
     }, graph);
@@ -1020,12 +1095,125 @@ export class StudentsService {
     studentId: string,
     ageBand: string,
   ): Promise<boolean> {
+    return !(await this.consentIsCurrent(db, studentId, ageBand));
+  }
+
+  private async consentIsCurrent(
+    db: Prisma.TransactionClient | PrismaService,
+    studentId: string,
+    ageBand: string,
+  ): Promise<boolean> {
     try {
       await this.assertFreshRequiredConsent(db, studentId, ageBand);
-      return false;
+      return consentCurrentFromVerifiedProbe();
     } catch (error) {
-      return error instanceof AppError && error.code === 'CONSENT_REQUIRED';
+      return applyConsentProbeFailure(error);
     }
+  }
+
+  private localDate(now: Date, timeZone: string): string {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(now);
+  }
+
+  private async applyEducation(
+    tx: Prisma.TransactionClient,
+    session: DeviceSession,
+    student: {
+      id: string;
+      version: number;
+      status: string;
+      timezone: string;
+      gradeConfigId: string | null;
+      gradeConfigVersionId: string | null;
+      stageCode: string | null;
+      schoolSystemCode: string | null;
+      gradeCode: string | null;
+      gradeLabel: string | null;
+      termCode: string | null;
+      ageBand: string;
+    },
+    input: Extract<PatchStudentInput, { kind: 'EDUCATION' }>,
+    now: Date,
+  ) {
+    const from = {
+      gradeConfigId: student.gradeConfigId,
+      gradeConfigVersionId: student.gradeConfigVersionId,
+      stageCode: student.stageCode,
+      schoolSystemCode: student.schoolSystemCode,
+      gradeCode: student.gradeCode,
+      gradeLabel: student.gradeLabel,
+      termCode: student.termCode,
+    };
+    const catalog = await this.catalog.loadPublishedGrades(tx);
+    const lastHistory = await tx.studentEducationHistory.findFirst({
+      where: { studentProfileId: student.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    const target = input.gradeConfigId
+      ? catalog.find((item) => item.id === input.gradeConfigId) ?? null
+      : null;
+    const transition = evaluateEducationChange({
+      from,
+      kind: input.changeKind,
+      target,
+      term: input.termCode ?? null,
+      catalog,
+      lastChangeKind: (lastHistory?.changeKind as EducationChangeKind | undefined) ?? null,
+    });
+    if (!transition.ok) {
+      throw new AppError(transition.code, transition.message, 400);
+    }
+    const to = transition.to;
+    const nextActivation = await this.activationFor(tx, {
+      ...student,
+      ...to,
+      status: student.status === 'RESTRICTED' ? 'RESTRICTED' : 'ONBOARDING',
+    });
+    const nextStatus = student.status === 'RESTRICTED' ? 'RESTRICTED' : nextActivation.status;
+    const updated = await tx.studentProfile.updateMany({
+      where: { id: student.id, version: student.version },
+      data: {
+        gradeConfigId: to.gradeConfigId,
+        gradeConfigVersionId: to.gradeConfigVersionId,
+        stageCode: to.stageCode,
+        schoolSystemCode: to.schoolSystemCode,
+        gradeCode: to.gradeCode,
+        gradeLabel: to.gradeLabel,
+        termCode: to.termCode,
+        status: nextStatus,
+        version: { increment: 1 },
+      },
+    });
+    if (updated.count === 0) {
+      throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
+    }
+    await tx.studentEducationHistory.create({
+      data: {
+        studentProfileId: student.id,
+        changeKind: input.changeKind,
+        fromGradeConfigId: from.gradeConfigId,
+        toGradeConfigId: to.gradeConfigId,
+        fromStageCode: from.stageCode,
+        fromSchoolSystemCode: from.schoolSystemCode,
+        fromGradeCode: from.gradeCode,
+        fromGradeLabel: from.gradeLabel,
+        fromTermCode: from.termCode,
+        toStageCode: to.stageCode,
+        toSchoolSystemCode: to.schoolSystemCode,
+        toGradeCode: to.gradeCode,
+        toGradeLabel: to.gradeLabel,
+        toTermCode: to.termCode,
+        actorAccountId: session.accountId!,
+        effectiveLocalDate: input.effectiveLocalDate ?? this.localDate(now, student.timezone),
+        timezoneSnapshot: student.timezone,
+        createdAt: now,
+      },
+    });
   }
 
   private async present(
@@ -1041,10 +1229,12 @@ export class StudentsService {
       gradeCode?: string | null;
       gradeLabel?: string | null;
       termCode?: string | null;
+      gradeConfigId?: string | null;
+      gradeConfigVersionId?: string | null;
     },
     db: Prisma.TransactionClient | PrismaService = this.prisma,
   ) {
-    return this.detail(student, await this.missingRequiredConsent(db, student.id, student.ageBand));
+    return this.detail(student, db);
   }
 
   private async collectStudentGraph(studentId: string, extra: LockIds = {}): Promise<LockIds> {
@@ -1151,7 +1341,76 @@ export class StudentsService {
     };
   }
 
-  private detail(
+  private snapshotOf(student: {
+    gradeConfigId?: string | null;
+    gradeConfigVersionId?: string | null;
+    stageCode?: string | null;
+    schoolSystemCode?: string | null;
+    gradeCode?: string | null;
+    gradeLabel?: string | null;
+    termCode?: string | null;
+  }): EducationSnapshot {
+    return {
+      gradeConfigId: student.gradeConfigId ?? null,
+      gradeConfigVersionId: student.gradeConfigVersionId ?? null,
+      stageCode: student.stageCode ?? null,
+      schoolSystemCode: student.schoolSystemCode ?? null,
+      gradeCode: student.gradeCode ?? null,
+      gradeLabel: student.gradeLabel ?? null,
+      termCode: student.termCode ?? null,
+    };
+  }
+
+  private async activationFor(
+    db: Prisma.TransactionClient | PrismaService,
+    student: {
+      id: string;
+      status: string;
+      ageBand: string;
+      gradeConfigId?: string | null;
+      gradeConfigVersionId?: string | null;
+      stageCode?: string | null;
+      schoolSystemCode?: string | null;
+      gradeCode?: string | null;
+      gradeLabel?: string | null;
+      termCode?: string | null;
+    },
+  ) {
+    const snapshot = this.snapshotOf(student);
+    let matchesPublishedVersion = false;
+    if (snapshot.gradeConfigId && snapshot.gradeConfigVersionId) {
+      const config = await db.gradeConfig.findUnique({ where: { id: snapshot.gradeConfigId } });
+      const version = await db.gradeConfigVersion.findUnique({ where: { id: snapshot.gradeConfigVersionId } });
+      if (config && version) {
+        matchesPublishedVersion = isEducationSnapshotMatchingVersion(
+          snapshot,
+          {
+            id: config.id,
+            schoolSystemCode: config.schoolSystemCode,
+            stageCode: config.stageCode,
+            gradeCode: config.gradeCode,
+            currentVersionId: config.currentVersionId,
+          },
+          {
+            id: version.id,
+            gradeConfigId: version.gradeConfigId,
+            gradeLabel: version.gradeLabel,
+            allowedTermCodes: JSON.parse(version.allowedTermCodes) as string[],
+            publishedAt: version.publishedAt,
+          },
+        );
+      }
+    }
+    const consentCurrent = await this.consentIsCurrent(db, student.id, student.ageBand);
+    return evaluateActivation({
+      storedStatus: student.status,
+      snapshot,
+      matchesPublishedVersion,
+      consentCurrent,
+    });
+  }
+
+  private async detail(
     student: {
       id: string;
       nickname: string;
@@ -1164,27 +1423,33 @@ export class StudentsService {
       gradeCode?: string | null;
       gradeLabel?: string | null;
       termCode?: string | null;
+      gradeConfigId?: string | null;
+      gradeConfigVersionId?: string | null;
     },
-    staleConsent = false,
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ) {
+    const snapshot = this.snapshotOf(student);
+    const activation = await this.activationFor(db, student);
+    let catalogEntryKey: string | null = null;
+    if (snapshot.gradeConfigId) {
+      const config = await db.gradeConfig.findUnique({ where: { id: snapshot.gradeConfigId } });
+      if (config?.currentVersionId) {
+        const version = await db.gradeConfigVersion.findUnique({ where: { id: config.currentVersionId } });
+        catalogEntryKey = version?.catalogEntryKey ?? null;
+      }
+    }
     return {
-      ...this.summary(student),
+      ...this.summary({ ...student, status: activation.status }),
       education: {
-        stageCode: student.stageCode ?? null,
-        schoolSystemCode: student.schoolSystemCode ?? null,
-        gradeCode: student.gradeCode ?? null,
-        gradeLabel: student.gradeLabel ?? null,
-        termCode: student.termCode ?? null,
+        gradeConfigId: snapshot.gradeConfigId,
+        stageCode: snapshot.stageCode,
+        schoolSystemCode: snapshot.schoolSystemCode,
+        gradeCode: snapshot.gradeCode,
+        gradeLabel: snapshot.gradeLabel,
+        termCode: snapshot.termCode,
+        catalogEntryKey,
       },
-      learningAccess: {
-        allowed: false as const,
-        reason:
-          student.status === 'RESTRICTED'
-            ? ('RESTRICTED' as const)
-            : staleConsent
-              ? ('CONSENT_REQUIRED' as const)
-              : ('ACADEMIC_CONFIGURATION_PENDING' as const),
-      },
+      learningAccess: activation.learningAccess,
     };
   }
 

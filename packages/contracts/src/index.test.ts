@@ -5,6 +5,7 @@ import {
   HEALTH_OK,
   createSessionSchema,
   createStudentSchema,
+  patchStudentSchema,
   requestAuthCodeSchema,
   withdrawConsentSchema,
 } from './index.js';
@@ -19,8 +20,8 @@ describe('@studysteps/contracts export boundary', () => {
   });
 
   it('keeps a stable error-code set for /v1', () => {
-    expect(ERROR_CODES).toContain('AGE_BAND_NOT_SUPPORTED');
-    expect(ERROR_CODES).toContain('RESOURCE_NOT_FOUND');
+    expect(ERROR_CODES).toContain('GRADE_CONFIG_INVALID');
+    expect(ERROR_CODES).toContain('TEMPLATE_IMPORT_NOT_ALLOWED');
   });
 });
 
@@ -66,6 +67,36 @@ describe('request validation', () => {
     });
     expect(session).not.toHaveProperty('accountId');
     expect(session.studentId).toBe('11111111-1111-1111-1111-111111111111');
+  });
+
+  it('rejects non-empty education on create and requires EDUCATION patch fields', () => {
+    const base = {
+      profile: { nickname: '小树', avatarPresetId: 'avatar-03', timezone: 'Asia/Shanghai' },
+      ageConfirmation: { band: 'UNDER_14' as const, source: 'GUARDIAN_DECLARATION' as const },
+      consentAcceptances: [{ policyKey: 'TEST_CHILD_CORE_SERVICE', version: 'test-v1' }],
+    };
+    expect(createStudentSchema.safeParse(base).success).toBe(true);
+    expect(
+      createStudentSchema.safeParse({
+        ...base,
+        education: {
+          stageCode: 'PRIMARY',
+          schoolSystemCode: 'SIX_THREE',
+          gradeCode: 'G3',
+          gradeLabel: '三年级',
+          termCode: 'FULL_YEAR',
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      patchStudentSchema.safeParse({
+        kind: 'EDUCATION',
+        expectedVersion: 1,
+        gradeConfigId: '11111111-1111-4111-8111-111111111111',
+        termCode: 'FIRST_TERM',
+        changeKind: 'SET',
+      }).success,
+    ).toBe(true);
   });
 
   it('does not require expectedStudentVersion on withdraw', () => {

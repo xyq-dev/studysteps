@@ -123,6 +123,8 @@ model StudentProfile {
   gradeCode               String?       @map("grade_code")
   gradeLabel              String?       @map("grade_label")
   termCode                String?       @map("term_code")
+  gradeConfigId           String?       @map("grade_config_id") @db.Uuid
+  gradeConfigVersionId    String?       @map("grade_config_version_id") @db.Uuid
   timezone                String        @default("Asia/Shanghai")
   createdByAccountId      String        @map("created_by_account_id") @db.Uuid
   version                 Int           @default(1)
@@ -136,6 +138,9 @@ model StudentProfile {
   consents                ConsentRecord[]
   studentSessions         DeviceSession[]
   pairings                DevicePairing[]
+  gradeConfig             GradeConfig?    @relation(fields: [gradeConfigId], references: [id], onDelete: Restrict)
+  gradeConfigVersion      GradeConfigVersion? @relation("StudentGradeVersion", fields: [gradeConfigVersionId, gradeConfigId], references: [id, gradeConfigId], onDelete: Restrict)
+  educationHistory        StudentEducationHistory[]
 
   @@map("student_profiles")
 }
@@ -358,4 +363,97 @@ model RateLimitBucket {
 
   @@unique([bucketKey, windowStartedAt])
   @@map("rate_limit_buckets")
+}
+
+model GradeConfig {
+  id                       String               @id @db.Uuid
+  schoolSystemCode         String               @map("school_system_code")
+  stageCode                String               @map("stage_code")
+  gradeCode                String               @map("grade_code")
+  currentVersionId         String?              @map("current_version_id") @db.Uuid
+  version                  Int                  @default(1)
+  createdAt                DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  currentVersion           GradeConfigVersion?  @relation("GradeConfigCurrentVersion", fields: [currentVersionId, id], references: [id, gradeConfigId], onDelete: Restrict)
+  documents                GradeConfigVersion[] @relation("GradeConfigDocumentVersions")
+  students                 StudentProfile[]
+  historyFrom              StudentEducationHistory[] @relation("EducationFromConfig")
+  historyTo                StudentEducationHistory[] @relation("EducationToConfig")
+
+  @@unique([schoolSystemCode, stageCode, gradeCode])
+  @@map("grade_configs")
+}
+
+model GradeConfigVersion {
+  id                 String      @id @db.Uuid
+  gradeConfigId      String      @map("grade_config_id") @db.Uuid
+  version            String
+  gradeLabel         String      @map("grade_label")
+  sortOrder          Int         @map("sort_order")
+  nextGradeConfigId  String?     @map("next_grade_config_id") @db.Uuid
+  catalogEntryKey    String?     @map("catalog_entry_key")
+  allowedTermCodes   String      @map("allowed_term_codes")
+  publishedAt        DateTime?   @map("published_at") @db.Timestamptz(3)
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  config             GradeConfig @relation("GradeConfigDocumentVersions", fields: [gradeConfigId], references: [id], onDelete: Restrict)
+  currentOf          GradeConfig[] @relation("GradeConfigCurrentVersion")
+  students           StudentProfile[] @relation("StudentGradeVersion")
+
+  @@unique([gradeConfigId, version])
+  @@unique([id, gradeConfigId])
+  @@map("grade_config_versions")
+}
+
+model StudentEducationHistory {
+  id                     String         @id @default(uuid()) @db.Uuid
+  studentProfileId       String         @map("student_profile_id") @db.Uuid
+  changeKind             String         @map("change_kind")
+  fromGradeConfigId      String?        @map("from_grade_config_id") @db.Uuid
+  toGradeConfigId        String?        @map("to_grade_config_id") @db.Uuid
+  fromStageCode          String?        @map("from_stage_code")
+  fromSchoolSystemCode   String?        @map("from_school_system_code")
+  fromGradeCode          String?        @map("from_grade_code")
+  fromGradeLabel         String?        @map("from_grade_label")
+  fromTermCode           String?        @map("from_term_code")
+  toStageCode            String?        @map("to_stage_code")
+  toSchoolSystemCode     String?        @map("to_school_system_code")
+  toGradeCode            String?        @map("to_grade_code")
+  toGradeLabel           String?        @map("to_grade_label")
+  toTermCode             String?        @map("to_term_code")
+  actorAccountId         String         @map("actor_account_id") @db.Uuid
+  effectiveLocalDate     String         @map("effective_local_date")
+  timezoneSnapshot       String         @map("timezone_snapshot")
+  createdAt              DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  student                StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  fromConfig             GradeConfig?   @relation("EducationFromConfig", fields: [fromGradeConfigId], references: [id], onDelete: Restrict)
+  toConfig               GradeConfig?   @relation("EducationToConfig", fields: [toGradeConfigId], references: [id], onDelete: Restrict)
+
+  @@index([studentProfileId, createdAt])
+  @@map("student_education_history")
+}
+
+model Subject {
+  id        String   @id @db.Uuid
+  code      String   @unique
+  label     String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@map("subjects")
+}
+
+model PlanTemplateVersion {
+  id               String    @id @db.Uuid
+  templateKey      String    @map("template_key")
+  version          String
+  catalogEntryKey  String    @map("catalog_entry_key")
+  kind             String
+  title            String
+  summary          String
+  contentJson      String    @map("content_json")
+  publishedAt      DateTime? @map("published_at") @db.Timestamptz(3)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([templateKey, version])
+  @@index([catalogEntryKey, kind])
+  @@map("plan_template_versions")
 }

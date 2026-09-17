@@ -369,7 +369,25 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 004 Codex review counterexampl
     const restricted = await createStudent(auth.cookies, '五态受限');
     const pendingStudent = await consumePairing(auth.cookies, pending.studentId, 'del-pending');
     const restrictedStudent = await consumePairing(auth.cookies, restricted.studentId, 'del-restricted');
-    await prisma.studentProfile.update({ where: { id: active.studentId }, data: { status: 'ACTIVE' } });
+    const activeGrade = await prisma.gradeConfig.findFirstOrThrow({
+      where: { schoolSystemCode: 'SIX_THREE', stageCode: 'PRIMARY', gradeCode: 'G3' },
+    });
+    const activeVersion = await prisma.gradeConfigVersion.findUniqueOrThrow({
+      where: { id: activeGrade.currentVersionId! },
+    });
+    await prisma.studentProfile.update({
+      where: { id: active.studentId },
+      data: {
+        status: 'ACTIVE',
+        gradeConfigId: activeGrade.id,
+        gradeConfigVersionId: activeVersion.id,
+        stageCode: activeGrade.stageCode,
+        schoolSystemCode: activeGrade.schoolSystemCode,
+        gradeCode: activeGrade.gradeCode,
+        gradeLabel: activeVersion.gradeLabel,
+        termCode: 'FULL_YEAR',
+      },
+    });
     await prisma.studentProfile.update({ where: { id: pending.studentId }, data: { status: 'DELETION_PENDING' } });
     await prisma.studentProfile.update({ where: { id: deleted.studentId }, data: { status: 'DELETED' } });
     await prisma.studentProfile.update({

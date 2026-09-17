@@ -9,3 +9,6 @@ export * from './permissions.js';
 export * from './session.js';
 export * from './pairing-code.js';
 export * from './consent.js';
+export * from './grade.js';
+export * from './education-transition.js';
+export * from './activation.js';

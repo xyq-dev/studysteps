@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertDisposableIsolationTarget,
   assertStp004IntegrationReady,
   hasStp004TestConfig,
   isCi,
@@ -41,6 +42,18 @@ describe('STP 004 isolation loader', () => {
     expect(shouldSkipStp004Isolation(ready)).toBe(false);
     expect(() => assertStp004IntegrationReady(ready)).not.toThrow();
     expect(shouldSkipStp004Isolation({ ...ready, CI: 'true' })).toBe(false);
+  });
+
+  it('refuses the original and old-fresh databases as test targets', () => {
+    expect(() =>
+      assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp004_identity_fresh'),
+    ).toThrow(/stp004_identity_fresh/);
+    expect(() =>
+      assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp004_identity'),
+    ).toThrow(/stp004_identity/);
+    expect(
+      assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp005_rev_fresh'),
+    ).toBe('stp005_rev_fresh');
   });
 
   it('requires an admin URL in CI', () => {

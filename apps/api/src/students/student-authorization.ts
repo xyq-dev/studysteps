@@ -38,6 +38,7 @@ export async function collectStudentAuthorizationGraph(
   return mergeLockIds(
     {
       studentIds: student ? [student.id] : [],
+      gradeConfigIds: student?.gradeConfigId ? [student.gradeConfigId] : [],
       accountIds: [
         ...(student ? [student.createdByAccountId, student.ageConfirmedByAccountId] : []),
         ...links.map((item) => item.accountId),
@@ -79,6 +80,7 @@ export async function discoverStudentAuthorizationGraph(
   ]);
   return {
     studentIds: student ? [student.id] : [],
+    gradeConfigIds: student?.gradeConfigId ? [student.gradeConfigId] : [],
     accountIds: [
       ...(student ? [student.createdByAccountId, student.ageConfirmedByAccountId] : []),
       ...links.map((item) => item.accountId),

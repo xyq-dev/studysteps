@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { APP_NAME, GUARDIAN_DECLARATION_TEXT } from '@studysteps/contracts';
 import { StatusBanner } from '@studysteps/ui';
 
-type Screen = 's01' | 's02' | 'p05' | 'p06' | 'student';
+type Screen = 's01' | 's02' | 'p05' | 'p06' | 's07' | 'student';
 
 function readCookie(name: string): string | undefined {
   return document.cookie
@@ -50,6 +50,13 @@ export function App() {
   const [pairingCodeInput, setPairingCodeInput] = useState('');
   const [devices, setDevices] = useState<Array<{ id: string; scope: string; revokedAt: string | null }>>([]);
   const [consents, setConsents] = useState<Array<{ id: string; policyKey: string; current: boolean }>>([]);
+  const [grades, setGrades] = useState<Array<{ id: string; gradeLabel: string; schoolSystemCode: string; catalogEntryKey: string | null }>>([]);
+  const [gradeConfigId, setGradeConfigId] = useState('');
+  const [changeKind, setChangeKind] = useState<'SET' | 'PROMOTE' | 'REPEAT' | 'SKIP' | 'LEAVE' | 'RESUME' | 'SYSTEM_SWITCH' | 'TERM_SWITCH'>('SET');
+  const [termCode, setTermCode] = useState<'FULL_YEAR' | 'FIRST_TERM' | 'SECOND_TERM'>('FULL_YEAR');
+  const [templates, setTemplates] = useState<Array<{ id: string; title: string }>>([]);
+  const [importAllowed, setImportAllowed] = useState(false);
+  const [recommendedCount, setRecommendedCount] = useState(0);
 
   async function sendCode(purpose: 'SIGN_IN' | 'GUARDIAN_STEP_UP' = 'SIGN_IN') {
     try {
@@ -133,7 +140,7 @@ export function App() {
       setActiveStudentId(created.profile.id);
       setStudents((current) => [...current, created.profile]);
       setScreen('p05');
-      setStatus('档案已创建。学习功能仍因年级配置未交付而保持关闭。');
+      setStatus('档案已创建。请选择学制年级后才能去掉配置待办。');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '建档失败');
     }
@@ -201,6 +208,80 @@ export function App() {
       setStatus('已撤销目标学生会话。旧 cookie 不能再写入。');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '无法撤销设备');
+    }
+  }
+
+  async function loadGrades() {
+    try {
+      const result = await api('/v1/grade-configs');
+      const items = (result.items ?? []) as Array<{
+        id: string;
+        gradeLabel: string;
+        schoolSystemCode: string;
+        catalogEntryKey: string | null;
+      }>;
+      setGrades(items);
+      const preferred = items.find((item) => item.catalogEntryKey) ?? items[0];
+      setGradeConfigId((current) => current || preferred?.id || '');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法读取年级目录');
+    }
+  }
+
+  async function saveEducation() {
+    if (!activeStudentId || !gradeConfigId) {
+      return;
+    }
+    try {
+      const current = await api(`/v1/students/${activeStudentId}`);
+      const result = await api(`/v1/students/${activeStudentId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          kind: 'EDUCATION',
+          expectedVersion: current.version,
+          gradeConfigId: changeKind === 'LEAVE' ? null : gradeConfigId,
+          termCode: changeKind === 'LEAVE' ? undefined : termCode,
+          changeKind,
+        }),
+      });
+      setStatus(
+        result.learningAccess?.allowed
+          ? '年级已保存。学习计划导入仍属后续任务。'
+          : `年级已保存，当前状态 ${result.status}`,
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法保存年级');
+    }
+  }
+
+  async function openTemplates() {
+    if (!activeStudentId) {
+      return;
+    }
+    try {
+      const result = await api(`/v1/templates?studentId=${activeStudentId}`);
+      setTemplates(result.items ?? []);
+      setImportAllowed(Boolean(result.importAllowed));
+      setRecommendedCount((result.recommendedTemplateIds ?? []).length);
+      setScreen('s07');
+      setStatus(
+        result.importAllowed
+          ? '可浏览并看到推荐；导入尚未开放。'
+          : '可浏览模板库，但无合法映射，不能导入。',
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法打开模板库');
+    }
+  }
+
+  async function tryImport(templateId: string) {
+    if (!activeStudentId) {
+      return;
+    }
+    try {
+      await api(`/v1/students/${activeStudentId}/templates/${templateId}/import`, { method: 'POST' });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '不能导入');
     }
   }
 
@@ -341,6 +422,60 @@ export function App() {
           <button type="button" data-testid="load-devices" onClick={() => void loadDevices()}>
             读取设备
           </button>
+          <button type="button" data-testid="load-grades" onClick={() => void loadGrades()}>
+            读取年级目录
+          </button>
+          <label>
+            年级
+            <select
+              data-testid="grade-select"
+              value={gradeConfigId}
+              onChange={(event) => setGradeConfigId(event.target.value)}
+            >
+              {grades.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.schoolSystemCode} · {item.gradeLabel}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            变更种类
+            <select
+              data-testid="change-kind-select"
+              value={changeKind}
+              onChange={(event) =>
+                setChangeKind(event.target.value as typeof changeKind)
+              }
+            >
+              <option value="SET">SET</option>
+              <option value="PROMOTE">PROMOTE</option>
+              <option value="REPEAT">REPEAT</option>
+              <option value="SKIP">SKIP</option>
+              <option value="LEAVE">LEAVE</option>
+              <option value="RESUME">RESUME</option>
+              <option value="SYSTEM_SWITCH">SYSTEM_SWITCH</option>
+              <option value="TERM_SWITCH">TERM_SWITCH</option>
+            </select>
+          </label>
+          <label>
+            学期
+            <select
+              data-testid="term-select"
+              value={termCode}
+              onChange={(event) => setTermCode(event.target.value as typeof termCode)}
+            >
+              <option value="FULL_YEAR">FULL_YEAR</option>
+              <option value="FIRST_TERM">FIRST_TERM</option>
+              <option value="SECOND_TERM">SECOND_TERM</option>
+            </select>
+          </label>
+          <button type="button" data-testid="save-education" onClick={() => void saveEducation()}>
+            保存年级
+          </button>
+          <button type="button" data-testid="open-templates" onClick={() => void openTemplates()}>
+            打开模板库
+          </button>
           <button
             type="button"
             data-testid="open-consents"
@@ -370,6 +505,28 @@ export function App() {
             ))}
           </ul>
           <p>导出／删除尚未实现，不会显示假成功。</p>
+        </section>
+      ) : null}
+
+      {screen === 's07' ? (
+        <section>
+          <h2>S07 计划模板库</h2>
+          <p data-testid="template-import-state">
+            {importAllowed ? `可推荐 ${recommendedCount} 条；导入未开放` : '无合法映射，禁止导入'}
+          </p>
+          <ul>
+            {templates.map((item) => (
+              <li key={item.id}>
+                {item.title}
+                <button type="button" data-testid={`import-template-${item.id}`} onClick={() => void tryImport(item.id)}>
+                  导入
+                </button>
+              </li>
+            ))}
+          </ul>
+          <button type="button" data-testid="back-from-templates" onClick={() => setScreen('p05')}>
+            返回档案
+          </button>
         </section>
       ) : null}
 

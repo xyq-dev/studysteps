@@ -80,10 +80,39 @@ export function shouldSkipStp004Isolation(env: NodeJS.ProcessEnv = process.env):
   return !hasStp004TestConfig(env);
 }
 
+export const FORBIDDEN_ISOLATION_DATABASES = [
+  'stp004_identity',
+  'stp004_identity_fresh',
+  'stp005_four_to_six',
+  'stp005_unknown_leftover',
+] as const;
+
+export function databaseNameFromUrl(url: string): string {
+  return new URL(url).pathname.replace(/^\//, '').split('?')[0] ?? '';
+}
+
+export function assertDisposableIsolationTarget(
+  url: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const name = databaseNameFromUrl(url);
+  if ((FORBIDDEN_ISOLATION_DATABASES as readonly string[]).includes(name)) {
+    throw new Error(`refusing existing database ${name}; use exclusive stp005_rev_* or CI studysteps`);
+  }
+  if (!isCi(env) && name !== 'studysteps' && !name.startsWith('stp005_rev_')) {
+    throw new Error(`expected exclusive stp005_rev_* test target, got ${name}`);
+  }
+  return name;
+}
+
 export function assertStp004IntegrationReady(env: NodeJS.ProcessEnv = process.env): void {
   const missing = missingStp004Isolation(env);
   if (missing.length > 0) {
     throw new Error(`STP 004 isolation required: ${missing.join(', ')}`);
+  }
+  const url = env.STP004_TEST_DATABASE_URL ?? env.DATABASE_URL;
+  if (url) {
+    assertDisposableIsolationTarget(url, env);
   }
 }
 

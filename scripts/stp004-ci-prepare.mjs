@@ -1,4 +1,4 @@
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -113,8 +113,27 @@ const applied = await catalog.query(`
 await catalog.end();
 
 const names = applied.rows.map((row) => row.migration_name);
-if (names.length !== 4) {
-  throw new Error(`expected 4 applied migrations, found ${names.length}`);
+const expected = readdirSync(join(root, 'prisma', 'migrations'))
+  .filter((name) => existsSync(join(root, 'prisma', 'migrations', name, 'migration.sql')))
+  .sort();
+if (names.length !== expected.length) {
+  throw new Error(`expected ${expected.length} applied migrations, found ${names.length}: ${names.join(',')}`);
+}
+const missing = expected.filter((name) => !names.includes(name));
+if (missing.length > 0) {
+  throw new Error(`missing applied migrations: ${missing.join(',')}`);
+}
+
+const upgrade = spawnSync(process.execPath, [join(root, 'scripts/stp005-four-to-six-upgrade.mjs')], {
+  cwd: root,
+  env: process.env,
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(upgrade.stdout || '');
+process.stderr.write(upgrade.stderr || '');
+if (upgrade.status !== 0) {
+  process.exit(upgrade.status ?? 1);
 }
 
 process.stdout.write(`CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}\n`);
