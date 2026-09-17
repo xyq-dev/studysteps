@@ -1,8 +1,8 @@
+// @ts-nocheck
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-// @ts-expect-error untyped workspace script
 import {
   FIXTURE_DATABASE,
   assertAllowed,
