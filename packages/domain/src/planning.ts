@@ -193,3 +193,18 @@ export function previewCanonicalPayload(input: {
     series: input.series,
   };
 }
+
+export function manualPreviewCanonicalPayload(input: {
+  education: EducationFingerprint;
+  series: SeriesRule[];
+}): {
+  source: 'MANUAL';
+  education: EducationFingerprint;
+  series: SeriesRule[];
+} {
+  return {
+    source: 'MANUAL',
+    education: input.education,
+    series: input.series,
+  };
+}

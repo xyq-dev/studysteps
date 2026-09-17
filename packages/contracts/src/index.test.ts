@@ -8,6 +8,7 @@ import {
   patchStudentSchema,
   requestAuthCodeSchema,
   withdrawConsentSchema,
+  createManualPlanSchema,
 } from './index.js';
 
 describe('@studysteps/contracts export boundary', () => {
@@ -113,5 +114,17 @@ describe('request validation', () => {
     expect(Object.keys(withdrawConsentSchema.shape)).not.toContain(
       'expectedStudentVersion',
     );
+  });
+
+  it('accepts manual plan confirm bodies without a template id', () => {
+    const parsed = createManualPlanSchema.parse({
+      expectedStudentVersion: 2,
+      previewDigest: 'd'.repeat(16),
+      tasks: [{ name: '自主阅读', subject: '自定义', standard: '完成' }],
+      coCreationAttested: true,
+      templateId: 'should-be-stripped-or-ignored',
+    });
+    expect(parsed.tasks[0]?.name).toBe('自主阅读');
+    expect(parsed).not.toHaveProperty('templateId');
   });
 });

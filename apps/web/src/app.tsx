@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { APP_NAME, GUARDIAN_DECLARATION_TEXT } from '@studysteps/contracts';
 import { StatusBanner } from '@studysteps/ui';
 
-type Screen = 's01' | 's02' | 'p05' | 'p06' | 's07' | 's03' | 's05' | 's08' | 'student';
+type Screen = 's01' | 's02' | 'p05' | 'p06' | 's07' | 's03' | 's05' | 's06' | 's08' | 'student';
 type PreviewTask = {
   name: string;
   subject: string;
@@ -132,11 +132,17 @@ export function App() {
   const [recommendedCount, setRecommendedCount] = useState(0);
   const [sessionScope, setSessionScope] = useState<'GUARDIAN' | 'STUDENT'>('GUARDIAN');
   const [previewTemplateId, setPreviewTemplateId] = useState('');
+  const [previewSource, setPreviewSource] = useState<'TEMPLATE' | 'MANUAL'>('TEMPLATE');
   const [previewDigest, setPreviewDigest] = useState('');
   const [previewTemplateVersion, setPreviewTemplateVersion] = useState('');
   const [previewTasks, setPreviewTasks] = useState<PreviewTask[]>([]);
   const [confirmAllowed, setConfirmAllowed] = useState(false);
   const [coCreationAttested, setCoCreationAttested] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [draftTaskName, setDraftTaskName] = useState('自主阅读');
+  const [draftTaskSubject, setDraftTaskSubject] = useState('自定义');
+  const [draftTaskStandard, setDraftTaskStandard] = useState('读完指定页并口头复述');
+  const [draftRepeatKind, setDraftRepeatKind] = useState<'ONCE' | 'DAILY' | 'WEEKLY_DAYS'>('DAILY');
   const [plans, setPlans] = useState<Array<{ id: string; status: string; origin: string; seriesCount: number }>>([]);
   const [planDetail, setPlanDetail] = useState<{
     id: string;
@@ -545,6 +551,7 @@ export function App() {
         body: JSON.stringify({}),
       });
       setPreviewTemplateId(templateId);
+      setPreviewSource('TEMPLATE');
       setPreviewDigest(result.previewDigest);
       setPreviewTemplateVersion(result.template.version);
       setPreviewTasks(result.tasks ?? []);
@@ -561,22 +568,78 @@ export function App() {
     }
   }
 
-  async function confirmPlan() {
-    if (!activeStudentId || !previewTemplateId) {
+  async function openManualCreate() {
+    setPreviewSource('MANUAL');
+    setPreviewTemplateId('');
+    setCoCreationAttested(false);
+    setConfirmAllowed(false);
+    setScreen('s06');
+    setStatus('填写任务后先预览，确认前不会创建计划。');
+  }
+
+  async function previewManual() {
+    if (!activeStudentId) {
       return;
     }
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/plans/preview`, {
+        method: 'POST',
+        body: JSON.stringify({
+          tasks: [
+            {
+              name: draftTaskName,
+              subject: draftTaskSubject,
+              standard: draftTaskStandard,
+              repeatKind: draftRepeatKind,
+              weekdays: draftRepeatKind === 'WEEKLY_DAYS' ? [1, 2, 3, 4, 5] : null,
+            },
+          ],
+        }),
+      });
+      setPreviewSource('MANUAL');
+      setPreviewTemplateId('');
+      setPreviewDigest(result.previewDigest);
+      setPreviewTemplateVersion('');
+      setPreviewTasks(result.tasks ?? []);
+      setConfirmAllowed(Boolean(result.confirmAllowed));
+      setCoCreationAttested(false);
+      if (!result.confirmAllowed) {
+        setStatus(result.blockReason ?? '当前不能确认创建计划');
+        return;
+      }
+      setScreen('s03');
+      setStatus('预览已生成，尚未创建计划。确认前可调整任务。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '不能预览');
+    }
+  }
+
+  async function confirmPlan() {
+    if (!activeStudentId || confirming) {
+      return;
+    }
+    if (previewSource === 'TEMPLATE' && !previewTemplateId) {
+      return;
+    }
+    setConfirming(true);
     try {
       const current = await api(`/v1/students/${activeStudentId}`);
       const body: Record<string, unknown> = {
         expectedStudentVersion: current.version,
         previewDigest,
-        templateVersion: previewTemplateVersion,
         tasks: previewTasks,
       };
+      if (previewSource === 'TEMPLATE') {
+        body.templateVersion = previewTemplateVersion;
+      }
       if (sessionScope === 'GUARDIAN') {
         body.coCreationAttested = coCreationAttested;
       }
-      const result = await api(`/v1/students/${activeStudentId}/templates/${previewTemplateId}/import`, {
+      const path =
+        previewSource === 'MANUAL'
+          ? `/v1/students/${activeStudentId}/plans`
+          : `/v1/students/${activeStudentId}/templates/${previewTemplateId}/import`;
+      const result = await api(path, {
         method: 'POST',
         body: JSON.stringify(body),
       });
@@ -585,6 +648,8 @@ export function App() {
       setStatus(`计划已创建 · ${result.origin}。学生确认时间未自动写入。`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '不能确认创建');
+    } finally {
+      setConfirming(false);
     }
   }
 
@@ -592,8 +657,21 @@ export function App() {
     setPreviewTemplateId('');
     setPreviewTasks([]);
     setCoCreationAttested(false);
+    setConfirming(false);
+    if (previewSource === 'MANUAL') {
+      setScreen('s06');
+      setStatus('已取消预览，未创建计划、规则或任务。');
+      return;
+    }
     setScreen('s07');
     setStatus('已取消预览，未创建计划、规则或任务。');
+  }
+
+  function cancelManualDraft() {
+    setPreviewTasks([]);
+    setCoCreationAttested(false);
+    setScreen(sessionScope === 'STUDENT' ? 'student' : 'p05');
+    setStatus('已取消填写，未创建计划、规则或任务。');
   }
 
   async function loadPlans() {
@@ -833,6 +911,9 @@ export function App() {
           <button type="button" data-testid="open-templates" onClick={() => void openTemplates()}>
             打开模板库
           </button>
+          <button type="button" data-testid="open-manual-plan" onClick={() => void openManualCreate()}>
+            自己添加
+          </button>
           <button type="button" data-testid="open-plans" onClick={() => void loadPlans()}>
             打开计划
           </button>
@@ -932,12 +1013,63 @@ export function App() {
           <button
             type="button"
             data-testid="confirm-plan"
-            disabled={!confirmAllowed || (sessionScope === 'GUARDIAN' && !coCreationAttested)}
+            disabled={!confirmAllowed || confirming || (sessionScope === 'GUARDIAN' && !coCreationAttested)}
             onClick={() => void confirmPlan()}
           >
-            确认创建计划
+            {confirming ? '正在创建计划' : '确认创建计划'}
           </button>
           <button type="button" data-testid="cancel-preview" onClick={() => cancelPreview()}>
+            取消
+          </button>
+        </section>
+      ) : null}
+
+      {screen === 's06' ? (
+        <section>
+          <h2>S06 自己添加计划</h2>
+          <p>不使用模板。预览不会创建计划。</p>
+          <label>
+            任务名
+            <input
+              data-testid="manual-task-name"
+              value={draftTaskName}
+              onChange={(event) => setDraftTaskName(event.target.value)}
+            />
+          </label>
+          <label>
+            科目
+            <input
+              data-testid="manual-task-subject"
+              value={draftTaskSubject}
+              onChange={(event) => setDraftTaskSubject(event.target.value)}
+            />
+          </label>
+          <label>
+            完成标准
+            <input
+              data-testid="manual-task-standard"
+              value={draftTaskStandard}
+              onChange={(event) => setDraftTaskStandard(event.target.value)}
+            />
+          </label>
+          <label>
+            重复
+            <select
+              data-testid="manual-repeat-kind"
+              value={draftRepeatKind}
+              onChange={(event) =>
+                setDraftRepeatKind(event.target.value as 'ONCE' | 'DAILY' | 'WEEKLY_DAYS')
+              }
+            >
+              <option value="ONCE">单次</option>
+              <option value="DAILY">每天</option>
+              <option value="WEEKLY_DAYS">每周指定日</option>
+            </select>
+          </label>
+          <button type="button" data-testid="preview-manual-plan" onClick={() => void previewManual()}>
+            预览
+          </button>
+          <button type="button" data-testid="cancel-manual-plan" onClick={() => cancelManualDraft()}>
             取消
           </button>
         </section>
@@ -988,6 +1120,12 @@ export function App() {
               </li>
             ))}
           </ul>
+          <button type="button" data-testid="open-templates-from-tasks" onClick={() => void openTemplates()}>
+            选择模板
+          </button>
+          <button type="button" data-testid="open-manual-from-tasks" onClick={() => void openManualCreate()}>
+            自己添加
+          </button>
           <button type="button" data-testid="back-from-tasks" onClick={() => setScreen(sessionScope === 'STUDENT' ? 'student' : 'p05')}>
             返回
           </button>
@@ -1026,6 +1164,9 @@ export function App() {
           <p>当前会话只能看到绑定档案。切回家长需要二次验证，不是前端开关。</p>
           <button type="button" data-testid="open-student-templates" onClick={() => void openTemplates()}>
             打开模板库
+          </button>
+          <button type="button" data-testid="open-student-manual-plan" onClick={() => void openManualCreate()}>
+            自己添加
           </button>
           <button type="button" data-testid="open-student-tasks" onClick={() => void loadTasks()}>
             打开今日任务

@@ -6,7 +6,7 @@
 
 文档交接已经完成。STP 003 已在本地建立可重复安装、检查、测试和构建的 TypeScript 工作区骨架。这不等于完成 M0、STP 001 或 STP 002，也不等于接口已冻结或业务功能已验收。
 
-STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已实施**，见 `docs/STP006_IMPLEMENTATION_REPORT.md`；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。本轮将第一批与已验证的 P05／A02 纳入 `origin/main` 远端基线。GitHub Actions 在 push 后按新 SHA 跟踪，不以 CI #5（`9118468`）代替。原库 `stp004_identity` 只读。测试目标为独占库 `stp006_fresh`（七条迁移），夹具 `stp006_six_to_seven` 验证六→七；`stp005_rev_*` 与 four-to-six 夹具保留。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 现覆盖 STP 004／005 及 **STP 006 第一批**（仍不覆盖 STP 009 或 006 后续批次）。
+STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已在 `f0ffa10` 落地，第二批 S06 空白创建本轮实施**，见 `docs/STP006_IMPLEMENTATION_REPORT.md`；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。GitHub Actions **CI #6**（run [`35197116890`](https://github.com/xyq-dev/studysteps/actions/runs/35197116890)，SHA `f0ffa10`）**success**。本轮 S06 提交后按新 SHA 跟踪，不以 CI #6 代替。原库 `stp004_identity` 只读。测试目标仍为 `stp006_fresh`（七条迁移，本批未新增第八条）；夹具 `stp006_six_to_seven` 与 four-to-six 保留原范围。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 覆盖 STP 004／005 及 **STP 006 第一批＋S06 最小闭环**（仍不覆盖 006 改期／horizon 工人或 STP 009）。
 
 下文「STP 004 实现前审查」是 **2026-09-13 代码开始前快照**（当时 API 仅 `/health`、无业务 Prisma 模型）。它不是当前代码状态。当前实现状态以本段、`docs/TASKS.md` 的 STP 004 条目和上述报告为准。
 
@@ -23,7 +23,9 @@ STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（ru
 | `pnpm test`（本机 2026-09-16，历史） | domain 21、contracts 7、ui/admin/web 各 1、api **105 passed / 0 skipped**。当时宣称的「四项已修复」已被 2026-09-17 反例推翻，见实施报告第 11–12 节 |
 | `pnpm test`（本机 2026-09-17 STP 006 第一批） | domain 28、contracts 7、ui/admin/web 各 1、api **131 passed / 0 skipped / 0 failed**；目标库 `stp006_fresh`／夹具 `stp006_six_to_seven`；exit 0 |
 | Playwright E2E（本机 2026-09-17 STP 006 第一批） | 6 passed（STP004 UI、STP005 UI、STP005 walkthrough×3、STP006 walkthrough）；exit 0 |
-| STP 006 | 第一批已纳入远端基线：第七条迁移、test-v2 隔离同意、preview／import 真写入、14 天实例、S03／学生 S07／只读日程。S06／改期／拆分／horizon 工人未做。不得标整个阶段完成 |
+| `pnpm test`（本机 2026-09-17 STP 006 第二批 S06） | domain 29、contracts 8、ui/admin/web 各 1、api **137 passed / 0 skipped / 0 failed**；目标库 `stp006_fresh`；exit 0 |
+| Playwright E2E（本机 2026-09-17 STP 006 第二批 S06） | 7 passed（含 STP006 S06 walkthrough）；exit 0 |
+| STP 006 | 第一批已在 `f0ffa10`。第二批 S06 空白创建：`POST /plans/preview` 与 `POST /plans`，无第八条迁移。改期／拆分／暂停归档／horizon 工人未做。不得标整个阶段完成 |
 
 下方「已核验的工作区事实」表保留 STP 003／审查时快照，其中“无 HEAD／CI 未跑”不是 2026-09-16 现状。
 
@@ -153,7 +155,7 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 | M1 | STP 003 独立仓库与 CI 基础 | 已完成 | 本地骨架、锁文件与根命令已验收；远端 `main@576da3d`；CI #1 run 35049218151 success |
 | M1 | STP 004 档案与授权基础 | 进行中 | 隔离库证据见实施报告第 10–11 节；CI #1 五套集成测试 84/0 未 skip；不得标完成；T02-D 本地已在 STP 005 执行、待 CI；不得写“第 1–8 项均修复” |
 | 基础内容 | STP 005 学段与模板种子 | 两个页面阻塞已关闭，产品验收未完成 | CI #5 `9118468`；P05／A02 复测见 `STP005_BROWSER_EVIDENCE.md` |
-| M2 | STP 006 计划与任务生成 | 第一批本地已实施；整个阶段未完成 | 第七条迁移、隔离 test-v2、preview／import、14 天实例；见实施报告。S06／改期／horizon 工人未做 |
+| M2 | STP 006 计划与任务生成 | 第一批＋S06 最小闭环已实施；整个阶段未完成 | 第七条未改。S06 手动 preview／create。改期／暂停归档／horizon 工人未做 |
 | M2 | STP 007 完成与计时 | 待开始 | 依赖 STP 006 的稳定任务实例模型 |
 | M3 | STP 008 报告与家庭协作 | 待开始 | 依赖可靠的完成、调整和计时记录 |
 | M4 | STP 009 后台与数据权利 | 待开始 | 依赖前述业务对象和权限边界 |
@@ -177,6 +179,6 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 
 ## 下一步
 
-1. STP 004 仍进行中。CI #5（run 35179504850，`9118468`）已记录。不要把 STP 004 标完成。T11-3／CON-3 **计划写入子项**已在 STP 006 第一批覆盖；完成／计时仍延期。
-2. STP 005：两个页面阻塞已关闭，产品验收未完成。STP 006 第一批已纳入远端基线，**不宣称整个阶段完成**。Playwright 不在 CI 工作流中。不得宣称 M0／STP 002／接口已冻结。
-3. 本轮提交范围：STP 006 第一批源码／测试／第七条迁移／隔离脚本，以及此前已验证的 P05／A02 与 E2E。原库 `stp004_identity` 与旧 fresh／旧 four-to-six 保持只读。本轮测试库为 `stp006_fresh`／`stp006_six_to_seven`。GitHub Actions 在 push 后跟踪。
+1. STP 004 仍进行中。CI #6（run 35197116890，`f0ffa10`）已记录。不要把 STP 004 标完成。T11-3／CON-3 已覆盖模板 import 与手动 `POST /plans`；完成／计时仍延期。
+2. STP 005：两个页面阻塞已关闭，产品验收未完成。STP 006 第一批＋S06 最小闭环本轮提交，**不宣称整个阶段完成**。Playwright 不在 CI 工作流中。不得宣称 M0／STP 002／接口已冻结。
+3. 本轮提交范围：S06 空白创建契约／API／H5／测试与文档。七条已发布迁移 checksum 未改，无第八条。原库与四→六、六→七夹具保留。GitHub Actions 在 push 后跟踪。

@@ -1,6 +1,8 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query, Req, Res } from '@nestjs/common';
 import {
+  createManualPlanSchema,
   listTasksQuerySchema,
+  previewManualPlanSchema,
   previewTemplateSchema,
   taskHorizonSchema,
 } from '@studysteps/contracts';
@@ -9,6 +11,7 @@ import { RuntimeConfig } from '../common/runtime-config';
 import { IdentityService } from '../auth/identity.service';
 import { assertAllowedOrigin } from '../auth/origin';
 import { assertBoundCsrf } from '../common/csrf';
+import { IdempotencyService } from '../common/idempotency.service';
 import { PlanningService } from './planning.service';
 
 @Controller('v1')
@@ -17,6 +20,7 @@ export class PlanningController {
     private readonly planning: PlanningService,
     private readonly identity: IdentityService,
     private readonly runtime: RuntimeConfig,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   private get config() {
@@ -35,6 +39,37 @@ export class PlanningController {
     const session = await this.guardWrite(request);
     res.setHeader('Cache-Control', 'no-store');
     return this.planning.preview(session, studentId, templateId, previewTemplateSchema.parse(body ?? {}));
+  }
+
+  @Post('students/:studentId/plans/preview')
+  @HttpCode(200)
+  async previewManual(
+    @Param('studentId') studentId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.previewManual(session, studentId, previewManualPlanSchema.parse(body ?? {}));
+  }
+
+  @Post('students/:studentId/plans')
+  async createPlan(
+    @Param('studentId') studentId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(201);
+    return this.planning.createPlan(
+      session,
+      studentId,
+      createManualPlanSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 
   @Get('students/:studentId/plans')

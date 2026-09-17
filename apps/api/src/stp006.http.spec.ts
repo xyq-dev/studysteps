@@ -463,4 +463,186 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     expect(['SESSION_SCOPE_FORBIDDEN', 'LEARNING_ACCESS_BLOCKED', 'CONSENT_REQUIRED']).toContain(denied.body.code);
     expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
   });
+
+  const manualTask = {
+    name: '自主阅读',
+    subject: '自定义',
+    standard: '读完指定页并口头复述',
+    repeatKind: 'DAILY' as const,
+  };
+
+  async function previewAndCreate(
+    cookies: CookieJar,
+    student: { id: string; version: number },
+    options: { attested?: boolean; idempotencyKey?: string; mutate?: (body: Record<string, unknown>) => void; tasks?: typeof manualTask[] } = {},
+  ) {
+    const preview = await agent()
+      .post(`/v1/students/${student.id}/plans/preview`)
+      .set(writeHeaders(cookies))
+      .send({ tasks: options.tasks ?? [manualTask] });
+    expect(preview.status).toBe(200);
+    const body: Record<string, unknown> = {
+      expectedStudentVersion: student.version,
+      previewDigest: preview.body.previewDigest,
+      tasks: preview.body.tasks,
+      coCreationAttested: options.attested ?? true,
+    };
+    options.mutate?.(body);
+    const created = await agent()
+      .post(`/v1/students/${student.id}/plans`)
+      .set(writeHeaders(cookies, options.idempotencyKey))
+      .send(body);
+    return { preview, created };
+  }
+
+  it('S06 preview cancel and illegal input leave no rows', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '手动取消'));
+    const preview = await agent()
+      .post(`/v1/students/${student.id}/plans/preview`)
+      .set(writeHeaders(auth.cookies))
+      .send({ tasks: [manualTask] });
+    expect(preview.status).toBe(200);
+    expect(preview.body.template).toBeNull();
+    expect(preview.body.confirmAllowed).toBe(true);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+    const empty = await agent()
+      .post(`/v1/students/${student.id}/plans`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        expectedStudentVersion: student.version,
+        previewDigest: preview.body.previewDigest,
+        tasks: [],
+        coCreationAttested: true,
+      });
+    expect(empty.status).toBe(400);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+    const nameless = await agent()
+      .post(`/v1/students/${student.id}/plans/preview`)
+      .set(writeHeaders(auth.cookies))
+      .send({ tasks: [{ name: '', subject: '自定义', standard: '完成' }] });
+    expect(nameless.status).toBe(400);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+  });
+
+  it('S06 legal create, replay, conflict, actor and window', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '手动成功'));
+    const missing = await previewAndCreate(auth.cookies, student, { attested: false });
+    expect(missing.created.status).toBe(400);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+
+    const key = randomUUID();
+    const first = await previewAndCreate(auth.cookies, student, { attested: true, idempotencyKey: key });
+    expect(first.created.status).toBe(201);
+    expect(first.created.body.origin).toBe('GUARDIAN_ASSISTED');
+    expect(first.created.body.createdByAccountId).toBeTruthy();
+    expect(first.created.body.studentConfirmedAt).toBeNull();
+    expect(first.created.body.sourceTemplateVersionId).toBeNull();
+    expect(first.created.body.series[0].name).toBe('自主阅读');
+    const occ = await prisma.taskOccurrence.findMany({
+      where: { series: { planId: first.created.body.id } },
+    });
+    expect(occ.length).toBeGreaterThan(0);
+    expect(occ.length).toBeLessThanOrEqual(14);
+    expect(occ.every((row) => row.gradeLabelSnapshot === '一年级')).toBe(true);
+
+    const replay = await previewAndCreate(auth.cookies, student, { attested: true, idempotencyKey: key });
+    expect(replay.created.status).toBe(201);
+    expect(replay.created.body.id).toBe(first.created.body.id);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(1);
+
+    const conflict = await previewAndCreate(auth.cookies, student, {
+      attested: true,
+      idempotencyKey: key,
+      mutate: (body) => {
+        body.expectedStudentVersion = student.version + 9;
+      },
+    });
+    expect(conflict.created.status).toBe(409);
+    expect(conflict.created.body.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('S06 custom grade can create while template import stays blocked', async () => {
+    const auth = await signIn();
+    const grades = await agent().get('/v1/grade-configs').set('Cookie', auth.cookies.header());
+    const custom = grades.body.items.find(
+      (item: { schoolSystemCode: string; gradeCode: string }) =>
+        item.schoolSystemCode === 'CUSTOM' && item.gradeCode === 'EXPERIMENTAL',
+    );
+    const student = await createStudent(auth.cookies, '自定义手动');
+    const set = await agent()
+      .patch(`/v1/students/${student.id}`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        kind: 'EDUCATION',
+        expectedVersion: student.version,
+        gradeConfigId: custom.id,
+        termCode: 'FIRST_TERM',
+        changeKind: 'SET',
+      });
+    expect(set.status).toBeLessThan(300);
+    expect(set.body.education.catalogEntryKey).toBeNull();
+    const listed = await agent().get(`/v1/templates?studentId=${student.id}`).set('Cookie', auth.cookies.header());
+    expect(listed.body.importAllowed).toBe(false);
+    const denied = await agent()
+      .post(`/v1/students/${student.id}/templates/${listed.body.items[0].id}/import`)
+      .set(writeHeaders(auth.cookies))
+      .send({});
+    expect(denied.status).toBe(400);
+    expect(denied.body.code).toBe('TEMPLATE_IMPORT_NOT_ALLOWED');
+    const created = await previewAndCreate(auth.cookies, { id: student.id, version: set.body.version });
+    expect(created.created.status).toBe(201);
+    expect(created.created.body.sourceTemplateVersionId).toBeNull();
+    const occ = await prisma.taskOccurrence.findFirst({
+      where: { series: { planId: created.created.body.id } },
+    });
+    expect(occ?.gradeLabelSnapshot).toBe('实验班');
+    expect(occ?.catalogEntryKeySnapshot).toBe('');
+  });
+
+  it('S06 withdraw refuses new writes and idempotent replay', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '手动撤回'));
+    const preview = await agent()
+      .post(`/v1/students/${student.id}/plans/preview`)
+      .set(writeHeaders(auth.cookies))
+      .send({ tasks: [manualTask] });
+    const key = randomUUID();
+    const consents = await agent().get(`/v1/students/${student.id}/consents`).set('Cookie', auth.cookies.header());
+    const current = consents.body.items.find((item: { current: boolean }) => item.current);
+    const withdrawn = await agent()
+      .post(`/v1/students/${student.id}/consents/${current.id}/withdraw`)
+      .set(writeHeaders(auth.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    expect(withdrawn.status).toBeLessThan(300);
+    const body = {
+      expectedStudentVersion: withdrawn.body.version ?? student.version,
+      previewDigest: preview.body.previewDigest,
+      tasks: preview.body.tasks,
+      coCreationAttested: true,
+    };
+    const denied = await agent().post(`/v1/students/${student.id}/plans`).set(writeHeaders(auth.cookies, key)).send(body);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(['SESSION_SCOPE_FORBIDDEN', 'LEARNING_ACCESS_BLOCKED', 'CONSENT_REQUIRED']).toContain(denied.body.code);
+    const replay = await agent().post(`/v1/students/${student.id}/plans`).set(writeHeaders(auth.cookies, key)).send(body);
+    expect(replay.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+  });
+
+  it('S06 expired step-up cannot confirm', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '手动二次验证'));
+    const previous = runtime.value.timing.stepUpMs;
+    runtime.value.timing.stepUpMs = 1;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const denied = await previewAndCreate(auth.cookies, student, { attested: true });
+      expect(denied.created.status).toBe(403);
+      expect(denied.created.body.code).toBe('STEP_UP_REQUIRED');
+      expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+    } finally {
+      runtime.value.timing.stepUpMs = previous;
+    }
+  });
 });

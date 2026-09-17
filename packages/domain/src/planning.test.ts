@@ -5,7 +5,9 @@ import {
   horizonWindow,
   isoWeekdayFromLocalDate,
   localDateInTimeZone,
+  manualPreviewCanonicalPayload,
   normalizePreviewTasks,
+  previewCanonicalPayload,
 } from './planning.js';
 import { consentCoversPlanWrites, TEST_POLICY_V1_SCOPE, TEST_POLICY_V2_SCOPE } from './consent-scope.js';
 import { guardianMay, studentMay } from './permissions.js';
@@ -61,6 +63,24 @@ describe('STP 006 horizon and repeat expansion', () => {
 
   it('normalizes empty preview as invalid', () => {
     expect(() => normalizePreviewTasks([], 'DAILY', '2026-09-17')).toThrow(/PREVIEW_EMPTY/);
+  });
+
+  it('keeps manual preview fingerprints distinct from template imports', () => {
+    const series = normalizePreviewTasks(
+      [{ name: '自主阅读', subject: '自定义', standard: '完成' }],
+      'DAILY',
+      '2026-09-17',
+    );
+    const education = {
+      gradeConfigId: 'g1',
+      gradeConfigVersionId: 'v1',
+      catalogEntryKey: '',
+      timezone: 'Asia/Shanghai',
+    };
+    expect(manualPreviewCanonicalPayload({ education, series }).source).toBe('MANUAL');
+    expect(previewCanonicalPayload({ templateId: 't1', templateVersion: '1', education, series })).not.toHaveProperty(
+      'source',
+    );
   });
 });
 

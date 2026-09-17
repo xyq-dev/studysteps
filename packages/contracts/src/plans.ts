@@ -35,6 +35,17 @@ export const importTemplateConfirmSchema = z.object({
   coCreationAttested: z.boolean().optional(),
 });
 
+export const previewManualPlanSchema = z.object({
+  tasks: z.array(planSeriesInputSchema).min(1).max(20),
+});
+
+export const createManualPlanSchema = z.object({
+  expectedStudentVersion: z.number().int().positive(),
+  previewDigest: z.string().min(16).max(128),
+  tasks: z.array(planSeriesInputSchema).min(1).max(20),
+  coCreationAttested: z.boolean().optional(),
+});
+
 export const listTasksQuerySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -47,5 +58,7 @@ export const taskHorizonSchema = z.object({
 
 export type PreviewTemplateInput = z.infer<typeof previewTemplateSchema>;
 export type ImportTemplateConfirmInput = z.infer<typeof importTemplateConfirmSchema>;
+export type PreviewManualPlanInput = z.infer<typeof previewManualPlanSchema>;
+export type CreateManualPlanInput = z.infer<typeof createManualPlanSchema>;
 export type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
 export type TaskHorizonInput = z.infer<typeof taskHorizonSchema>;

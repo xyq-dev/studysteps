@@ -65,7 +65,7 @@ S07「导入」改为进入 **S03 预览**，不再直接创建。无映射项�
 | S08 | 计划目标、规则列表、未来实例、暂停／归档入口（第二批可写；第一批可先只读） | 执行记录完成态（无完成接口） |
 | S04 | 只读今日任务列表；无计划／休息／计划已暂停文案 | 打卡、计时、下一项完成 |
 | S09 | 只读完成标准、步骤、安排日期 | 开始学习、直接记录 |
-| S06／S12 | 第二／三批；契约与生成器第一批就要可复用 | 本批不做空白创建 UI 不等于取消 S06 |
+| S06／S12 | 第二批最小：S06 填写 → 预览／确认 → 计划与任务可见。暂停／归档／改期／S12 仍后延 | 本批不做范围编辑 |
 
 ## 4. 业务与数据规则
 
@@ -200,7 +200,8 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | POST | `/v1/students/:id/templates/:templateId/import` | G 创建+step-up+双方约定／S 创建 | 确认体＝预览结果；`expectedStudentVersion`；`previewDigest`；Guardian 必带 `coCreationAttested: true` | 201 计划＋规则＋**确认事务内**已生成的 14 日实例摘要；记录 `origin`／操作者／归属；`studentConfirmedAt=null`（Guardian） | Idempotency；学生 version | 403 `LEARNING_ACCESS_BLOCKED`／`STEP_UP_REQUIRED`；400 `TEMPLATE_IMPORT_NOT_ALLOWED`／缺双方约定；409 预览过期／version／异体幂等 |
 | GET | `/v1/students/:id/plans` | G／S 读 | 游标、状态过滤 | 计划摘要 | 只读 | 401／404 |
 | GET | `/v1/students/:id/plans/:planId` | 同上 | — | 计划＋规则 | 只读 | 404 同形 |
-| POST | `/v1/students/:id/plans` | 同创建 | 无模板的手动计划（S06，第二批） | 201 | 同 import | 同上 |
+| POST | `/v1/students/:id/plans/preview` | G 读／S 读 | 无模板；`tasks` 至少一条；零 INSERT | 200 规范化预览、7 日估量、`previewDigest`、教育指纹；`template=null` | 无写 | 400 非法条目；403 会话范围；学习访问未开通时 `confirmAllowed=false`，**不得**返回 `TEMPLATE_IMPORT_NOT_ALLOWED` |
+| POST | `/v1/students/:id/plans` | 同创建 | 无模板手动确认；`expectedStudentVersion`；`previewDigest`；Guardian 必带 `coCreationAttested: true`；**禁止**伪造 `templateId` | 201 计划＋规则＋确认事务内 14 日实例；`sourceTemplateVersionId=null`；`origin` 仍为 `GUARDIAN_ASSISTED`／`STUDENT`（不用 `MANUAL` 绕过双方约定 CHECK） | Idempotency `plans.create`；学生 version | 403 同意／授权／step-up；400 缺双方约定／非法条目；409 预览过期／version／异体幂等。自定义年级无映射时**允许**本入口 |
 | PATCH | `/v1/students/:id/plans/:planId` | G／S 更新 | `expectedVersion`；暂停／恢复／归档 | 新 version | 幂等+version | 409；403 |
 | PATCH | `/v1/plans/:planId/series/:seriesId` | 更新 | `scope=THIS_OCCURRENCE\|FUTURE`；`fromLocalDate` | 新 series version | version | 409；禁止改完成行 |
 | GET | `/v1/students/:id/tasks?date=` | 读 | 本地日；可 `from`/`to` | 已存在实例；排除取消；跳过仍列出但标未完成 | **只读；不创建、不补齐**。成功请求的会话 `lastSeen` 节流 heartbeat 沿用 STP 004 HB-1，失败不 heartbeat | 401／404 |
@@ -244,7 +245,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 批 | 内容 | 退出 |
 | --- | --- | --- |
 | **A 最小闭环（第一批，不扩展）** | 第七条迁移；preview／import 真写入；GET plans／plan／tasks（只读）；学生 S07 入口；S03 确认／取消；S05／S08／S04 只读；确认事务内生成 14 天；`POST .../task-horizon` 端点（供窗口外补齐与 T06-P-UNIQ，无工人）；T06-P-*（含 ORIGIN）、T03 生成、T02-D-OCC、T11-3／CON-3 的**计划写** | 闭环可点；无完成；无新同意文档、无重新同意页 |
-| B | S06 手动 `POST /plans`；暂停／恢复／归档；THIS／FUTURE；改期；S12 最小 | T04、T07 |
+| B | S06 手动 `POST /plans` 最小闭环（本批）；暂停／恢复／归档；THIS／FUTURE；改期；S12 最小（后延） | 手动创建可点；无改期 |
 | C | 拆分；Outbox 工人调用同一 `task-horizon` POST（不经 GET）；S09 只读细节打磨 | TASKS 所列后台任务入口 |
 
 A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不是 P1。
@@ -341,7 +342,16 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 第一批功能范围已固定。B04 正式文案／经营主体仍是上线前置，不阻塞隔离开发。生产告知不得用 test-v2 冒充。
 
-后续批次仍开放：S06 手动创建、范围编辑、暂停／归档、改期、拆分、`task-horizon` 真补齐与 Outbox 工人。打卡、计时、通知、运营发布不在本 STP。
+后续批次仍开放：范围编辑、暂停／归档、改期、拆分、`task-horizon` 真补齐与 Outbox 工人。打卡、计时、通知、运营发布不在本 STP。
+
+### 3.4 S06 空白创建（第二批最小）
+
+- **进入：** S05／P05／学生视图「自己添加」。不经过模板 ID，不创建空白模板行。
+- **填写：** 至少一条任务：名称、科目（可「自定义」）、完成标准、重复（单次／每天／每周指定日）、开始日、结束日或持续。计划表无独立名称列，列表展示首条任务名。
+- **预览：** `POST /v1/students/:id/plans/preview`。零 INSERT。取消只丢客户端状态。
+- **确认：** `POST /v1/students/:id/plans`。复用第一批确认事务、14 天窗口、去重键、年级快照。保存中禁用按钮；失败保留输入。
+- **自定义年级：** 无 `catalogEntryKey` 只禁止模板导入；手动创建仍要求教育已配置、当前必要同意、`PLAN_CREATE` 与 test-v2 用途。
+- **结构：** 第七条已允许 `source_template_version_id` 为空；本批不新增迁移。
 
 ## 12. 与原文冲突（不改 `PROJECT_PLAN.md`）
 

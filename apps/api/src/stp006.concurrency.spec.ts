@@ -262,4 +262,50 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await holder.end();
     await observer.end();
   });
+
+  it('T11-3 / CON-3 revoke-first: overlapping manual create cannot commit after withdraw', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '撤回先手动');
+    const preview = await agent()
+      .post(`/v1/students/${ready.studentId}/plans/preview`)
+      .set(writeHeaders(cookies))
+      .send({
+        tasks: [{ name: '自主阅读', subject: '自定义', standard: '读完', repeatKind: 'DAILY' }],
+      });
+    expect(preview.status).toBe(200);
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const withdrawPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/consents/${ready.consentId}/withdraw`)
+        .set(writeHeaders(cookies))
+        .send({ reasonCode: 'GUARDIAN_REQUEST' }),
+    );
+    const revoker = await waitForWaiterOnHolder(observer, holderPid, 'CON-3 manual withdraw waits on pairing');
+    const createPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/plans`)
+        .set(writeHeaders(cookies))
+        .send({
+          expectedStudentVersion: ready.version,
+          previewDigest: preview.body.previewDigest,
+          tasks: preview.body.tasks,
+          coCreationAttested: true,
+        }),
+    );
+    const overlap = await waitForWaiterOnHolder(observer, revoker.waiter_pid, 'CON-3 manual create waits on withdraw');
+    expect(overlap.holder_pid).toBe(revoker.waiter_pid);
+    await holder.query('ROLLBACK');
+    const withdrawn = await withdrawPromise;
+    expect(withdrawn.body.status).toBe('RESTRICTED');
+    const created = await createPromise;
+    expect(created.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: ready.studentId } })).toBe(0);
+    await holder.end();
+    await observer.end();
+  });
 });

@@ -80,8 +80,30 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 ## 9. 未解决问题
 
-- STP 006 后续批次（S06、改期、拆分、暂停归档、horizon 工人）
+- STP 006 后续：范围编辑、改期、拆分、暂停／归档、horizon 工人
 - B04 正式告知／经营主体
 - STP 004 整体未完成；STP 005 产品验收未完成
 - Playwright 不在 CI
 - GitHub Actions 结果见 push 后的 run，不以本地 passed 数量写成 CI 数量
+
+## 10. 第二批 S06 空白创建（2026-09-17）
+
+实施前 HEAD：`f0ffa10903e0a87dec7c2b736cf6083ef059d3b1`（`main@f0ffa10`）。
+
+原因：按定稿补 S06 填写 → 预览／确认 → 计划与任务可见，不提前做改期或 horizon。
+
+结构：第七条已允许 `source_template_version_id` 为空；**未新增第八条迁移**。`origin` 仍为 `GUARDIAN_ASSISTED`／`STUDENT`，避免用 `MANUAL` 绕过双方约定 CHECK。test-v2 未改。
+
+接口：`POST /v1/students/:id/plans/preview`（200，零 INSERT）；`POST /v1/students/:id/plans`（201，确认事务复用 14 天窗口与去重键）。自定义年级无映射禁止模板导入，手动创建按教育／同意／`PLAN_CREATE`。
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 8、domain 29、ui／admin／web 各 1、api **137 passed / 0 failed / 0 skipped** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright | 0 | **7 passed / 0 failed**（含 S06 walkthrough） |
+| GitHub Actions | push 后跟踪 | 不以 CI #6 代替；日志 403 时不编造 CI 测试数 |
+
+用户可见：P05／S05／学生视图「自己添加」进入 S06；取消不写库；确认中禁用按钮；刷新后仍可打开计划。模板导入路径未删。
