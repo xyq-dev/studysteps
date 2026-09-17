@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -10,14 +10,6 @@ const pg = require('pg');
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const runtimeFile = join(root, '.local', 'stp004-pg', 'runtime.env');
-if (existsSync(runtimeFile)) {
-  for (const line of readFileSync(runtimeFile, 'utf8').split(/\r?\n/)) {
-    if (!line || line.startsWith('#')) continue;
-    const index = line.indexOf('=');
-    const key = line.slice(0, index);
-    if (!process.env[key]) process.env[key] = line.slice(index + 1);
-  }
-}
 
 const FOUR = [
   '20260914000000_stp004_identity_profiles_consents',
@@ -27,29 +19,87 @@ const FOUR = [
 ];
 const FIFTH = '20260916120000_stp005_grade_catalog_templates';
 const SIXTH = '20260916180000_stp005_legacy_fingerprint_and_version_fks';
-const FORBIDDEN = new Set(['stp004_identity', 'stp004_identity_fresh', 'stp005_four_to_six', 'stp005_unknown_leftover']);
+export const FORBIDDEN = new Set([
+  'stp004_identity',
+  'stp004_identity_fresh',
+  'stp005_four_to_six',
+  'stp005_unknown_leftover',
+]);
 const originalName = 'stp004_identity';
-const fixtureName = 'stp005_rev_four_to_six';
+export const FIXTURE_DATABASE = 'stp005_rev_four_to_six';
+const fixtureName = FIXTURE_DATABASE;
 const forgedName = 'stp005_rev_forged';
 const dirtyName = 'stp005_rev_dirty';
 
-const adminUrl = process.env.STP004_ADMIN_DATABASE_URL;
-if (!adminUrl) {
-  throw new Error('STP004_ADMIN_DATABASE_URL is required');
-}
-
-function rewriteDb(url, name) {
+export function rewriteDb(url, name) {
   return url.replace(/\/[^/?]+(\?|$)/, `/${name}$1`);
 }
 
-function databaseName(url) {
+export function databaseName(url) {
   return new URL(url).pathname.replace(/^\//, '').split('?')[0];
 }
 
-function assertAllowed(name) {
+export function shouldRequireLocalOriginalIdentity(env = process.env) {
+  if (env.CI === 'true' || env.CI === '1') return false;
+  if (env.STP004_CI_PREPARED === '1' || env.STP004_CI_PREPARE === '1') return false;
+  return true;
+}
+
+export function assertOriginalIdentityPresence(rowCount, env = process.env) {
+  if (!shouldRequireLocalOriginalIdentity(env)) return;
+  if (rowCount !== 1) {
+    throw new Error('original stp004_identity missing; leave it read-only');
+  }
+}
+
+export function assertAllowed(name) {
   if (FORBIDDEN.has(name) || !name.startsWith('stp005_rev_')) {
     throw new Error(`refusing database ${name}`);
   }
+}
+
+export function recordFourToSixFixtureUrl(fixtureUrl, env = process.env, io = { appendFileSync }) {
+  const name = databaseName(fixtureUrl);
+  assertAllowed(name);
+  env.STP005_FOUR_TO_SIX_DATABASE_URL = fixtureUrl;
+  if (env.GITHUB_ENV) {
+    io.appendFileSync(env.GITHUB_ENV, `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}\n`);
+  }
+}
+
+function loadRuntimeEnv(env = process.env) {
+  if (!existsSync(runtimeFile)) return;
+  for (const line of readFileSync(runtimeFile, 'utf8').split(/\r?\n/)) {
+    if (!line || line.startsWith('#')) continue;
+    const index = line.indexOf('=');
+    const key = line.slice(0, index);
+    if (!env[key]) env[key] = line.slice(index + 1);
+  }
+}
+
+function sameEndpoint(left, right) {
+  const a = new URL(left);
+  const b = new URL(right);
+  return a.hostname === b.hostname && (a.port || '5432') === (b.port || '5432');
+}
+
+function runtimeAdminUrl(text) {
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('STP004_ADMIN_DATABASE_URL=')) {
+      return line.slice('STP004_ADMIN_DATABASE_URL='.length);
+    }
+  }
+  return '';
+}
+
+export function shouldWriteLocalRuntime(localAdminUrl, fixtureUrl) {
+  return Boolean(localAdminUrl) && sameEndpoint(localAdminUrl, fixtureUrl);
+}
+
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return resolve(fileURLToPath(import.meta.url)).toLowerCase() === resolve(entry).toLowerCase();
 }
 
 function prisma(args, databaseUrl) {
@@ -165,15 +215,29 @@ async function seedAssigned(client, accountId) {
   return assignedId;
 }
 
-const postgresAdminUrl = rewriteDb(adminUrl, 'postgres');
-const admin = new pg.Client({ connectionString: postgresAdminUrl, connectionTimeoutMillis: 8000 });
-await admin.connect();
-const originalOpen = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [originalName]);
-if (originalOpen.rowCount !== 1) {
-  await admin.end();
-  throw new Error('original stp004_identity missing; leave it read-only');
-}
-await recreateDb(admin, fixtureName);
+async function main() {
+  loadRuntimeEnv();
+  const adminUrl = process.env.STP004_ADMIN_DATABASE_URL;
+  if (!adminUrl) {
+    throw new Error('STP004_ADMIN_DATABASE_URL is required');
+  }
+
+  const postgresAdminUrl = rewriteDb(adminUrl, 'postgres');
+  const admin = new pg.Client({ connectionString: postgresAdminUrl, connectionTimeoutMillis: 8000 });
+  await admin.connect();
+  const originalOpen = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [originalName]);
+  try {
+    assertOriginalIdentityPresence(originalOpen.rowCount);
+  } catch (error) {
+    await admin.end();
+    throw error;
+  }
+  if (originalOpen.rowCount === 1) {
+    process.stdout.write('original stp004_identity present and left unmodified\n');
+  } else {
+    process.stdout.write('CI/prepare path: original stp004_identity is not required on this cluster\n');
+  }
+  await recreateDb(admin, fixtureName);
 await recreateDb(admin, forgedName);
 await recreateDb(admin, dirtyName);
 await admin.end();
@@ -357,21 +421,33 @@ for (const name of [forgedName, dirtyName]) {
 await drop.end();
 
 if (existsSync(runtimeFile)) {
-  let text = readFileSync(runtimeFile, 'utf8');
-  if (text.includes('STP005_FOUR_TO_SIX_DATABASE_URL=')) {
-    text = text.replace(/^STP005_FOUR_TO_SIX_DATABASE_URL=.*$/m, `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}`);
-  } else {
-    text += `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}\n`;
+    const text = readFileSync(runtimeFile, 'utf8');
+    const localAdmin = runtimeAdminUrl(text);
+    if (!localAdmin || !shouldWriteLocalRuntime(localAdmin, fixtureUrl)) {
+      process.stdout.write(
+        'skip writing local runtime.env; fixture cluster is not the local runtime endpoint\n',
+      );
+    } else {
+      let next = text;
+      if (next.includes('STP005_FOUR_TO_SIX_DATABASE_URL=')) {
+        next = next.replace(
+          /^STP005_FOUR_TO_SIX_DATABASE_URL=.*$/m,
+          `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}`,
+        );
+      } else {
+        next += `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}\n`;
+      }
+      writeFileSync(runtimeFile, next);
+      process.stdout.write(
+        'recorded STP005_FOUR_TO_SIX_DATABASE_URL to revised fixture; old fixture URL not reused.\n',
+      );
+    }
   }
-  writeFileSync(runtimeFile, text);
-  process.stdout.write('recorded STP005_FOUR_TO_SIX_DATABASE_URL to revised fixture; old fixture URL not reused.\n');
-}
 
-process.env.STP005_FOUR_TO_SIX_DATABASE_URL = fixtureUrl;
-const githubEnv = process.env.GITHUB_ENV;
-if (githubEnv) {
-  appendFileSync(githubEnv, `STP005_FOUR_TO_SIX_DATABASE_URL=${fixtureUrl}\n`);
-}
-
+recordFourToSixFixtureUrl(fixtureUrl);
 process.stdout.write(`revised four-to-six fixture ready: ${fixtureName}\n`);
-process.exit(0);
+}
+
+if (isDirectRun()) {
+  await main();
+}

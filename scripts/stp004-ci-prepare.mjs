@@ -4,6 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import {
+  FIXTURE_DATABASE,
+  recordFourToSixFixtureUrl,
+  rewriteDb,
+} from './stp005-four-to-six-upgrade.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -124,9 +129,10 @@ if (missing.length > 0) {
   throw new Error(`missing applied migrations: ${missing.join(',')}`);
 }
 
+const upgradeEnv = { ...process.env };
 const upgrade = spawnSync(process.execPath, [join(root, 'scripts/stp005-four-to-six-upgrade.mjs')], {
   cwd: root,
-  env: process.env,
+  env: upgradeEnv,
   encoding: 'utf8',
   windowsHide: true,
 });
@@ -136,4 +142,27 @@ if (upgrade.status !== 0) {
   process.exit(upgrade.status ?? 1);
 }
 
-process.stdout.write(`CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}\n`);
+const fixtureUrl = rewriteDb(adminUrl, FIXTURE_DATABASE);
+const fixture = new pg.Client({ connectionString: fixtureUrl, connectionTimeoutMillis: 8000 });
+await fixture.connect();
+const fixtureDb = await fixture.query('SELECT current_database() AS name');
+if (fixtureDb.rows[0]?.name !== FIXTURE_DATABASE) {
+  await fixture.end();
+  throw new Error('upgrade fixture connected to the wrong database');
+}
+const leftover = await fixture.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '遗留快照'`,
+);
+await fixture.end();
+if (leftover.rows[0]?.n !== 1) {
+  throw new Error('upgrade fixture leftover row missing after four-to-six');
+}
+
+recordFourToSixFixtureUrl(fixtureUrl, process.env);
+if (process.env.STP005_FOUR_TO_SIX_DATABASE_URL !== fixtureUrl) {
+  throw new Error('STP005_FOUR_TO_SIX_DATABASE_URL was not applied in the current prepare step');
+}
+
+process.stdout.write(
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}\n`,
+);

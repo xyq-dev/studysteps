@@ -185,13 +185,13 @@
 
 ## STP 005：学段与模板种子
 
-状态：本地实现已验证，待 CI（不得标产品验收完成）
+状态：已提交，CI 夹具自包含修复待新 SHA 验证（不得标产品验收完成）
 
 2026-09-16：用户授权代码／Schema／新增迁移后按 `docs/STP005_DESIGN.md` 落地，并完成当时的四项阻塞修复尝试。该「四项已修复」声明已被 2026-09-17 反例推翻（`created_at` 可伪造 leftover；`AGE_BAND_NOT_SUPPORTED` 曾被当成 consentCurrent）。历史说明保留在 `docs/STP005_IMPLEMENTATION_REPORT.md` 第 11 节。
 
 2026-09-17：仅修订尚未发布的第五／第六条迁移与 activation 失败关闭。可信 leftover 改为第五条锁内封存的 allowlist；`created_at` 不再作为来源。第六条只消费该名单，并在任何版本 ID 回填前全量预检 assigned／current。测试只打在独占库 `stp005_rev_fresh` 与夹具 `stp005_rev_four_to_six`。既有 `stp004_identity`／`stp004_identity_fresh`／`stp005_four_to_six` 未 deploy、未 reset、未改账本。原库只读。STP 004 仍进行中。不得宣称 M0／STP 002／接口冻结。
 
-本地命令（2026-09-17，均为退出码 0，0 skipped）：`pnpm lint`、`pnpm typecheck`、`pnpm test`（139 passed：api 107、domain 22、contracts 7、ui/web/admin 各 1）、`pnpm build`、`pnpm prisma:validate`、`pnpm test:e2e`（Playwright 2 passed）。GitHub Actions **未跑本轮**。
+本地命令（2026-09-17，均为退出码 0，0 skipped）：`pnpm lint`、`pnpm typecheck`、`pnpm test`（139 passed：api 107、domain 22、contracts 7、ui/web/admin 各 1）、`pnpm build`、`pnpm prisma:validate`、`pnpm test:e2e`（Playwright 2 passed）。提交 `cf2bd3a` 后 **CI #2** 在 Prepare isolated PostgreSQL 失败。无 `stp004_identity` 的本轮临时集群复现到 `original stp004_identity missing; leave it read-only`。CI 准备脚本改为不要求开发机原库，并在当前步骤写入 `STP005_FOUR_TO_SIX_DATABASE_URL`。完整 lint／typecheck／test／build／prisma:validate 由新 SHA 的 Actions 验证。不得标产品验收。
 
 目标：建立可配置的学段、学制、年级、学期和科目映射，并提供可预览的原创基础模板。
 
