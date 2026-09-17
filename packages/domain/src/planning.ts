@@ -189,6 +189,16 @@ export function datesToMaterializeForPlan(
   return expandSeriesOccurrences(rule, horizonWindow(todayLocalDate, rule.endLocalDate));
 }
 
+export function missingOccurrenceDates(
+  status: string,
+  rule: SeriesRule,
+  todayLocalDate: string,
+  existingKeys: Iterable<string>,
+): string[] {
+  const have = new Set(existingKeys);
+  return datesToMaterializeForPlan(status, rule, todayLocalDate).filter((day) => !have.has(day));
+}
+
 export function resolvePlanStatusTransition(
   current: string,
   action: string,

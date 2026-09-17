@@ -214,9 +214,9 @@
 
 ## STP 006：计划与任务生成
 
-状态：第一批＋S06＋暂停／恢复／归档已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
+状态：第一批＋S06＋暂停／恢复／归档＋按需 task-horizon 已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
 
-2026-09-17：本批落地计划暂停／恢复／归档：`PATCH /v1/students/:id/plans/:planId`。复用既有 status／cancel_reason／plan_adjustments，无第八条迁移。S05／S08 按权限提供暂停、恢复、归档（归档前确认；无取消归档）。GET 不补齐；horizon／worker 未实现。范围编辑、改期、拆分与 Outbox 工人仍属后续批次。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
+2026-09-17：本批落地按需 `POST /v1/students/:id/task-horizon`。复用既有生成逻辑、唯一约束与幂等记录，无第八条迁移。S05／S08 提供「更新未来任务」；GET 与只读加载仍不补齐。不接 worker／Outbox。范围编辑、改期、拆分仍属后续批次。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
 
 目标：实现计划、重复规则、每日任务实例、范围编辑、暂停、归档、改期和拆分。
 

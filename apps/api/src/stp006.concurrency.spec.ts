@@ -411,4 +411,237 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await holder.end();
     await observer.end();
   });
+
+  async function deleteLatestOccurrence(planId: string) {
+    const last = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId } },
+      orderBy: { occurrenceKey: 'desc' },
+    });
+    await prisma.taskOccurrence.delete({ where: { id: last.id } });
+    return last;
+  }
+
+  it('two overlapping horizon POSTs wait on the plan row and insert each key once', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '双补齐竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const deleted = await deleteLatestOccurrence(plan.id);
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM study_plans WHERE id = $1 FOR UPDATE', [plan.id]);
+    const holderPid = await backendPid(holder);
+    const firstPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const firstWaiter = await waitForWaiterOnHolder(observer, holderPid, 'horizon A waits on plan');
+    const blockedFirst = await observer.query<{ pids: number[] }>('SELECT pg_blocking_pids($1::int) AS pids', [
+      firstWaiter.waiter_pid,
+    ]);
+    expect(blockedFirst.rows[0]?.pids ?? []).toContain(holderPid);
+    const secondPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const secondWaiter = await waitForWaiterOnHolder(observer, firstWaiter.waiter_pid, 'horizon B waits on A');
+    expect(secondWaiter.holder_pid).toBe(firstWaiter.waiter_pid);
+    await holder.query('ROLLBACK');
+    const first = await firstPromise;
+    const second = await secondPromise;
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.insertedCount + second.body.insertedCount).toBe(1);
+    expect(
+      await prisma.taskOccurrence.count({
+        where: { series: { planId: plan.id }, occurrenceKey: deleted.occurrenceKey },
+      }),
+    ).toBe(1);
+    const grouped = await prisma.taskOccurrence.groupBy({
+      by: ['seriesId', 'occurrenceKey'],
+      where: { series: { planId: plan.id } },
+      _count: { _all: true },
+    });
+    expect(grouped.every((row) => row._count._all === 1)).toBe(true);
+    await holder.end();
+    await observer.end();
+  });
+
+  it('pause-first overlapping horizon does not generate; horizon-first then pause cancels the new row', async () => {
+    const { cookies } = await signIn();
+    const pauseFirstReady = await readyStudent(cookies, '暂停先补齐');
+    const pauseFirstPlan = await importReadyPlan(cookies, pauseFirstReady);
+    const pauseHolder = new pg.Client({ connectionString });
+    const pauseObserver = await observerClient();
+    await pauseHolder.connect();
+    await pauseHolder.query('BEGIN');
+    await pauseHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [pauseFirstReady.pairingId]);
+    const pauseHolderPid = await backendPid(pauseHolder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${pauseFirstReady.studentId}/plans/${pauseFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: pauseFirstPlan.version }),
+    );
+    const pauseWaiter = await waitForWaiterOnHolder(pauseObserver, pauseHolderPid, 'pause waits on pairing');
+    const horizonAfterPausePromise = dispatch(
+      agent()
+        .post(`/v1/students/${pauseFirstReady.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const horizonAfterPauseWaiter = await waitForWaiterOnHolder(
+      pauseObserver,
+      pauseWaiter.waiter_pid,
+      'horizon waits on pause',
+    );
+    expect(horizonAfterPauseWaiter.holder_pid).toBe(pauseWaiter.waiter_pid);
+    await pauseHolder.query('ROLLBACK');
+    const paused = await pausePromise;
+    const horizonAfterPause = await horizonAfterPausePromise;
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    expect(horizonAfterPause.status).toBe(200);
+    expect(horizonAfterPause.body.insertedCount).toBe(0);
+    expect(horizonAfterPause.body.skipped).toEqual(
+      expect.arrayContaining([expect.objectContaining({ reason: 'PLAN_PAUSED', planId: pauseFirstPlan.id })]),
+    );
+    expect(await prisma.taskOccurrence.count({ where: { series: { planId: pauseFirstPlan.id }, status: 'PLANNED' } })).toBe(0);
+    await pauseHolder.end();
+    await pauseObserver.end();
+
+    const horizonFirstReady = await readyStudent(cookies, '补齐先暂停');
+    const horizonFirstPlan = await importReadyPlan(cookies, horizonFirstReady);
+    const deleted = await deleteLatestOccurrence(horizonFirstPlan.id);
+    const horizonHolder = new pg.Client({ connectionString });
+    const horizonObserver = await observerClient();
+    await horizonHolder.connect();
+    await horizonHolder.query('BEGIN');
+    await horizonHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [horizonFirstReady.pairingId]);
+    const horizonHolderPid = await backendPid(horizonHolder);
+    const horizonPromise = dispatch(
+      agent()
+        .post(`/v1/students/${horizonFirstReady.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const horizonWaiter = await waitForWaiterOnHolder(horizonObserver, horizonHolderPid, 'horizon waits on pairing');
+    const pauseAfterPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${horizonFirstReady.studentId}/plans/${horizonFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: horizonFirstPlan.version }),
+    );
+    const pauseAfterWaiter = await waitForWaiterOnHolder(
+      horizonObserver,
+      horizonWaiter.waiter_pid,
+      'pause waits on horizon',
+    );
+    expect(pauseAfterWaiter.holder_pid).toBe(horizonWaiter.waiter_pid);
+    await horizonHolder.query('ROLLBACK');
+    const horizonFirst = await horizonPromise;
+    const pausedAfter = await pauseAfterPromise;
+    expect(horizonFirst.status).toBe(200);
+    expect(horizonFirst.body.insertedCount).toBe(1);
+    expect(pausedAfter.status).toBe(200);
+    expect(pausedAfter.body.status).toBe('PAUSED');
+    const newRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: horizonFirstPlan.id }, occurrenceKey: deleted.occurrenceKey },
+    });
+    expect(newRow.status).toBe('CANCELLED');
+    expect(newRow.cancelReason).toBe('PLAN_PAUSED');
+    await horizonHolder.end();
+    await horizonObserver.end();
+  });
+
+  it('archive-first overlapping horizon does not generate; horizon-first then archive cancels the new row', async () => {
+    const { cookies } = await signIn();
+    const archiveFirstReady = await readyStudent(cookies, '归档先补齐');
+    const archiveFirstPlan = await importReadyPlan(cookies, archiveFirstReady);
+    const archiveHolder = new pg.Client({ connectionString });
+    const archiveObserver = await observerClient();
+    await archiveHolder.connect();
+    await archiveHolder.query('BEGIN');
+    await archiveHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [archiveFirstReady.pairingId]);
+    const archiveHolderPid = await backendPid(archiveHolder);
+    const archivePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${archiveFirstReady.studentId}/plans/${archiveFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'ARCHIVE', expectedVersion: archiveFirstPlan.version }),
+    );
+    const archiveWaiter = await waitForWaiterOnHolder(archiveObserver, archiveHolderPid, 'archive waits on pairing');
+    const horizonAfterArchivePromise = dispatch(
+      agent()
+        .post(`/v1/students/${archiveFirstReady.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const horizonAfterArchiveWaiter = await waitForWaiterOnHolder(
+      archiveObserver,
+      archiveWaiter.waiter_pid,
+      'horizon waits on archive',
+    );
+    expect(horizonAfterArchiveWaiter.holder_pid).toBe(archiveWaiter.waiter_pid);
+    await archiveHolder.query('ROLLBACK');
+    const archived = await archivePromise;
+    const horizonAfterArchive = await horizonAfterArchivePromise;
+    expect(archived.status).toBe(200);
+    expect(archived.body.status).toBe('ARCHIVED');
+    expect(horizonAfterArchive.status).toBe(200);
+    expect(horizonAfterArchive.body.insertedCount).toBe(0);
+    expect(horizonAfterArchive.body.skipped).toEqual(
+      expect.arrayContaining([expect.objectContaining({ reason: 'PLAN_ARCHIVED', planId: archiveFirstPlan.id })]),
+    );
+    await archiveHolder.end();
+    await archiveObserver.end();
+
+    const horizonFirstReady = await readyStudent(cookies, '补齐先归档');
+    const horizonFirstPlan = await importReadyPlan(cookies, horizonFirstReady);
+    const deleted = await deleteLatestOccurrence(horizonFirstPlan.id);
+    const horizonHolder = new pg.Client({ connectionString });
+    const horizonObserver = await observerClient();
+    await horizonHolder.connect();
+    await horizonHolder.query('BEGIN');
+    await horizonHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [horizonFirstReady.pairingId]);
+    const horizonHolderPid = await backendPid(horizonHolder);
+    const horizonPromise = dispatch(
+      agent()
+        .post(`/v1/students/${horizonFirstReady.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const horizonWaiter = await waitForWaiterOnHolder(horizonObserver, horizonHolderPid, 'horizon waits on pairing');
+    const archiveAfterPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${horizonFirstReady.studentId}/plans/${horizonFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'ARCHIVE', expectedVersion: horizonFirstPlan.version }),
+    );
+    const archiveAfterWaiter = await waitForWaiterOnHolder(
+      horizonObserver,
+      horizonWaiter.waiter_pid,
+      'archive waits on horizon',
+    );
+    expect(archiveAfterWaiter.holder_pid).toBe(horizonWaiter.waiter_pid);
+    await horizonHolder.query('ROLLBACK');
+    const horizonFirst = await horizonPromise;
+    const archivedAfter = await archiveAfterPromise;
+    expect(horizonFirst.status).toBe(200);
+    expect(horizonFirst.body.insertedCount).toBe(1);
+    expect(archivedAfter.status).toBe(200);
+    expect(archivedAfter.body.status).toBe('ARCHIVED');
+    const newRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: horizonFirstPlan.id }, occurrenceKey: deleted.occurrenceKey },
+    });
+    expect(newRow.status).toBe('CANCELLED');
+    expect(newRow.cancelReason).toBe('PLAN_ARCHIVED');
+    await horizonHolder.end();
+    await horizonObserver.end();
+  });
 });

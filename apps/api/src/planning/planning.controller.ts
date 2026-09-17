@@ -136,14 +136,21 @@ export class PlanningController {
   }
 
   @Post('students/:studentId/task-horizon')
+  @HttpCode(200)
   async horizon(
-    @Param('studentId') _studentId: string,
+    @Param('studentId') studentId: string,
     @Body() body: unknown,
     @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    await this.guardWrite(request);
-    taskHorizonSchema.parse(body ?? {});
-    return this.planning.taskHorizon();
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.taskHorizon(
+      session,
+      studentId,
+      taskHorizonSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 
   private async guardRead(request: Request) {

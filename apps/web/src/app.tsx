@@ -167,6 +167,7 @@ export function App() {
   >([]);
   const [planActionPending, setPlanActionPending] = useState(false);
   const [archiveConfirmPlanId, setArchiveConfirmPlanId] = useState<string | null>(null);
+  const [horizonPending, setHorizonPending] = useState(false);
   const studentLoadSeq = useRef(0);
   const bootstrapSeq = useRef(0);
 
@@ -191,6 +192,7 @@ export function App() {
     setTasks([]);
     setPlanActionPending(false);
     setArchiveConfirmPlanId(null);
+    setHorizonPending(false);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -826,6 +828,19 @@ export function App() {
     );
   }
 
+  function renderHorizonAction() {
+    return (
+      <button
+        type="button"
+        data-testid="update-task-horizon"
+        disabled={horizonPending}
+        onClick={() => void updateTaskHorizon()}
+      >
+        {horizonPending ? '正在更新未来任务' : '更新未来任务'}
+      </button>
+    );
+  }
+
   function renderArchiveConfirm() {
     if (!archiveConfirmPlanId) {
       return null;
@@ -850,6 +865,35 @@ export function App() {
         </button>
       </div>
     );
+  }
+
+  async function updateTaskHorizon() {
+    if (!activeStudentId || horizonPending) {
+      return;
+    }
+    setHorizonPending(true);
+    setStatus('正在更新未来任务');
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/task-horizon`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      await loadTasks();
+      const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+      if (result.insertedCount > 0) {
+        setStatus(`已新增 ${result.insertedCount} 个任务（${result.from} 至 ${result.to}）。`);
+      } else if (skipped.some((item: { reason?: string }) => item.reason === 'PLAN_PAUSED')) {
+        setStatus('计划已暂停，未生成新任务。');
+      } else if (skipped.some((item: { reason?: string }) => item.reason === 'PLAN_ARCHIVED')) {
+        setStatus('计划已归档，未生成新任务。');
+      } else {
+        setStatus(`当前窗口无需补齐（${result.from} 至 ${result.to}）。`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法更新未来任务');
+    } finally {
+      setHorizonPending(false);
+    }
   }
 
   async function loadTasks() {
@@ -1271,6 +1315,7 @@ export function App() {
               </ul>
             </div>
           ) : null}
+          {renderHorizonAction()}
           <button type="button" data-testid="open-tasks-from-plan" onClick={() => void loadTasks()}>
             查看日程
           </button>
@@ -1304,6 +1349,7 @@ export function App() {
                 </li>
               ))}
           </ul>
+          {renderHorizonAction()}
           <button type="button" data-testid="open-templates-from-tasks" onClick={() => void openTemplates()}>
             选择模板
           </button>

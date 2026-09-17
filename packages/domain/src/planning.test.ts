@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   addLocalDays,
   datesToMaterializeForPlan,
+  missingOccurrenceDates,
   expandSeriesOccurrences,
   horizonWindow,
   isoWeekdayFromLocalDate,
@@ -147,6 +148,11 @@ describe('STP 006 plan status transitions', () => {
     expect(datesToMaterializeForPlan('ACTIVE', daily, '2026-09-17').length).toBeGreaterThan(0);
     expect(datesToMaterializeForPlan('PAUSED', daily, '2026-09-17')).toEqual([]);
     expect(datesToMaterializeForPlan('ARCHIVED', daily, '2026-09-17')).toEqual([]);
+    expect(missingOccurrenceDates('ACTIVE', daily, '2026-09-17', datesToMaterializeForPlan('ACTIVE', daily, '2026-09-17'))).toEqual(
+      [],
+    );
+    expect(missingOccurrenceDates('ACTIVE', daily, '2026-09-18', ['2026-09-18'])).toContain('2026-10-01');
+    expect(missingOccurrenceDates('PAUSED', daily, '2026-09-18', [])).toEqual([]);
   });
 
   it('cancels future planned rows and restores only PLAN_PAUSED rows still in window', () => {

@@ -151,3 +151,44 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 用户可见：S08／S05 对 ACTIVE 计划可暂停／归档，对 PAUSED 可恢复／归档；归档前说明并确认；归档后只读查看历史。S05 显示「计划已暂停」且任务不可继续执行。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。
 
+## 12. 本批：按需 task-horizon（2026-09-17）
+
+实施前 HEAD：`9274f2e`（基线 `main@9274f2e`，与 `origin/main` 一致）。保留工作区既有未提交文件；本批只提交 horizon 相关改动。
+
+原因：把 `POST /v1/students/:id/task-horizon` 从 `409 TASK_HORIZON_NOT_AVAILABLE` 换成真实、受授权控制的按需补齐，复用确认事务同一套展开／去重，而不是另写任务展开器。不接 worker／Outbox，不做范围编辑、改期、拆分、打卡、计时、通知或运营发布。
+
+结构：现有 `task_occurrences` 唯一约束与 `idempotency_records` 足够；幂等成功体写入 `resourceId` JSON，避免跨日同键再生成。**未新增第八条迁移**。七条已发布迁移 checksum 与 test-v2 未改。写入仅隔离测试库／CI。原库与四→六、六→七夹具保持原范围。
+
+接口：`POST /v1/students/:id/task-horizon`。沿用 `TASK_ADJUST`、当前同意、CSRF、幂等 `tasks.horizon`、7.7 锁序、锁内重验计划状态、成功 heartbeat。监护人 step-up 与其他学习写入相同，不要求共同制定。锁内读 `clock_timestamp()` 映射档案时区今日…今日+13。只 INSERT 缺失 key；`GET` 零补齐。返回 `from`／`to`／`insertedCount`／`skipped`。无新增为 200，授权失败为 4xx。
+
+页面：S05／S08「更新未来任务」；处理中禁用；成功后重新读取任务。无 `useEffect` 自动 POST。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 已满窗口再补齐新增为零 | 通过 | HTTP T06-P-OK 后续 horizon `insertedCount=0` + `ALREADY_EXISTS` |
+| 跨日夹具只补新窗口边，原行不变 | 通过 | HTTP 将 `occurrence_key`／开始日左移一日后只插入 `today+13`；未改系统时钟、无公开调时接口 |
+| 结束日／非重复日／过去日不误补 | 通过 | HTTP 手动 DAILY 截止今日、WEEKLY_DAYS、跨日夹具不插入昨日 |
+| 两重叠 POST 不重复实例 | 通过 | 并发：独立连接、`pg_blocking_pids`、每 `(seriesId, occurrenceKey)` 一行，两响应 `insertedCount` 之和为 1 |
+| PAUSED／ARCHIVED 不生成，取消不复活 | 通过 | HTTP 200 + `PLAN_PAUSED`／`PLAN_ARCHIVED` skip；`USER_CANCELLED` 行保持 |
+| 补齐与暂停／归档双提交顺序 | 通过 | 并发 pause-first／horizon-first 与 archive 对称；状态先提交时 `insertedCount=0`；补齐先提交后新行被正确取消 |
+| 同意／会话撤销后写入与重放拒绝 | 通过 | HTTP 4xx；无计划 200+`NO_PLAN` 与 403／404／401 区分；GET 不补齐 |
+| 升年级后新行新快照、旧行不变 | 通过 | HTTP 删缺口后 PROMOTE 再 POST：新年级只在新行 |
+| Chromium 点击补齐，刷新一致 | 通过 | `stp006-horizon-walkthrough.spec.ts`；导入／S06／状态 walkthrough 仍绿 |
+| 无第八条迁移 | 通过 | 仍 7 条；本批无新 migration 文件 |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 10、domain 32、ui／admin／web 各 1、api **149 passed / 0 failed / 0 skipped** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `apps/web` e2e | 0 | **9 passed / 0 failed**（含模板导入、S06、状态、horizon walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright，不宣称已执行；日志 403 时只写证据边界 |
+
+用户可见：S08／S05 可点「更新未来任务」；已满窗口提示无需补齐；失败不假成功。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。未宣称 worker 验收。
+

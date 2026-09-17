@@ -52,9 +52,11 @@ export const listTasksQuerySchema = z.object({
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 
-export const taskHorizonSchema = z.object({
-  expectedStudentVersion: z.number().int().positive().optional(),
-});
+export const taskHorizonSchema = z
+  .object({
+    expectedStudentVersion: z.number().int().positive().optional(),
+  })
+  .strict();
 
 export const patchPlanSchema = z.object({
   action: z.enum(['PAUSE', 'RESUME', 'ARCHIVE']),

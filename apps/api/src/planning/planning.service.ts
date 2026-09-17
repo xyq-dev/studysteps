@@ -12,6 +12,7 @@ import {
   previewCanonicalPayload,
   manualPreviewCanonicalPayload,
   datesToMaterializeForPlan,
+  missingOccurrenceDates,
   occurrenceCancellableOnPlanHalt,
   occurrenceRestorableOnResume,
   planAllowsOccurrenceGeneration,
@@ -25,6 +26,7 @@ import type {
   PatchPlanInput,
   PreviewManualPlanInput,
   PreviewTemplateInput,
+  TaskHorizonInput,
 } from '@studysteps/contracts';
 import { AppError } from '../common/app-error';
 import { digestCanonical } from '../common/crypto';
@@ -44,6 +46,36 @@ import { CatalogService } from '../catalog/catalog.service';
 import { StudentsService } from '../students/students.service';
 
 type Tx = Prisma.TransactionClient;
+
+type HorizonSkip = {
+  reason: 'NO_PLAN' | 'PLAN_PAUSED' | 'PLAN_ARCHIVED' | 'ALREADY_EXISTS' | 'SERIES_ENDED' | 'NO_DATES_IN_WINDOW';
+  planId?: string;
+  seriesId?: string;
+};
+
+type HorizonResult = {
+  from: string;
+  to: string;
+  insertedCount: number;
+  skipped: HorizonSkip[];
+};
+
+type OccurrenceSnapshot = {
+  timezone: string;
+  gradeConfigId: string;
+  gradeConfigVersionId: string;
+  stageCode: string;
+  schoolSystemCode: string;
+  gradeCode: string;
+  gradeLabel: string;
+  termCode: string;
+  catalogEntryKey: string;
+  name: string;
+  subject: string;
+  completionStandard: string;
+  durationMinutes: number | null;
+  stepsJson: string;
+};
 
 @Injectable()
 export class PlanningService {
@@ -458,8 +490,83 @@ export class PlanningService {
     });
   }
 
-  async taskHorizon(): Promise<never> {
-    throw new AppError('TASK_HORIZON_NOT_AVAILABLE', '滚动窗口补齐属于后续批次', 409);
+  async taskHorizon(session: DeviceSession, studentId: string, input: TaskHorizonInput, idempotencyKey: string) {
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'TASK_ADJUST');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = this.idempotency.requestDigest({
+      operation: 'tasks.horizon',
+      studentId,
+      input,
+    });
+    const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'tasks.horizon', idempotencyKey);
+    const existingRows = await this.prisma.taskOccurrence.findMany({
+      where: { series: { plan: { studentProfileId: studentId } } },
+      select: { id: true, seriesId: true, series: { select: { planId: true } } },
+    });
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [...new Set(existingRows.map((row) => row.series.planId))],
+      taskSeriesIds: [...new Set(existingRows.map((row) => row.seriesId))],
+      taskOccurrenceIds: existingRows.map((row) => row.id),
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'TASK_ADJUST',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      const begun = await this.idempotency.begin(tx, actor, 'tasks.horizon', idempotencyKey, requestDigest, now);
+      if (begun.kind === 'REPLAY' && begun.resourceId) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return this.parseHorizonReplay(begun.resourceId);
+      }
+      if (input.expectedStudentVersion != null && current.version !== input.expectedStudentVersion) {
+        throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const plans = await tx.studyPlan.findMany({
+        where: { studentProfileId: studentId },
+        include: { series: { include: { occurrences: true } } },
+      });
+      const seriesIds = plans.flatMap((plan) => plan.series.map((item) => item.id));
+      const occurrenceIds = plans.flatMap((plan) => plan.series.flatMap((item) => item.occurrences.map((row) => row.id)));
+      if (
+        !lockIdsContain(locked, {
+          planIds: plans.map((plan) => plan.id),
+          taskSeriesIds: seriesIds,
+          taskOccurrenceIds: occurrenceIds,
+        })
+      ) {
+        throw new IncompleteLockSetError({
+          planIds: plans.map((plan) => plan.id),
+          taskSeriesIds: seriesIds,
+          taskOccurrenceIds: occurrenceIds,
+        });
+      }
+      const result = await this.fillMissingOccurrences(tx, current, plans, now);
+      await this.idempotency.complete(tx, begun.recordId, 'TaskHorizon', JSON.stringify(result), 200, now);
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return result;
+    }, graph);
   }
 
   private assertCreateAttestation(session: DeviceSession, coCreationAttested: boolean | undefined) {
@@ -594,34 +701,201 @@ export class PlanningService {
         throw new AppError('PLAN_STATUS_INVALID', '暂停或归档的计划不能生成新实例', 409);
       }
       const dates = datesToMaterializeForPlan(plan.status, rule, today);
-      if (dates.length === 0) {
-        continue;
-      }
-      await tx.taskOccurrence.createMany({
-        data: dates.map((localDate) => ({
-          seriesId: series.id,
-          occurrenceKey: localDate,
-          originalLocalDate: localDate,
-          scheduledLocalDate: localDate,
-          timezoneSnapshot: current.timezone,
-          status: 'PLANNED',
-          nameSnapshot: rule.name,
-          subjectSnapshot: rule.subject,
-          completionStandardSnapshot: rule.completionStandard,
-          durationMinutesSnapshot: rule.durationMinutes,
-          stepsSnapshotJson: JSON.stringify(rule.steps),
-          gradeConfigId: preview.education.gradeConfigId,
-          gradeConfigVersionId: preview.education.gradeConfigVersionId,
-          stageCodeSnapshot,
-          schoolSystemCodeSnapshot,
-          gradeCodeSnapshot,
-          gradeLabelSnapshot,
-          termCodeSnapshot,
-          catalogEntryKeySnapshot: preview.education.catalogEntryKey,
-        })),
+      await this.insertOccurrenceDates(tx, series.id, dates, {
+        timezone: current.timezone,
+        gradeConfigId: preview.education.gradeConfigId,
+        gradeConfigVersionId: preview.education.gradeConfigVersionId,
+        stageCode: stageCodeSnapshot,
+        schoolSystemCode: schoolSystemCodeSnapshot,
+        gradeCode: gradeCodeSnapshot,
+        gradeLabel: gradeLabelSnapshot,
+        termCode: termCodeSnapshot,
+        catalogEntryKey: preview.education.catalogEntryKey,
+        name: rule.name,
+        subject: rule.subject,
+        completionStandard: rule.completionStandard,
+        durationMinutes: rule.durationMinutes,
+        stepsJson: JSON.stringify(rule.steps),
       });
     }
     return plan;
+  }
+
+  private parseHorizonReplay(resourceId: string): HorizonResult {
+    try {
+      const parsed = JSON.parse(resourceId) as HorizonResult;
+      if (!parsed || typeof parsed.from !== 'string' || typeof parsed.insertedCount !== 'number') {
+        throw new Error('invalid');
+      }
+      return parsed;
+    } catch {
+      throw new AppError('VALIDATION_ERROR', '幂等重放结果不可用', 409);
+    }
+  }
+
+  private ruleFromSeries(series: {
+    name: string;
+    subject: string;
+    completionStandard: string;
+    durationMinutes: number | null;
+    stepsJson: string;
+    repeatKind: string;
+    weekdaysJson: string | null;
+    startLocalDate: string;
+    endLocalDate: string | null;
+    ongoing: boolean;
+  }): SeriesRule {
+    return {
+      name: series.name,
+      subject: series.subject,
+      completionStandard: series.completionStandard,
+      durationMinutes: series.durationMinutes,
+      steps: JSON.parse(series.stepsJson) as string[],
+      repeatKind: series.repeatKind as SeriesRule['repeatKind'],
+      weekdays: series.weekdaysJson ? (JSON.parse(series.weekdaysJson) as SeriesRule['weekdays']) : null,
+      startLocalDate: series.startLocalDate,
+      endLocalDate: series.endLocalDate,
+      ongoing: series.ongoing,
+    };
+  }
+
+  private async insertOccurrenceDates(tx: Tx, seriesId: string, dates: string[], snapshot: OccurrenceSnapshot) {
+    if (dates.length === 0) {
+      return 0;
+    }
+    const created = await tx.taskOccurrence.createMany({
+      data: dates.map((localDate) => ({
+        seriesId,
+        occurrenceKey: localDate,
+        originalLocalDate: localDate,
+        scheduledLocalDate: localDate,
+        timezoneSnapshot: snapshot.timezone,
+        status: 'PLANNED',
+        nameSnapshot: snapshot.name,
+        subjectSnapshot: snapshot.subject,
+        completionStandardSnapshot: snapshot.completionStandard,
+        durationMinutesSnapshot: snapshot.durationMinutes,
+        stepsSnapshotJson: snapshot.stepsJson,
+        gradeConfigId: snapshot.gradeConfigId,
+        gradeConfigVersionId: snapshot.gradeConfigVersionId,
+        stageCodeSnapshot: snapshot.stageCode,
+        schoolSystemCodeSnapshot: snapshot.schoolSystemCode,
+        gradeCodeSnapshot: snapshot.gradeCode,
+        gradeLabelSnapshot: snapshot.gradeLabel,
+        termCodeSnapshot: snapshot.termCode,
+        catalogEntryKeySnapshot: snapshot.catalogEntryKey,
+      })),
+      skipDuplicates: true,
+    });
+    return created.count;
+  }
+
+  private async fillMissingOccurrences(
+    tx: Tx,
+    student: {
+      id: string;
+      timezone: string;
+      stageCode: string | null;
+      schoolSystemCode: string | null;
+      gradeCode: string | null;
+      gradeLabel: string | null;
+      termCode: string | null;
+      gradeConfigId: string | null;
+      gradeConfigVersionId: string | null;
+    },
+    plans: Array<{
+      id: string;
+      status: string;
+      series: Array<{
+        id: string;
+        name: string;
+        subject: string;
+        completionStandard: string;
+        durationMinutes: number | null;
+        stepsJson: string;
+        repeatKind: string;
+        weekdaysJson: string | null;
+        startLocalDate: string;
+        endLocalDate: string | null;
+        ongoing: boolean;
+        occurrences: Array<{ occurrenceKey: string }>;
+      }>;
+    }>,
+    now: Date,
+  ): Promise<HorizonResult> {
+    const today = localDateInTimeZone(now, student.timezone);
+    const window = horizonWindow(today, null);
+    const skipped: HorizonSkip[] = [];
+    let insertedCount = 0;
+    if (plans.length === 0) {
+      return { from: window.from, to: window.to, insertedCount: 0, skipped: [{ reason: 'NO_PLAN' }] };
+    }
+    if (
+      !student.stageCode ||
+      !student.schoolSystemCode ||
+      !student.gradeCode ||
+      !student.gradeLabel ||
+      !student.termCode ||
+      !student.gradeConfigId ||
+      !student.gradeConfigVersionId
+    ) {
+      throw new AppError('LEARNING_ACCESS_BLOCKED', '尚未配置教育资料，不能生成任务', 403);
+    }
+    const gradeVersion = await tx.gradeConfigVersion.findUnique({
+      where: { id: student.gradeConfigVersionId },
+    });
+    const snapshotBase = {
+      timezone: student.timezone,
+      gradeConfigId: student.gradeConfigId,
+      gradeConfigVersionId: student.gradeConfigVersionId,
+      stageCode: student.stageCode,
+      schoolSystemCode: student.schoolSystemCode,
+      gradeCode: student.gradeCode,
+      gradeLabel: student.gradeLabel,
+      termCode: student.termCode,
+      catalogEntryKey: gradeVersion?.catalogEntryKey ?? '',
+    };
+    for (const plan of plans) {
+      if (!planAllowsOccurrenceGeneration(plan.status)) {
+        skipped.push({
+          reason: plan.status === 'PAUSED' ? 'PLAN_PAUSED' : 'PLAN_ARCHIVED',
+          planId: plan.id,
+        });
+        continue;
+      }
+      for (const series of plan.series) {
+        const rule = this.ruleFromSeries(series);
+        const wanted = datesToMaterializeForPlan(plan.status, rule, today);
+        if (wanted.length === 0) {
+          const ended = rule.endLocalDate != null && rule.endLocalDate < today;
+          skipped.push({
+            reason: ended ? 'SERIES_ENDED' : 'NO_DATES_IN_WINDOW',
+            planId: plan.id,
+            seriesId: series.id,
+          });
+          continue;
+        }
+        const missing = missingOccurrenceDates(
+          plan.status,
+          rule,
+          today,
+          series.occurrences.map((row) => row.occurrenceKey),
+        );
+        if (missing.length === 0) {
+          skipped.push({ reason: 'ALREADY_EXISTS', planId: plan.id, seriesId: series.id });
+          continue;
+        }
+        insertedCount += await this.insertOccurrenceDates(tx, series.id, missing, {
+          ...snapshotBase,
+          name: series.name,
+          subject: series.subject,
+          completionStandard: series.completionStandard,
+          durationMinutes: series.durationMinutes,
+          stepsJson: series.stepsJson,
+        });
+      }
+    }
+    return { from: window.from, to: window.to, insertedCount, skipped };
   }
 
   private async readAuthorized<T>(

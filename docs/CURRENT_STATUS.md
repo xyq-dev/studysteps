@@ -6,7 +6,7 @@
 
 文档交接已经完成。STP 003 已在本地建立可重复安装、检查、测试和构建的 TypeScript 工作区骨架。这不等于完成 M0、STP 001 或 STP 002，也不等于接口已冻结或业务功能已验收。
 
-STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已在 `f0ffa10` 落地，S06 空白创建已在 `9a2c46f` 落地，本轮实施计划暂停／恢复／归档**，见 `docs/STP006_IMPLEMENTATION_REPORT.md` 第 11 节；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。GitHub Actions **CI #6**（run [`35197116890`](https://github.com/xyq-dev/studysteps/actions/runs/35197116890)，SHA `f0ffa10`）**success**。本轮提交后按新 SHA 跟踪。原库 `stp004_identity` 只读。测试目标仍为 `stp006_fresh`（七条迁移，本批未新增第八条）；夹具 `stp006_six_to_seven` 与 four-to-six 保留原范围。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 覆盖 STP 004／005 及 **STP 006 第一批＋S06＋计划状态控制**（仍不覆盖 006 改期／horizon 工人或 STP 009）。
+STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已在 `f0ffa10` 落地，S06 空白创建已在 `9a2c46f` 落地，暂停／恢复／归档已在 `9274f2e` 落地，本轮实施按需 task-horizon**，见 `docs/STP006_IMPLEMENTATION_REPORT.md` 第 12 节；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。GitHub Actions **CI #8**（run 见实施报告，SHA `9274f2e`）**success**。本轮提交后按新 SHA 跟踪。原库 `stp004_identity` 只读。测试目标仍为 `stp006_fresh`（七条迁移，本批未新增第八条）；夹具 `stp006_six_to_seven` 与 four-to-six 保留原范围。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 覆盖 STP 004／005 及 **STP 006 第一批＋S06＋计划状态控制＋按需 horizon**（仍不覆盖 006 改期／horizon 工人或 STP 009）。
 
 下文「STP 004 实现前审查」是 **2026-09-13 代码开始前快照**（当时 API 仅 `/health`、无业务 Prisma 模型）。它不是当前代码状态。当前实现状态以本段、`docs/TASKS.md` 的 STP 004 条目和上述报告为准。
 
@@ -27,7 +27,9 @@ STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（ru
 | Playwright E2E（本机 2026-09-17 STP 006 第二批 S06） | 7 passed（含 STP006 S06 walkthrough）；exit 0 |
 | `pnpm test`（本机 2026-09-17 STP 006 计划状态控制） | domain 32、contracts 9、ui/admin/web 各 1、api **142 passed / 0 skipped / 0 failed**；目标库 `stp006_fresh`；exit 0 |
 | Playwright E2E（本机 2026-09-17 STP 006 计划状态控制） | 8 passed（含模板导入、S06、状态 walkthrough）；exit 0 |
-| STP 006 | 第一批 `f0ffa10`。S06 `9a2c46f`。本轮暂停／恢复／归档：`PATCH /plans/:planId`，无第八条迁移。改期／拆分／horizon 工人未做。不得标整个阶段完成 |
+| `pnpm test`（本机 2026-09-17 STP 006 按需 horizon） | domain 32、contracts 10、ui/admin/web 各 1、api **149 passed / 0 skipped / 0 failed**；目标库 `stp006_fresh`；exit 0 |
+| Playwright E2E（本机 2026-09-17 STP 006 按需 horizon） | 9 passed（含模板导入、S06、状态、horizon walkthrough）；exit 0 |
+| STP 006 | 第一批 `f0ffa10`。S06 `9a2c46f`。暂停／恢复／归档 `9274f2e`。本轮按需 `POST .../task-horizon`，无第八条迁移。改期／拆分／horizon 工人未做。不得标整个阶段完成 |
 
 下方「已核验的工作区事实」表保留 STP 003／审查时快照，其中“无 HEAD／CI 未跑”不是 2026-09-16 现状。
 

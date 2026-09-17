@@ -10,6 +10,7 @@ import {
   withdrawConsentSchema,
   createManualPlanSchema,
   patchPlanSchema,
+  taskHorizonSchema,
 } from './index.js';
 
 describe('@studysteps/contracts export boundary', () => {
@@ -139,5 +140,12 @@ describe('request validation', () => {
       }),
     ).toEqual({ action: 'PAUSE', expectedVersion: 1 });
     expect(patchPlanSchema.safeParse({ action: 'UNARCHIVE', expectedVersion: 1 }).success).toBe(false);
+  });
+
+  it('rejects client-chosen task horizon windows', () => {
+    expect(taskHorizonSchema.parse({})).toEqual({});
+    expect(taskHorizonSchema.parse({ expectedStudentVersion: 3 })).toEqual({ expectedStudentVersion: 3 });
+    expect(taskHorizonSchema.safeParse({ from: '2026-01-01', to: '2026-12-31' }).success).toBe(false);
+    expect(taskHorizonSchema.safeParse({ studentId: 'other' }).success).toBe(false);
   });
 });
