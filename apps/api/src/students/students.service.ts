@@ -17,6 +17,7 @@ import {
   nextAttemptState,
   normalizePairingCode,
   replayWithdrawEffect,
+  studentMay,
   studentMayReadSelf,
   type EducationChangeKind,
   type EducationSnapshot,
@@ -1065,7 +1066,7 @@ export class StudentsService {
     return { ...policy, document };
   }
 
-  private async assertFreshRequiredConsent(
+  async assertFreshRequiredConsent(
     db: Prisma.TransactionClient | PrismaService,
     studentId: string,
     ageBand: string,
@@ -1237,11 +1238,11 @@ export class StudentsService {
     return this.detail(student, db);
   }
 
-  private async collectStudentGraph(studentId: string, extra: LockIds = {}): Promise<LockIds> {
+  async collectStudentGraph(studentId: string, extra: LockIds = {}): Promise<LockIds> {
     return collectStudentAuthorizationGraph(this.prisma, studentId, extra);
   }
 
-  private async discoverStudentGraph(
+  async discoverStudentGraph(
     tx: Prisma.TransactionClient,
     studentId: string,
     session?: DeviceSession | null,
@@ -1257,7 +1258,7 @@ export class StudentsService {
     });
   }
 
-  private async authorize(session: DeviceSession, studentId: string, action: GuardianAction) {
+  async authorize(session: DeviceSession, studentId: string, action: GuardianAction) {
     return this.authorizeLocked(this.prisma, session, studentId, action);
   }
 
@@ -1278,10 +1279,10 @@ export class StudentsService {
       if (session.studentProfileId !== studentId) {
         throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
       }
-      if (action !== 'PROFILE_READ') {
+      if (!studentMay(asProfileStatus(student.status), action)) {
         throw new AppError('SESSION_SCOPE_FORBIDDEN', '学生会话不能执行该操作', 403);
       }
-      if (!studentMayReadSelf(asProfileStatus(student.status))) {
+      if (action === 'PROFILE_READ' && !studentMayReadSelf(asProfileStatus(student.status))) {
         throw new AppError('AUTH_SESSION_INVALID', '未登录', 401);
       }
       return student;
@@ -1298,7 +1299,7 @@ export class StudentsService {
     return student;
   }
 
-  private async reauthorize(
+  async reauthorize(
     tx: Prisma.TransactionClient,
     session: DeviceSession,
     studentId: string,
@@ -1361,7 +1362,7 @@ export class StudentsService {
     };
   }
 
-  private async activationFor(
+  async activationFor(
     db: Prisma.TransactionClient | PrismaService,
     student: {
       id: string;

@@ -19,7 +19,7 @@ STP 004 **保持进行中**。2026-09-14 日间按 Codex 审查第 1–8 项补�
 | T10-4 | 通过 | matrix | 跨档案 consent／pairing／device 与缺失 ID 同形 404 | 通过 |
 | T11-1 | 通过 | HTTP + Chromium 撤销设备 | 旧学生 cookie／刷新会话 401／未登录 | 通过（顺序撤销；本轮 Chromium 复测） |
 | T11-2 | 通过 | matrix 调内部 `revokeGuardianLink` | 该档案 404／学生会话 401／pairing 401；另一档案仍可读 | 通过（顺序关系撤销） |
-| T11-3 | 部分通过 | HTTP + review + Chromium 撤回 | 档案 `RESTRICTED`；旧学生会话 401；**学习写入接口仍不存在** | 部分通过：同意撤回与学生会话拒绝已测；学习写入 **未执行／延期** 至 STP 006／007 |
+| T11-3 | 部分通过 | HTTP + review + Chromium 撤回；STP 006 计划写 | 档案 `RESTRICTED`；旧学生会话 401；**计划 import 在撤回后拒绝**（`stp006.http.spec.ts`／concurrency） | 部分通过：同意撤回、学生会话拒绝、**计划写入子项已覆盖**；完成／计时／待同步完成仍延期至 STP 007 |
 | T11-4 | 通过 | matrix | 重授后旧学生会话仍 401；新学生模式可读 | 通过 |
 | T11-D | 后续阶段 | — | 通知 worker 不在本阶段；`authorize`／`reauthorize` 不是 worker 守卫 | 后续阶段 |
 | AUTH-1 | 通过 | matrix | 错码／过期／重放／跨设备／跨用途均为 `AUTH_GRANT_INVALID`；失败 challenge 未消费 | 通过 |
@@ -33,7 +33,7 @@ STP 004 **保持进行中**。2026-09-14 日间按 Codex 审查第 1–8 项补�
 | PAIR-4 | 通过 | concurrency PAIR-4 | 生成 vs 兑换、兑换 vs 撤销均重叠等待；无 500；最多一个学生会话 | 通过 |
 | CON-1 | 通过 | concurrency CON-1 | 同 `expectedVersion` 双 patch：一成功一 409；昵称仅为其中之一；version +1 | 通过 |
 | CON-2 | 通过 | concurrency CON-2 | 独立连接持锁 + 真实 HTTP 等待；两种提交顺序 | 通过 |
-| CON-3 | 部分通过 | concurrency CON-3 | 监护人 BASIC vs 撤回仍只证明 RESTRICTED 矩阵；本轮补：学生心跳 vs 设备撤销、step-up vs 撤销、`authVersion` vs 写入、lastSeen 并发单写、幂等重放 vs 关系撤销 | 部分通过。学习待同步写入 **未执行／延期** |
+| CON-3 | 部分通过 | concurrency CON-3 + `stp006.concurrency.spec.ts` | 监护人 BASIC vs 撤回；学生心跳／step-up／authVersion／lastSeen／关系撤销；**计划 import vs 同意撤回两种顺序**（独立连接 + `pg_blocking_pids`） | 部分通过。计划写入子项已覆盖。完成待同步写入仍延期至 STP 007 |
 | IDEM-1 | 通过 | HTTP | 同 key 重放 201，不同 body 409 | 通过 |
 | IDEM-2 | 通过 | matrix | 同 key 重放 `NOT_REPLAYABLE` 无 secret；新 key 签发并撤销旧码 | 通过 |
 | DB-1 | 通过 | `stp004.db.spec.ts` | partial unique 拒绝第二主监护 | 通过 |

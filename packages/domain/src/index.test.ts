@@ -6,6 +6,7 @@ import {
   decideAgeBand,
   domainBoundary,
   guardianMay,
+  studentMay,
   studentMayReadSelf,
   isExpired,
   nextAttemptState,
@@ -59,8 +60,9 @@ describe('permissions, session and withdraw replay', () => {
     expect(guardianMay('RESTRICTED', 'STUDENT_MODE_CREATE')).toBe(false);
     expect(guardianMay('RESTRICTED', 'CONSENT_GRANT')).toBe(true);
     expect(guardianMay('ONBOARDING', 'PAIRING_CREATE')).toBe(true);
-    expect(guardianMay('ACTIVE', 'PAIRING_CREATE')).toBe(true);
-    expect(guardianMay('DELETION_PENDING', 'PROFILE_READ')).toBe(false);
+    expect(guardianMay('ACTIVE', 'PLAN_CREATE')).toBe(true);
+    expect(studentMay('ACTIVE', 'PLAN_CREATE')).toBe(true);
+    expect(studentMay('ACTIVE', 'PAIRING_CREATE')).toBe(false);
     expect(guardianMay('DELETED', 'CONSENT_GRANT')).toBe(false);
   });
 

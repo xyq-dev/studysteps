@@ -12,8 +12,8 @@
 | 2 | STP 002 关键页面高保真与状态 | M0 | STP 001 的术语和状态已统一 | 优先页面、组件状态和异常状态可评审 |
 | 3 | STP 003 独立仓库与 CI 基础 | M1 基础 | 默认等待 M0；可提前做不依赖业务接口的骨架 | 全新安装及统一检查、测试、构建可运行。工程骨架已在本地验收；M0 未通过，接口未冻结 |
 | 4 | STP 004 档案与授权基础 | M1 | STP 003 已完成；本地决定已写入；B07 仍阻塞最终验收 | 档案隔离、同意、配对和撤销通过。当前进行中，未完成 |
-| 5 | STP 005 学段与模板种子 | 基础内容 | STP 003；与 STP 004 共享的档案字段已稳定 | 学制映射和模板可查询、预览。当前**本地实现已验证、待 CI**，不得标产品验收。退出门槛 39 条模板（原 36＋初四 3），见设计第 1.1／10 节 |
-| 6 | STP 006 计划与任务生成 | M2 | STP 004、STP 005 | 重复、编辑范围、改期和并发约束通过 |
+| 5 | STP 005 学段与模板种子 | 基础内容 | STP 003；与 STP 004 共享的档案字段已稳定 | 学制映射和模板可查询、预览。CI #5 `9118468` success；P05 刷新回填与 A02 只读目录已复测。不得标产品验收。退出门槛 39 条模板（原 36＋初四 3），见设计第 1.1／10 节 |
+| 6 | STP 006 计划与任务生成 | M2 | STP 004、STP 005 | 重复、编辑范围、改期和并发约束通过。当前**第一批本地已实施**（整个阶段未完成），见 `docs/STP006_DESIGN.md` 与 `docs/STP006_IMPLEMENTATION_REPORT.md` |
 | 7 | STP 007 完成与计时 | M2 | STP 006 的任务实例模型稳定 | 幂等完成、补记、撤销、计时与跨天通过 |
 | 8 | STP 008 报告与家庭协作 | M3 | STP 007 的记录与事件可靠 | 报告可核对，可见范围和建议回应正确 |
 | 9 | STP 009 后台与数据权利 | M4 | STP 004 至 STP 008 的对象和权限稳定 | 模板运营、支持、导出、删除和审计闭环 |
@@ -185,13 +185,13 @@
 
 ## STP 005：学段与模板种子
 
-状态：已提交，CI 夹具自包含修复待新 SHA 验证（不得标产品验收完成）
+状态：P05 刷新回填与 A02 只读目录已复测关闭；可开始 STP 006 设计（不得标产品验收完成）
 
 2026-09-16：用户授权代码／Schema／新增迁移后按 `docs/STP005_DESIGN.md` 落地，并完成当时的四项阻塞修复尝试。该「四项已修复」声明已被 2026-09-17 反例推翻（`created_at` 可伪造 leftover；`AGE_BAND_NOT_SUPPORTED` 曾被当成 consentCurrent）。历史说明保留在 `docs/STP005_IMPLEMENTATION_REPORT.md` 第 11 节。
 
 2026-09-17：仅修订尚未发布的第五／第六条迁移与 activation 失败关闭。可信 leftover 改为第五条锁内封存的 allowlist；`created_at` 不再作为来源。第六条只消费该名单，并在任何版本 ID 回填前全量预检 assigned／current。测试只打在独占库 `stp005_rev_fresh` 与夹具 `stp005_rev_four_to_six`。既有 `stp004_identity`／`stp004_identity_fresh`／`stp005_four_to_six` 未 deploy、未 reset、未改账本。原库只读。STP 004 仍进行中。不得宣称 M0／STP 002／接口冻结。
 
-本地命令（2026-09-17，均为退出码 0，0 skipped）：`pnpm lint`、`pnpm typecheck`、`pnpm test`（139 passed：api 107、domain 22、contracts 7、ui/web/admin 各 1）、`pnpm build`、`pnpm prisma:validate`、`pnpm test:e2e`（Playwright 2 passed）。提交 `cf2bd3a` 后 **CI #2** 在 Prepare isolated PostgreSQL 失败。无 `stp004_identity` 的本轮临时集群复现到 `original stp004_identity missing; leave it read-only`。CI 准备脚本改为不要求开发机原库，并在当前步骤写入 `STP005_FOUR_TO_SIX_DATABASE_URL`。完整 lint／typecheck／test／build／prisma:validate 由新 SHA 的 Actions 验证。不得标产品验收。
+`pnpm --filter @studysteps/web test:e2e`（2026-09-17 走查后修复复测，退出码 0，**5 passed / 0 skipped**）。证据：`docs/handoffs/STP005_BROWSER_EVIDENCE.md`。先前走查失败的 A02 目录展示与 P05 刷新回填已关闭。当时导入仍 409；STP 006 第一批已将合法映射的确认写入改为真实 import（空 body 为 `400 VALIDATION_ERROR`，无映射仍为 `TEMPLATE_IMPORT_NOT_ALLOWED`）。不得标 STP 005 产品验收。
 
 目标：建立可配置的学段、学制、年级、学期和科目映射，并提供可预览的原创基础模板。
 
@@ -214,7 +214,9 @@
 
 ## STP 006：计划与任务生成
 
-状态：待开始
+状态：第一批本地已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
+
+2026-09-17：用户已授权第一批实现、独占 STP006 测试库、隔离 test-v2 同意发布、第七条增量迁移，以及本轮普通 commit／push。旧「未授权实现」不再阻塞。第一批已落地：S07／学生入口、S03 预览确认取消、import 真写入、计划／任务只读、确认事务 14 天窗口、test-v2（非正式、仅隔离）、第七条结构迁移。S06 手动创建、范围编辑、暂停／归档、改期、拆分与 Outbox 工人仍属后续批次。六条已发布迁移 checksum 未改。打卡、计时、通知、运营发布、B04 正式文案不在本批。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪，不以 CI #5 代替。
 
 目标：实现计划、重复规则、每日任务实例、范围编辑、暂停、归档、改期和拆分。
 
@@ -224,13 +226,13 @@
 - 计划、规则、日程、改期接口及契约。
 - `packages/domain` 的重复、生成、编辑范围、状态转换和日期规则。
 - S05、S06、S08、S09、S12 及 S04 的日程读取部分。
-- 未来 14 天预生成与读取补齐的后台任务／Outbox 入口。
+- 未来 14 天预生成与显式 `task-horizon` POST／Outbox 入口（GET 日程不补齐）。
 
 验收标准：
 
 - T03、T04、T07 通过，并覆盖 T08 的本地日期与时区边界。
 - P0 支持单次、每天、每周指定日期及起止日期／持续标记，不解析任意自然语言规则。
-- `series_id＋occurrence_key` 唯一；定时预生成、读取补齐和并发重试不会重复。
+- `series_id＋occurrence_key` 唯一；确认生成、horizon POST 和并发重试不会重复（GET 不补齐）。
 - 改期保持实例 ID、最初安排日期和发生键；同日冲突只提示，不自动覆盖。
 - “仅本次”和“未来”作用范围正确，历史完成标准与已完成记录不被覆盖。
 - 暂停、恢复、归档、取消和拆分保留历史，拆分后的原任务不会再次计为完成。

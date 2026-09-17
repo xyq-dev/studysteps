@@ -1,19 +1,24 @@
-import { Controller, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { importTemplateConfirmSchema } from '@studysteps/contracts';
 import type { Request, Response } from 'express';
 import { RuntimeConfig } from '../common/runtime-config';
 import { IdentityService } from '../auth/identity.service';
 import { assertAllowedOrigin } from '../auth/origin';
 import { assertBoundCsrf } from '../common/csrf';
+import { IdempotencyService } from '../common/idempotency.service';
 import { CatalogService } from './catalog.service';
 import { StudentsService } from '../students/students.service';
+import { PlanningService } from '../planning/planning.service';
 
 @Controller('v1')
 export class CatalogController {
   constructor(
     private readonly catalog: CatalogService,
     private readonly students: StudentsService,
+    private readonly planning: PlanningService,
     private readonly identity: IdentityService,
     private readonly runtime: RuntimeConfig,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   private get config() {
@@ -47,12 +52,23 @@ export class CatalogController {
   async importTemplate(
     @Param('studentId') studentId: string,
     @Param('templateId') templateId: string,
+    @Body() body: unknown,
     @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
     assertAllowedOrigin(request, this.config);
     const session = await this.identity.peekSession(request.cookies?.[this.config.cookieNames.session]);
     assertBoundCsrf(request, session, this.config);
-    const presented = await this.students.get(session, studentId);
-    return this.catalog.assertImportAllowed(presented.education.catalogEntryKey, templateId);
+    await this.students.authorize(session, studentId, 'PLAN_READ');
+    await this.catalog.assertImportAllowed(await this.catalog.catalogEntryKeyForStudent(studentId), templateId);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(201);
+    return this.planning.importPlan(
+      session,
+      studentId,
+      templateId,
+      importTemplateConfirmSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 }

@@ -599,8 +599,8 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 005 T02-D catalog and educatio
       .post(`/v1/students/${student.id}/templates/${listed.body.recommendedTemplateIds[0]}/import`)
       .set(writeHeaders(auth.cookies))
       .send({});
-    expect(deferred.status).toBe(409);
-    expect(deferred.body.code).toBe('TEMPLATE_IMPORT_NOT_AVAILABLE');
+    expect(deferred.status).toBe(400);
+    expect(deferred.body.code).toBe('VALIDATION_ERROR');
     expect(set.body.education.catalogEntryKey).toBe('PRIMARY_G1');
   });
 });

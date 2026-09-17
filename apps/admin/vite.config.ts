@@ -16,5 +16,9 @@ export default defineConfig({
   },
   server: {
     port: 5174,
+    proxy: {
+      '/v1': 'http://127.0.0.1:3000',
+      '/__local': 'http://127.0.0.1:3000',
+    },
   },
 });

@@ -12,6 +12,11 @@ export const PRIMARY_GUARDIAN_ACTIONS = [
   'PAIRING_REVOKE',
   'DEVICE_SESSION_READ',
   'DEVICE_SESSION_REVOKE',
+  'PLAN_READ',
+  'PLAN_CREATE',
+  'PLAN_UPDATE',
+  'TASK_READ',
+  'TASK_ADJUST',
 ] as const;
 
 export type GuardianAction = (typeof PRIMARY_GUARDIAN_ACTIONS)[number];
@@ -55,6 +60,16 @@ export function guardianListIncludes(status: string): boolean {
   return status === 'ONBOARDING' || status === 'ACTIVE' || status === 'RESTRICTED';
 }
 
+const PLAN_WRITE_ACTIONS = new Set<GuardianAction>(['PLAN_CREATE', 'PLAN_UPDATE', 'TASK_ADJUST']);
+const STUDENT_ALLOWED = new Set<GuardianAction>([
+  'PROFILE_READ',
+  'PLAN_READ',
+  'PLAN_CREATE',
+  'PLAN_UPDATE',
+  'TASK_READ',
+  'TASK_ADJUST',
+]);
+
 export function guardianMay(status: ProfileStatus, action: GuardianAction): boolean {
   if (isDeletionStatus(status)) {
     return false;
@@ -62,9 +77,22 @@ export function guardianMay(status: ProfileStatus, action: GuardianAction): bool
   if (status === 'RESTRICTED') {
     return RESTRICTED_GUARDIAN.has(action);
   }
+  if (status === 'ONBOARDING' && PLAN_WRITE_ACTIONS.has(action)) {
+    return false;
+  }
   return PRIMARY_GUARDIAN_ACTIONS.includes(action);
 }
 
 export function studentMayReadSelf(status: ProfileStatus): boolean {
   return status === 'ONBOARDING' || status === 'ACTIVE';
+}
+
+export function studentMay(status: ProfileStatus, action: GuardianAction): boolean {
+  if (!STUDENT_ALLOWED.has(action)) {
+    return false;
+  }
+  if (action === 'PROFILE_READ' || action === 'PLAN_READ' || action === 'TASK_READ') {
+    return studentMayReadSelf(status);
+  }
+  return status === 'ACTIVE';
 }

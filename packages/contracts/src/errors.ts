@@ -19,6 +19,8 @@ export const ERROR_CODES = [
   'GRADE_CHANGE_NOT_ALLOWED',
   'TEMPLATE_IMPORT_NOT_ALLOWED',
   'TEMPLATE_IMPORT_NOT_AVAILABLE',
+  'PLAN_PREVIEW_STALE',
+  'TASK_HORIZON_NOT_AVAILABLE',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

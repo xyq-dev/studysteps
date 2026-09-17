@@ -20,7 +20,10 @@ export const TEST_POLICY_KEYS = {
 export const GUARDIAN_DECLARATION_TEXT =
   '我声明自己是该未成年人的监护人，并确认所填信息';
 
+export const TEST_POLICY_V2_VERSION = 'test-v2';
+
 export * from './errors.js';
 export * from './auth.js';
 export * from './students.js';
 export * from './consents.js';
+export * from './plans.js';

@@ -53,5 +53,11 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 120_000,
     },
+    {
+      command: 'pnpm --filter @studysteps/admin dev -- --host 127.0.0.1 --port 5174',
+      url: 'http://127.0.0.1:5174',
+      reuseExistingServer: false,
+      timeout: 120_000,
+    },
   ],
 });

@@ -69,6 +69,8 @@ model Account {
   issuedStudentSessions DeviceSession[] @relation("IssuedStudentSessions")
   challenges   AuthChallenge[]
   pairings     DevicePairing[]
+  createdPlans StudyPlan[] @relation("PlanCreatedBy")
+  attestedPlans StudyPlan[] @relation("PlanCoCreationAttestedBy")
 
   @@map("accounts")
 }
@@ -141,6 +143,7 @@ model StudentProfile {
   gradeConfig             GradeConfig?    @relation(fields: [gradeConfigId], references: [id], onDelete: Restrict)
   gradeConfigVersion      GradeConfigVersion? @relation("StudentGradeVersion", fields: [gradeConfigVersionId, gradeConfigId], references: [id, gradeConfigId], onDelete: Restrict)
   educationHistory        StudentEducationHistory[]
+  studyPlans              StudyPlan[]
 
   @@map("student_profiles")
 }
@@ -271,6 +274,7 @@ model DeviceSession {
   challenges               AuthChallenge[]
   createdPairings          DevicePairing[] @relation("PairingCreatedBySession")
   consumedPairings         DevicePairing[] @relation("PairingConsumedBySession")
+  createdPlans             StudyPlan[] @relation("PlanCreatedBySession")
 
   @@unique([id, studentProfileId])
   @@unique([id, accountId])
@@ -453,7 +457,114 @@ model PlanTemplateVersion {
   publishedAt      DateTime? @map("published_at") @db.Timestamptz(3)
   createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
 
+  importedPlans    StudyPlan[]
+
   @@unique([templateKey, version])
   @@index([catalogEntryKey, kind])
   @@map("plan_template_versions")
+}
+
+model StudyPlan {
+  id                          String               @id @default(uuid()) @db.Uuid
+  studentProfileId            String               @map("student_profile_id") @db.Uuid
+  status                      String               @default("ACTIVE")
+  origin                      String
+  createdByAccountId          String?              @map("created_by_account_id") @db.Uuid
+  createdBySessionId          String?              @map("created_by_session_id") @db.Uuid
+  coCreationAttestedAt        DateTime?            @map("co_creation_attested_at") @db.Timestamptz(3)
+  coCreationAttestedByAccountId String?            @map("co_creation_attested_by_account_id") @db.Uuid
+  studentConfirmedAt          DateTime?            @map("student_confirmed_at") @db.Timestamptz(3)
+  sourceTemplateVersionId     String?              @map("source_template_version_id") @db.Uuid
+  importedContentJson         String               @map("imported_content_json")
+  timezoneSnapshot            String               @map("timezone_snapshot")
+  version                     Int                  @default(1)
+  createdAt                   DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                   DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  student                     StudentProfile       @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  createdByAccount            Account?             @relation("PlanCreatedBy", fields: [createdByAccountId], references: [id], onDelete: Restrict)
+  createdBySession            DeviceSession?       @relation("PlanCreatedBySession", fields: [createdBySessionId], references: [id], onDelete: Restrict)
+  attestedBy                  Account?             @relation("PlanCoCreationAttestedBy", fields: [coCreationAttestedByAccountId], references: [id], onDelete: Restrict)
+  sourceTemplate              PlanTemplateVersion? @relation(fields: [sourceTemplateVersionId], references: [id], onDelete: Restrict)
+  series                      TaskSeries[]
+  adjustments                 PlanAdjustment[]
+
+  @@index([studentProfileId, status])
+  @@map("study_plans")
+}
+
+model TaskSeries {
+  id                    String           @id @default(uuid()) @db.Uuid
+  planId                String           @map("plan_id") @db.Uuid
+  name                  String
+  subject               String
+  completionStandard    String           @map("completion_standard")
+  durationMinutes       Int?             @map("duration_minutes")
+  stepsJson             String           @default("[]") @map("steps_json")
+  repeatKind            String           @map("repeat_kind")
+  weekdaysJson          String?          @map("weekdays_json")
+  startLocalDate        String           @map("start_local_date")
+  endLocalDate          String?          @map("end_local_date")
+  ongoing               Boolean          @default(false)
+  effectiveFromLocalDate String          @map("effective_from_local_date")
+  effectiveToLocalDate  String?          @map("effective_to_local_date")
+  version               Int              @default(1)
+  createdAt             DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  plan                  StudyPlan        @relation(fields: [planId], references: [id], onDelete: Restrict)
+  occurrences           TaskOccurrence[]
+  adjustments           PlanAdjustment[]
+
+  @@index([planId])
+  @@map("task_series")
+}
+
+model TaskOccurrence {
+  id                     String           @id @default(uuid()) @db.Uuid
+  seriesId               String           @map("series_id") @db.Uuid
+  occurrenceKey          String           @map("occurrence_key")
+  originalLocalDate      String           @map("original_local_date")
+  scheduledLocalDate     String           @map("scheduled_local_date")
+  timezoneSnapshot       String           @map("timezone_snapshot")
+  status                 String           @default("PLANNED")
+  cancelReason           String?          @map("cancel_reason")
+  nameSnapshot           String           @map("name_snapshot")
+  subjectSnapshot        String           @map("subject_snapshot")
+  completionStandardSnapshot String       @map("completion_standard_snapshot")
+  durationMinutesSnapshot Int?            @map("duration_minutes_snapshot")
+  stepsSnapshotJson      String           @map("steps_snapshot_json")
+  gradeConfigId          String           @map("grade_config_id") @db.Uuid
+  gradeConfigVersionId   String           @map("grade_config_version_id") @db.Uuid
+  stageCodeSnapshot      String           @map("stage_code_snapshot")
+  schoolSystemCodeSnapshot String         @map("school_system_code_snapshot")
+  gradeCodeSnapshot      String           @map("grade_code_snapshot")
+  gradeLabelSnapshot     String           @map("grade_label_snapshot")
+  termCodeSnapshot       String           @map("term_code_snapshot")
+  catalogEntryKeySnapshot String          @map("catalog_entry_key_snapshot")
+  sourceOccurrenceId     String?          @map("source_occurrence_id") @db.Uuid
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  series                 TaskSeries       @relation(fields: [seriesId], references: [id], onDelete: Restrict)
+  sourceOccurrence       TaskOccurrence?  @relation("OccurrenceSplit", fields: [sourceOccurrenceId], references: [id], onDelete: Restrict)
+  splitFrom              TaskOccurrence[] @relation("OccurrenceSplit")
+  adjustments            PlanAdjustment[]
+
+  @@unique([seriesId, occurrenceKey])
+  @@index([scheduledLocalDate])
+  @@map("task_occurrences")
+}
+
+model PlanAdjustment {
+  id              String          @id @default(uuid()) @db.Uuid
+  planId          String          @map("plan_id") @db.Uuid
+  seriesId        String?         @map("series_id") @db.Uuid
+  occurrenceId    String?         @map("occurrence_id") @db.Uuid
+  reasonCode      String          @map("reason_code")
+  payloadJson     String          @map("payload_json")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  plan            StudyPlan       @relation(fields: [planId], references: [id], onDelete: Restrict)
+  series          TaskSeries?     @relation(fields: [seriesId], references: [id], onDelete: Restrict)
+  occurrence      TaskOccurrence? @relation(fields: [occurrenceId], references: [id], onDelete: Restrict)
+
+  @@index([planId, createdAt])
+  @@map("plan_adjustments")
 }

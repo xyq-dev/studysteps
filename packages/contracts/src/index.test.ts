@@ -22,6 +22,7 @@ describe('@studysteps/contracts export boundary', () => {
   it('keeps a stable error-code set for /v1', () => {
     expect(ERROR_CODES).toContain('GRADE_CONFIG_INVALID');
     expect(ERROR_CODES).toContain('TEMPLATE_IMPORT_NOT_ALLOWED');
+    expect(ERROR_CODES).toContain('PLAN_PREVIEW_STALE');
   });
 });
 

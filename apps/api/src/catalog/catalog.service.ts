@@ -68,7 +68,16 @@ export class CatalogService {
     if (!template) {
       throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
     }
-    throw new AppError('TEMPLATE_IMPORT_NOT_AVAILABLE', '计划导入属于后续任务，本阶段不创建计划', 409);
+    return template;
+  }
+
+  async catalogEntryKeyForStudent(studentId: string): Promise<string | null> {
+    const student = await this.prisma.studentProfile.findUnique({ where: { id: studentId } });
+    if (!student?.gradeConfigVersionId) {
+      return null;
+    }
+    const version = await this.prisma.gradeConfigVersion.findUnique({ where: { id: student.gradeConfigVersionId } });
+    return version?.catalogEntryKey ?? null;
   }
 
   async loadPublishedGrades(db: PrismaService | Tx = this.prisma): Promise<PublishedGradeView[]> {

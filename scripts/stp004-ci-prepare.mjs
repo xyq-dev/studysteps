@@ -9,6 +9,10 @@ import {
   recordFourToSixFixtureUrl,
   rewriteDb,
 } from './stp005-four-to-six-upgrade.mjs';
+import {
+  FIXTURE_DATABASE as SIX_TO_SEVEN_DATABASE,
+  recordSixToSevenFixtureUrl,
+} from './stp006-six-to-seven.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -142,6 +146,18 @@ if (upgrade.status !== 0) {
   process.exit(upgrade.status ?? 1);
 }
 
+const sixToSeven = spawnSync(process.execPath, [join(root, 'scripts/stp006-six-to-seven.mjs')], {
+  cwd: root,
+  env: { ...process.env },
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(sixToSeven.stdout || '');
+process.stderr.write(sixToSeven.stderr || '');
+if (sixToSeven.status !== 0) {
+  process.exit(sixToSeven.status ?? 1);
+}
+
 const fixtureUrl = rewriteDb(adminUrl, FIXTURE_DATABASE);
 const fixture = new pg.Client({ connectionString: fixtureUrl, connectionTimeoutMillis: 8000 });
 await fixture.connect();
@@ -163,6 +179,30 @@ if (process.env.STP005_FOUR_TO_SIX_DATABASE_URL !== fixtureUrl) {
   throw new Error('STP005_FOUR_TO_SIX_DATABASE_URL was not applied in the current prepare step');
 }
 
+const sixToSevenUrl = rewriteDb(adminUrl, SIX_TO_SEVEN_DATABASE);
+const sixToSevenDbClient = new pg.Client({ connectionString: sixToSevenUrl, connectionTimeoutMillis: 8000 });
+await sixToSevenDbClient.connect();
+const sixToSevenDb = await sixToSevenDbClient.query('SELECT current_database() AS name');
+if (sixToSevenDb.rows[0]?.name !== SIX_TO_SEVEN_DATABASE) {
+  await sixToSevenDbClient.end();
+  throw new Error('six-to-seven fixture connected to the wrong database');
+}
+const baseline = await sixToSevenDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '六到七基线'`,
+);
+const seventh = await sixToSevenDbClient.query(`SELECT to_regclass('study_plans') AS plans`);
+await sixToSevenDbClient.end();
+if (baseline.rows[0]?.n !== 1) {
+  throw new Error('six-to-seven baseline student missing');
+}
+if (!seventh.rows[0]?.plans) {
+  throw new Error('six-to-seven fixture missing study_plans');
+}
+recordSixToSevenFixtureUrl(sixToSevenUrl, process.env);
+if (process.env.STP006_SIX_TO_SEVEN_DATABASE_URL !== sixToSevenUrl) {
+  throw new Error('STP006_SIX_TO_SEVEN_DATABASE_URL was not applied in the current prepare step');
+}
+
 process.stdout.write(
-  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}\n`,
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}\n`,
 );

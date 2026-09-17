@@ -1,8 +1,80 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { APP_NAME, GUARDIAN_DECLARATION_TEXT } from '@studysteps/contracts';
 import { StatusBanner } from '@studysteps/ui';
 
-type Screen = 's01' | 's02' | 'p05' | 'p06' | 's07' | 'student';
+type Screen = 's01' | 's02' | 'p05' | 'p06' | 's07' | 's03' | 's05' | 's08' | 'student';
+type PreviewTask = {
+  name: string;
+  subject: string;
+  standard: string;
+  durationMinutes?: number | null;
+  steps?: string[];
+  repeatKind?: string;
+  weekdays?: number[] | null;
+  startLocalDate?: string;
+  endLocalDate?: string | null;
+  ongoing?: boolean;
+};
+type TermCode = 'FULL_YEAR' | 'FIRST_TERM' | 'SECOND_TERM';
+type ChangeKind = 'SET' | 'PROMOTE' | 'REPEAT' | 'SKIP' | 'LEAVE' | 'RESUME' | 'SYSTEM_SWITCH' | 'TERM_SWITCH';
+type GradeItem = {
+  id: string;
+  gradeLabel: string;
+  schoolSystemCode: string;
+  catalogEntryKey: string | null;
+  version: string;
+  versionId: string;
+};
+type EducationDetail = {
+  gradeConfigId: string | null;
+  schoolSystemCode: string | null;
+  gradeLabel: string | null;
+  termCode: string | null;
+};
+
+const ACTIVE_STUDENT_KEY = 'stp.ui.activeStudentId';
+
+function isTermCode(value: string | null | undefined): value is TermCode {
+  return value === 'FULL_YEAR' || value === 'FIRST_TERM' || value === 'SECOND_TERM';
+}
+
+function readStoredStudentId(): string | null {
+  try {
+    return sessionStorage.getItem(ACTIVE_STUDENT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredStudentId(id: string | null) {
+  try {
+    if (id) {
+      sessionStorage.setItem(ACTIVE_STUDENT_KEY, id);
+    } else {
+      sessionStorage.removeItem(ACTIVE_STUDENT_KEY);
+    }
+  } catch {
+    /* ignore private-mode quota */
+  }
+}
+
+function readOrCreateInstallationId() {
+  try {
+    const existing = sessionStorage.getItem('stp.ui.installationId');
+    if (existing) {
+      return existing;
+    }
+    const created = crypto.randomUUID();
+    sessionStorage.setItem('stp.ui.installationId', created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
+function isUnauthenticated(error: unknown) {
+  return error instanceof Error && (error.message === '未登录' || error.message.includes('AUTH_SESSION_INVALID'));
+}
 
 function readCookie(name: string): string | undefined {
   return document.cookie
@@ -33,7 +105,7 @@ async function api(path: string, init: RequestInit = {}) {
 }
 
 export function App() {
-  const installationId = useMemo(() => crypto.randomUUID(), []);
+  const installationId = useMemo(() => readOrCreateInstallationId(), []);
   const [screen, setScreen] = useState<Screen>('s01');
   const [phone, setPhone] = useState('13800138000');
   const [code, setCode] = useState('');
@@ -50,13 +122,173 @@ export function App() {
   const [pairingCodeInput, setPairingCodeInput] = useState('');
   const [devices, setDevices] = useState<Array<{ id: string; scope: string; revokedAt: string | null }>>([]);
   const [consents, setConsents] = useState<Array<{ id: string; policyKey: string; current: boolean }>>([]);
-  const [grades, setGrades] = useState<Array<{ id: string; gradeLabel: string; schoolSystemCode: string; catalogEntryKey: string | null }>>([]);
+  const [grades, setGrades] = useState<GradeItem[]>([]);
   const [gradeConfigId, setGradeConfigId] = useState('');
-  const [changeKind, setChangeKind] = useState<'SET' | 'PROMOTE' | 'REPEAT' | 'SKIP' | 'LEAVE' | 'RESUME' | 'SYSTEM_SWITCH' | 'TERM_SWITCH'>('SET');
-  const [termCode, setTermCode] = useState<'FULL_YEAR' | 'FIRST_TERM' | 'SECOND_TERM'>('FULL_YEAR');
+  const [changeKind, setChangeKind] = useState<ChangeKind>('SET');
+  const [termCode, setTermCode] = useState<TermCode>('FULL_YEAR');
+  const [educationNote, setEducationNote] = useState('尚未配置年级');
   const [templates, setTemplates] = useState<Array<{ id: string; title: string }>>([]);
   const [importAllowed, setImportAllowed] = useState(false);
   const [recommendedCount, setRecommendedCount] = useState(0);
+  const [sessionScope, setSessionScope] = useState<'GUARDIAN' | 'STUDENT'>('GUARDIAN');
+  const [previewTemplateId, setPreviewTemplateId] = useState('');
+  const [previewDigest, setPreviewDigest] = useState('');
+  const [previewTemplateVersion, setPreviewTemplateVersion] = useState('');
+  const [previewTasks, setPreviewTasks] = useState<PreviewTask[]>([]);
+  const [confirmAllowed, setConfirmAllowed] = useState(false);
+  const [coCreationAttested, setCoCreationAttested] = useState(false);
+  const [plans, setPlans] = useState<Array<{ id: string; status: string; origin: string; seriesCount: number }>>([]);
+  const [planDetail, setPlanDetail] = useState<{
+    id: string;
+    origin: string;
+    studentConfirmedAt: string | null;
+    series: Array<{ id: string; name: string; occurrenceCount: number }>;
+  } | null>(null);
+  const [tasks, setTasks] = useState<Array<{ id: string; name: string; scheduledLocalDate: string; status: string }>>([]);
+  const studentLoadSeq = useRef(0);
+  const bootstrapSeq = useRef(0);
+
+  function clearProtectedState() {
+    studentLoadSeq.current += 1;
+    setStudents([]);
+    setActiveStudentId(null);
+    writeStoredStudentId(null);
+    setGrades([]);
+    setGradeConfigId('');
+    setChangeKind('SET');
+    setTermCode('FULL_YEAR');
+    setEducationNote('尚未配置年级');
+    setDevices([]);
+    setConsents([]);
+    setTemplates([]);
+    setPreviewTemplateId('');
+    setPreviewTasks([]);
+    setCoCreationAttested(false);
+    setPlans([]);
+    setPlanDetail(null);
+    setTasks([]);
+    setSessionScope('GUARDIAN');
+    setIssuedPairingId('');
+    setIssuedPairingCode('');
+    setScreen('s01');
+  }
+
+  function applyEducation(items: GradeItem[], education: EducationDetail | undefined, nextKind?: ChangeKind) {
+    setGrades(items);
+    const savedId = education?.gradeConfigId ?? '';
+    if (!savedId) {
+      setGradeConfigId('');
+      setTermCode('FULL_YEAR');
+      setChangeKind(nextKind ?? 'SET');
+      setEducationNote('尚未配置年级');
+      return;
+    }
+    if (isTermCode(education?.termCode)) {
+      setTermCode(education.termCode);
+    }
+    const matched = items.find((item) => item.id === savedId);
+    if (!matched) {
+      setGradeConfigId('');
+      setChangeKind(nextKind ?? 'TERM_SWITCH');
+      setEducationNote(
+        `已保存 ${education?.schoolSystemCode ?? ''} · ${education?.gradeLabel ?? ''}，但当前目录没有对应项，未改选。`,
+      );
+      return;
+    }
+    setGradeConfigId(matched.id);
+    setChangeKind(nextKind ?? 'TERM_SWITCH');
+    setEducationNote(
+      `当前 ${matched.schoolSystemCode} · ${matched.gradeLabel} · ${education?.termCode ?? ''} · 版本 ${matched.version}`,
+    );
+  }
+
+  async function loadStudentEducation(studentId: string) {
+    const seq = ++studentLoadSeq.current;
+    try {
+      const [catalog, detail] = await Promise.all([
+        api('/v1/grade-configs') as Promise<{ items?: GradeItem[] }>,
+        api(`/v1/students/${studentId}`) as Promise<{ education?: EducationDetail }>,
+      ]);
+      if (seq !== studentLoadSeq.current) {
+        return;
+      }
+      applyEducation(catalog.items ?? [], detail.education);
+    } catch (error) {
+      if (seq !== studentLoadSeq.current) {
+        return;
+      }
+      if (isUnauthenticated(error)) {
+        clearProtectedState();
+        setStatus('会话已失效，请重新登录');
+        return;
+      }
+      setStatus(error instanceof Error ? error.message : '无法读取档案');
+    }
+  }
+
+  function selectStudent(studentId: string) {
+    setActiveStudentId(studentId);
+    writeStoredStudentId(studentId);
+    void loadStudentEducation(studentId);
+  }
+
+  async function enterGuardian(items: Array<{ id: string; nickname: string; status: string }>, message: string) {
+    setStudents(items);
+    if (!items.length) {
+      setActiveStudentId(null);
+      setScreen('s02');
+      setStatus(message);
+      return;
+    }
+    setScreen('p05');
+    setStatus(message);
+    const stored = readStoredStudentId();
+    const only = items.length === 1 ? items[0] : undefined;
+    const chosen = items.some((item) => item.id === stored) ? stored : only?.id ?? null;
+    if (chosen) {
+      selectStudent(chosen);
+    }
+  }
+
+  useEffect(() => {
+    const seq = ++bootstrapSeq.current;
+    void (async () => {
+      try {
+        const result = await api('/v1/auth/session');
+        if (seq !== bootstrapSeq.current) {
+          return;
+        }
+        if (result.session?.scope === 'STUDENT') {
+          setSessionScope('STUDENT');
+          if (result.session.studentId) {
+            setActiveStudentId(result.session.studentId);
+            writeStoredStudentId(result.session.studentId);
+          }
+          setScreen('student');
+          setStatus('已恢复学生会话');
+          return;
+        }
+        setSessionScope('GUARDIAN');
+        const listed = await api('/v1/students');
+        if (seq !== bootstrapSeq.current) {
+          return;
+        }
+        await enterGuardian(listed.items ?? [], '已恢复家长会话');
+      } catch (error) {
+        if (seq !== bootstrapSeq.current) {
+          return;
+        }
+        clearProtectedState();
+        if (isUnauthenticated(error)) {
+          setStatus('请登录后继续');
+          return;
+        }
+        setStatus(error instanceof Error ? error.message : '请登录后继续');
+      }
+    })();
+    // Session restore runs once on mount; later student switches use selectStudent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function sendCode(purpose: 'SIGN_IN' | 'GUARDIAN_STEP_UP' = 'SIGN_IN') {
     try {
@@ -76,6 +308,7 @@ export function App() {
   }
 
   async function signIn(grantType: 'VERIFICATION_CODE' | 'GUARDIAN_STEP_UP' = 'VERIFICATION_CODE') {
+    bootstrapSeq.current += 1;
     try {
       await api('/v1/auth/session', {
         method: 'POST',
@@ -87,15 +320,15 @@ export function App() {
         }),
       });
       const listed = await api('/v1/students');
-      setStudents(listed.items ?? []);
-      setScreen((listed.items ?? []).length ? 'p05' : 's02');
-      setStatus(grantType === 'GUARDIAN_STEP_UP' ? '已重新验证并回到家长会话' : '已进入家长会话');
+      setSessionScope('GUARDIAN');
+      await enterGuardian(listed.items ?? [], grantType === 'GUARDIAN_STEP_UP' ? '已重新验证并回到家长会话' : '已进入家长会话');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '登录失败');
     }
   }
 
   async function pairingSignIn() {
+    bootstrapSeq.current += 1;
     try {
       await api('/v1/auth/session', {
         method: 'POST',
@@ -106,6 +339,7 @@ export function App() {
           device: { installationId, label: '第二设备' },
         }),
       });
+      setSessionScope('STUDENT');
       setScreen('student');
       setStatus('已通过配对进入学生模式');
     } catch (error) {
@@ -138,9 +372,24 @@ export function App() {
         }),
       });
       setActiveStudentId(created.profile.id);
+      writeStoredStudentId(created.profile.id);
       setStudents((current) => [...current, created.profile]);
+      setGradeConfigId('');
+      setChangeKind('SET');
+      setTermCode('FULL_YEAR');
+      setEducationNote('尚未配置年级');
       setScreen('p05');
       setStatus('档案已创建。请选择学制年级后才能去掉配置待办。');
+      try {
+        const catalog = (await api('/v1/grade-configs')) as { items?: GradeItem[] };
+        applyEducation(catalog.items ?? [], undefined, 'SET');
+      } catch (catalogError) {
+        setStatus(
+          catalogError instanceof Error
+            ? `档案已创建，但目录读取失败：${catalogError.message}`
+            : '档案已创建，但目录读取失败。',
+        );
+      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '建档失败');
     }
@@ -155,6 +404,7 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ grantType: 'STUDENT_MODE', studentId: activeStudentId }),
       });
+      setSessionScope('STUDENT');
       setScreen('student');
       setStatus('已进入学生模式。切回家长必须重新验证。');
     } catch (error) {
@@ -213,17 +463,18 @@ export function App() {
 
   async function loadGrades() {
     try {
-      const result = await api('/v1/grade-configs');
-      const items = (result.items ?? []) as Array<{
-        id: string;
-        gradeLabel: string;
-        schoolSystemCode: string;
-        catalogEntryKey: string | null;
-      }>;
+      const result = (await api('/v1/grade-configs')) as { items?: GradeItem[] };
+      const items = result.items ?? [];
       setGrades(items);
-      const preferred = items.find((item) => item.catalogEntryKey) ?? items[0];
-      setGradeConfigId((current) => current || preferred?.id || '');
+      setGradeConfigId((current) =>
+        current && items.some((item) => item.id === current) ? current : '',
+      );
     } catch (error) {
+      if (isUnauthenticated(error)) {
+        clearProtectedState();
+        setStatus('会话已失效，请重新登录');
+        return;
+      }
       setStatus(error instanceof Error ? error.message : '无法读取年级目录');
     }
   }
@@ -244,12 +495,22 @@ export function App() {
           changeKind,
         }),
       });
+      applyEducation(
+        grades,
+        result.education,
+        result.education?.gradeConfigId ? (changeKind === 'SET' ? 'TERM_SWITCH' : changeKind) : 'SET',
+      );
       setStatus(
         result.learningAccess?.allowed
-          ? '年级已保存。学习计划导入仍属后续任务。'
+          ? '年级已保存。可从模板库预览并确认创建计划。'
           : `年级已保存，当前状态 ${result.status}`,
       );
     } catch (error) {
+      if (isUnauthenticated(error)) {
+        clearProtectedState();
+        setStatus('会话已失效，请重新登录');
+        return;
+      }
       setStatus(error instanceof Error ? error.message : '无法保存年级');
     }
   }
@@ -266,7 +527,7 @@ export function App() {
       setScreen('s07');
       setStatus(
         result.importAllowed
-          ? '可浏览并看到推荐；导入尚未开放。'
+          ? '可浏览并看到推荐；先预览再确认创建。'
           : '可浏览模板库，但无合法映射，不能导入。',
       );
     } catch (error) {
@@ -274,14 +535,108 @@ export function App() {
     }
   }
 
-  async function tryImport(templateId: string) {
+  async function openPreview(templateId: string) {
     if (!activeStudentId) {
       return;
     }
     try {
-      await api(`/v1/students/${activeStudentId}/templates/${templateId}/import`, { method: 'POST' });
+      const result = await api(`/v1/students/${activeStudentId}/templates/${templateId}/preview`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      setPreviewTemplateId(templateId);
+      setPreviewDigest(result.previewDigest);
+      setPreviewTemplateVersion(result.template.version);
+      setPreviewTasks(result.tasks ?? []);
+      setConfirmAllowed(Boolean(result.confirmAllowed));
+      setCoCreationAttested(false);
+      if (!result.confirmAllowed) {
+        setStatus(result.blockReason ?? '当前不能确认创建计划');
+        return;
+      }
+      setScreen('s03');
+      setStatus('预览已生成，尚未创建计划。确认前可调整任务。');
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : '不能导入');
+      setStatus(error instanceof Error ? error.message : '不能预览');
+    }
+  }
+
+  async function confirmPlan() {
+    if (!activeStudentId || !previewTemplateId) {
+      return;
+    }
+    try {
+      const current = await api(`/v1/students/${activeStudentId}`);
+      const body: Record<string, unknown> = {
+        expectedStudentVersion: current.version,
+        previewDigest,
+        templateVersion: previewTemplateVersion,
+        tasks: previewTasks,
+      };
+      if (sessionScope === 'GUARDIAN') {
+        body.coCreationAttested = coCreationAttested;
+      }
+      const result = await api(`/v1/students/${activeStudentId}/templates/${previewTemplateId}/import`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      setPlanDetail(result);
+      setScreen('s08');
+      setStatus(`计划已创建 · ${result.origin}。学生确认时间未自动写入。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '不能确认创建');
+    }
+  }
+
+  function cancelPreview() {
+    setPreviewTemplateId('');
+    setPreviewTasks([]);
+    setCoCreationAttested(false);
+    setScreen('s07');
+    setStatus('已取消预览，未创建计划、规则或任务。');
+  }
+
+  async function loadPlans() {
+    if (!activeStudentId) {
+      return;
+    }
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/plans`);
+      setPlans(result.items ?? []);
+      setScreen('s08');
+      setStatus('已读取计划列表（只读）。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法读取计划');
+    }
+  }
+
+  async function loadPlanDetail(planId: string) {
+    if (!activeStudentId) {
+      return;
+    }
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/plans/${planId}`);
+      setPlanDetail(result);
+      setScreen('s08');
+      setStatus('已读取计划详情（只读）。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法读取计划');
+    }
+  }
+
+  async function loadTasks() {
+    if (!activeStudentId) {
+      return;
+    }
+    try {
+      const today = new Date().toLocaleDateString('en-CA');
+      const to = new Date(Date.now() + 13 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA');
+      const result = await api(`/v1/students/${activeStudentId}/tasks?from=${today}&to=${to}`);
+      setTasks(result.items ?? []);
+      setScreen('s05');
+      setStatus('已读取任务日程（只读，GET 不补齐）。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法读取任务');
     }
   }
 
@@ -404,7 +759,7 @@ export function App() {
           <ul>
             {students.map((item) => (
               <li key={item.id}>
-                <button type="button" data-testid={`student-${item.id}`} onClick={() => setActiveStudentId(item.id)}>
+                <button type="button" data-testid={`student-${item.id}`} onClick={() => selectStudent(item.id)}>
                   {item.nickname} · {item.status}
                 </button>
               </li>
@@ -432,6 +787,7 @@ export function App() {
               value={gradeConfigId}
               onChange={(event) => setGradeConfigId(event.target.value)}
             >
+              <option value="">未选择年级</option>
               {grades.map((item) => (
                 <option key={item.id} value={item.id}>
                   {item.schoolSystemCode} · {item.gradeLabel}
@@ -439,6 +795,7 @@ export function App() {
               ))}
             </select>
           </label>
+          <p data-testid="education-filled">{educationNote}</p>
           <label>
             变更种类
             <select
@@ -476,6 +833,12 @@ export function App() {
           <button type="button" data-testid="open-templates" onClick={() => void openTemplates()}>
             打开模板库
           </button>
+          <button type="button" data-testid="open-plans" onClick={() => void loadPlans()}>
+            打开计划
+          </button>
+          <button type="button" data-testid="open-tasks" onClick={() => void loadTasks()}>
+            打开今日任务
+          </button>
           <button
             type="button"
             data-testid="open-consents"
@@ -512,20 +875,121 @@ export function App() {
         <section>
           <h2>S07 计划模板库</h2>
           <p data-testid="template-import-state">
-            {importAllowed ? `可推荐 ${recommendedCount} 条；导入未开放` : '无合法映射，禁止导入'}
+            {importAllowed ? `可推荐 ${recommendedCount} 条；先预览再确认` : '无合法映射，禁止导入'}
           </p>
           <ul>
             {templates.map((item) => (
               <li key={item.id}>
                 {item.title}
-                <button type="button" data-testid={`import-template-${item.id}`} onClick={() => void tryImport(item.id)}>
-                  导入
+                <button type="button" data-testid={`import-template-${item.id}`} onClick={() => void openPreview(item.id)}>
+                  预览
                 </button>
               </li>
             ))}
           </ul>
-          <button type="button" data-testid="back-from-templates" onClick={() => setScreen('p05')}>
-            返回档案
+          <button type="button" data-testid="back-from-templates" onClick={() => setScreen(sessionScope === 'STUDENT' ? 'student' : 'p05')}>
+            返回
+          </button>
+        </section>
+      ) : null}
+
+      {screen === 's03' ? (
+        <section>
+          <h2>S03 计划预览</h2>
+          <p data-testid="preview-state">{confirmAllowed ? '可以确认创建' : '当前不能确认创建'}</p>
+          <ul data-testid="preview-tasks">
+            {previewTasks.map((task, index) => (
+              <li key={`${task.name}-${index}`}>
+                <label>
+                  任务名
+                  <input
+                    data-testid={`preview-task-name-${index}`}
+                    value={task.name}
+                    onChange={(event) => {
+                      const next = [...previewTasks];
+                      next[index] = { ...task, name: event.target.value };
+                      setPreviewTasks(next);
+                    }}
+                  />
+                </label>
+                <span>
+                  {task.subject} · {task.standard}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {sessionScope === 'GUARDIAN' ? (
+            <label>
+              <input
+                data-testid="co-creation-attested"
+                type="checkbox"
+                checked={coCreationAttested}
+                onChange={(event) => setCoCreationAttested(event.target.checked)}
+              />
+              已与孩子当面约定本计划（默认不勾选）
+            </label>
+          ) : null}
+          <button
+            type="button"
+            data-testid="confirm-plan"
+            disabled={!confirmAllowed || (sessionScope === 'GUARDIAN' && !coCreationAttested)}
+            onClick={() => void confirmPlan()}
+          >
+            确认创建计划
+          </button>
+          <button type="button" data-testid="cancel-preview" onClick={() => cancelPreview()}>
+            取消
+          </button>
+        </section>
+      ) : null}
+
+      {screen === 's08' ? (
+        <section>
+          <h2>S08 计划详情</h2>
+          <ul data-testid="plan-list">
+            {plans.map((item) => (
+              <li key={item.id}>
+                {item.origin} · {item.status} · {item.seriesCount} 条规则
+                <button type="button" data-testid={`open-plan-${item.id}`} onClick={() => void loadPlanDetail(item.id)}>
+                  查看
+                </button>
+              </li>
+            ))}
+          </ul>
+          {planDetail ? (
+            <div data-testid="plan-detail">
+              <p>来源 {planDetail.origin}</p>
+              <p>学生确认 {planDetail.studentConfirmedAt ?? '未确认'}</p>
+              <ul>
+                {planDetail.series.map((item) => (
+                  <li key={item.id}>
+                    {item.name} · {item.occurrenceCount} 个实例
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <button type="button" data-testid="open-tasks-from-plan" onClick={() => void loadTasks()}>
+            查看日程
+          </button>
+          <button type="button" data-testid="back-from-plan" onClick={() => setScreen(sessionScope === 'STUDENT' ? 'student' : 'p05')}>
+            返回
+          </button>
+        </section>
+      ) : null}
+
+      {screen === 's05' ? (
+        <section>
+          <h2>S05 今日任务</h2>
+          <ul data-testid="task-list">
+            {tasks.map((item) => (
+              <li key={item.id}>
+                {item.scheduledLocalDate} · {item.name} · {item.status}
+              </li>
+            ))}
+          </ul>
+          <button type="button" data-testid="back-from-tasks" onClick={() => setScreen(sessionScope === 'STUDENT' ? 'student' : 'p05')}>
+            返回
           </button>
         </section>
       ) : null}
@@ -560,6 +1024,12 @@ export function App() {
         <section>
           <h2>学生视图</h2>
           <p>当前会话只能看到绑定档案。切回家长需要二次验证，不是前端开关。</p>
+          <button type="button" data-testid="open-student-templates" onClick={() => void openTemplates()}>
+            打开模板库
+          </button>
+          <button type="button" data-testid="open-student-tasks" onClick={() => void loadTasks()}>
+            打开今日任务
+          </button>
           <button type="button" data-testid="refresh-session" onClick={() => void refreshSession()}>
             刷新会话
           </button>

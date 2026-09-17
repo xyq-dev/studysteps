@@ -229,3 +229,33 @@ Playwright：`stp004-ui` 1 passed；`stp005-ui` 1 passed。覆盖建档全空、
 - 旧 fresh／旧 four-to-six 仍为被推翻实现的账本，禁止对其 deploy 修订版。
 - STP 004 仍进行中。不得宣称 M0／STP 002／接口冻结／产品验收完成。
 - 模板导入与任务实例年级快照属 STP 006；A02 运营发布属 STP 009。
+
+## 13. 2026-09-17 真实浏览器走查（本轮）
+
+授权：页面走查、隔离库测试数据、补充 E2E；禁止改业务代码／Schema／六条迁移；禁止 commit／push。
+
+| 项 | 结果 |
+| --- | --- |
+| HEAD | `911846895adcba9ad2958f2b4c707655903cd56a` |
+| 库 | `stp005_rev_fresh` @ 6260；六条已应用；25 年级／39 模板 |
+| `pnpm --filter @studysteps/web test:e2e` | 退出码 0；**4 passed / 0 skipped** |
+| 证据 | `docs/handoffs/STP005_BROWSER_EVIDENCE.md` |
+
+家庭侧 P05 SET／PROMOTE／TERM_SWITCH／SYSTEM_SWITCH 与 S07 39 条浏览已点击。A02 现有访问目录读取失败。学生视图无 S07 入口。刷新不回填年级。
+
+**可开始 STP 006 设计。不得标 STP 005 产品验收或 STP 004 完成。**
+
+## 14. 2026-09-17 页面两项阻塞修复（本轮）
+
+授权：只改 `apps/web`、`apps/admin` 及相关 E2E／验收记录。未改 API 鉴权、业务规则、Schema、六条迁移；未 commit／push。
+
+| 项 | 结果 |
+| --- | --- |
+| HEAD（未提交） | 仍为 `911846895adcba9ad2958f2b4c707655903cd56a` |
+| 库 | `stp005_rev_fresh` @ 6260；六条已应用；25 年级／39 模板 |
+| `pnpm --filter @studysteps/web test:e2e` | 退出码 0；**5 passed / 0 failed / 0 skipped** |
+| 证据 | `docs/handoffs/STP005_BROWSER_EVIDENCE.md` 修复验证节 |
+
+A02：Admin Vite 补 `/v1` 代理，复用家庭端 Cookie 读已发布目录；未登录引导现有登录，列表为空。P05：初始化 `GET /v1/auth/session` 恢复会话，按学生详情回填 `gradeConfigId`／学期／目录版本；刷新后断言实际选项值。
+
+**两项走查阻塞已关闭。仍可开始 STP 006 设计。不得标 STP 005 产品验收或 STP 004 完成。**

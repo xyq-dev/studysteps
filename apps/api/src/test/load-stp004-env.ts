@@ -97,10 +97,10 @@ export function assertDisposableIsolationTarget(
 ): string {
   const name = databaseNameFromUrl(url);
   if ((FORBIDDEN_ISOLATION_DATABASES as readonly string[]).includes(name)) {
-    throw new Error(`refusing existing database ${name}; use exclusive stp005_rev_* or CI studysteps`);
+    throw new Error(`refusing existing database ${name}; use exclusive stp006_* / stp005_rev_* or CI studysteps`);
   }
-  if (!isCi(env) && name !== 'studysteps' && !name.startsWith('stp005_rev_')) {
-    throw new Error(`expected exclusive stp005_rev_* test target, got ${name}`);
+  if (!isCi(env) && name !== 'studysteps' && !name.startsWith('stp005_rev_') && !name.startsWith('stp006_')) {
+    throw new Error(`expected exclusive stp005_rev_* / stp006_* test target, got ${name}`);
   }
   return name;
 }

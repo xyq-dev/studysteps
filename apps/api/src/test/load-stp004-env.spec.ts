@@ -52,8 +52,8 @@ describe('STP 004 isolation loader', () => {
       assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp004_identity'),
     ).toThrow(/stp004_identity/);
     expect(
-      assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp005_rev_fresh'),
-    ).toBe('stp005_rev_fresh');
+      assertDisposableIsolationTarget('postgresql://stp004_api@127.0.0.1:6260/stp006_fresh'),
+    ).toBe('stp006_fresh');
   });
 
   it('requires an admin URL in CI', () => {

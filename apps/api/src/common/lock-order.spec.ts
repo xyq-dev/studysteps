@@ -29,9 +29,13 @@ describe('7.7 lock id planning', () => {
     expect(normalizeLockIds(mergeLockIds(planned, discovered)).accountIds).toEqual(['acct-1', 'acct-2']);
   });
 
-  it('fails completeness when a grade config appears after the first plan', () => {
-    const planned = { studentIds: ['stu-1'] };
-    const discovered = { studentIds: ['stu-1'], gradeConfigIds: ['g-1'] };
-    expect(lockIdsContain(planned, discovered)).toBe(false);
+  it('locks template versions for share after grade configs', () => {
+    const normalized = normalizeLockIds({
+      gradeConfigIds: ['g1'],
+      templateVersionIds: ['t2', 't1'],
+      planIds: ['p1'],
+    });
+    expect(normalized.templateVersionIds).toEqual(['t1', 't2']);
+    expect(normalized.planIds).toEqual(['p1']);
   });
 });

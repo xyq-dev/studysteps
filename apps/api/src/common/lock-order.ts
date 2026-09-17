@@ -15,12 +15,16 @@ export type LockIds = {
   accountIds?: string[];
   studentIds?: string[];
   gradeConfigIds?: string[];
+  templateVersionIds?: string[];
   policies?: PolicyLock[];
   linkIds?: string[];
   consentIds?: string[];
   pairingIds?: string[];
   sessionIds?: string[];
   challengeIds?: string[];
+  planIds?: string[];
+  taskSeriesIds?: string[];
+  taskOccurrenceIds?: string[];
 };
 
 export class IncompleteLockSetError extends Error {
@@ -56,12 +60,16 @@ export function normalizeLockIds(ids: LockIds): {
   accountIds: string[];
   studentIds: string[];
   gradeConfigIds: string[];
+  templateVersionIds: string[];
   policies: PolicyLock[];
   linkIds: string[];
   consentIds: string[];
   pairingIds: string[];
   sessionIds: string[];
   challengeIds: string[];
+  planIds: string[];
+  taskSeriesIds: string[];
+  taskOccurrenceIds: string[];
 } {
   return {
     idempotencyIds: uniqSorted(ids.idempotencyIds),
@@ -71,12 +79,16 @@ export function normalizeLockIds(ids: LockIds): {
     accountIds: uniqSorted(ids.accountIds),
     studentIds: uniqSorted(ids.studentIds),
     gradeConfigIds: uniqSorted(ids.gradeConfigIds),
+    templateVersionIds: uniqSorted(ids.templateVersionIds),
     policies: uniqPolicies(ids.policies),
     linkIds: uniqSorted(ids.linkIds),
     consentIds: uniqSorted(ids.consentIds),
     pairingIds: uniqSorted(ids.pairingIds),
     sessionIds: uniqSorted(ids.sessionIds),
     challengeIds: uniqSorted(ids.challengeIds),
+    planIds: uniqSorted(ids.planIds),
+    taskSeriesIds: uniqSorted(ids.taskSeriesIds),
+    taskOccurrenceIds: uniqSorted(ids.taskOccurrenceIds),
   };
 }
 
@@ -89,12 +101,16 @@ export function mergeLockIds(left: LockIds, right: LockIds): LockIds {
     accountIds: [...(left.accountIds ?? []), ...(right.accountIds ?? [])],
     studentIds: [...(left.studentIds ?? []), ...(right.studentIds ?? [])],
     gradeConfigIds: [...(left.gradeConfigIds ?? []), ...(right.gradeConfigIds ?? [])],
+    templateVersionIds: [...(left.templateVersionIds ?? []), ...(right.templateVersionIds ?? [])],
     policies: [...(left.policies ?? []), ...(right.policies ?? [])],
     linkIds: [...(left.linkIds ?? []), ...(right.linkIds ?? [])],
     consentIds: [...(left.consentIds ?? []), ...(right.consentIds ?? [])],
     pairingIds: [...(left.pairingIds ?? []), ...(right.pairingIds ?? [])],
     sessionIds: [...(left.sessionIds ?? []), ...(right.sessionIds ?? [])],
     challengeIds: [...(left.challengeIds ?? []), ...(right.challengeIds ?? [])],
+    planIds: [...(left.planIds ?? []), ...(right.planIds ?? [])],
+    taskSeriesIds: [...(left.taskSeriesIds ?? []), ...(right.taskSeriesIds ?? [])],
+    taskOccurrenceIds: [...(left.taskOccurrenceIds ?? []), ...(right.taskOccurrenceIds ?? [])],
   };
 }
 
@@ -113,6 +129,7 @@ export function lockIdsContain(planned: LockIds, discovered: LockIds): boolean {
     includesAll(left.accountIds, right.accountIds) &&
     includesAll(left.studentIds, right.studentIds) &&
     includesAll(left.gradeConfigIds, right.gradeConfigIds) &&
+    includesAll(left.templateVersionIds, right.templateVersionIds) &&
     includesAll(
       left.policies.map((item) => item.id),
       right.policies.map((item) => item.id),
@@ -121,7 +138,10 @@ export function lockIdsContain(planned: LockIds, discovered: LockIds): boolean {
     includesAll(left.consentIds, right.consentIds) &&
     includesAll(left.pairingIds, right.pairingIds) &&
     includesAll(left.sessionIds, right.sessionIds) &&
-    includesAll(left.challengeIds, right.challengeIds)
+    includesAll(left.challengeIds, right.challengeIds) &&
+    includesAll(left.planIds, right.planIds) &&
+    includesAll(left.taskSeriesIds, right.taskSeriesIds) &&
+    includesAll(left.taskOccurrenceIds, right.taskOccurrenceIds)
   );
 }
 
@@ -193,6 +213,12 @@ export async function acquireLocks(tx: Prisma.TransactionClient, raw: LockIds): 
       Prisma.sql`SELECT id FROM grade_configs WHERE id IN (${uuidIn(ids.gradeConfigIds)}) ORDER BY id FOR SHARE`,
     );
   }
+  if (ids.templateVersionIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT id FROM plan_template_versions WHERE id IN (${uuidIn(ids.templateVersionIds)}) ORDER BY id FOR SHARE`,
+    );
+  }
   if (ids.policies.length > 0) {
     await lockTable(
       tx,
@@ -227,6 +253,24 @@ export async function acquireLocks(tx: Prisma.TransactionClient, raw: LockIds): 
     await lockTable(
       tx,
       Prisma.sql`SELECT id FROM device_sessions WHERE id IN (${uuidIn(ids.sessionIds)}) ORDER BY id FOR UPDATE`,
+    );
+  }
+  if (ids.planIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT id FROM study_plans WHERE id IN (${uuidIn(ids.planIds)}) ORDER BY id FOR UPDATE`,
+    );
+  }
+  if (ids.taskSeriesIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT id FROM task_series WHERE id IN (${uuidIn(ids.taskSeriesIds)}) ORDER BY id FOR UPDATE`,
+    );
+  }
+  if (ids.taskOccurrenceIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT id FROM task_occurrences WHERE id IN (${uuidIn(ids.taskOccurrenceIds)}) ORDER BY id FOR UPDATE`,
     );
   }
 }
