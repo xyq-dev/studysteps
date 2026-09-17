@@ -9,10 +9,13 @@ import {
   localDateInTimeZone,
   manualPreviewCanonicalPayload,
   normalizePreviewTasks,
+  canRescheduleOccurrence,
   occurrenceCancellableOnPlanHalt,
   occurrenceRestorableOnResume,
   planAllowsOccurrenceGeneration,
   previewCanonicalPayload,
+  rescheduleTargetAllowed,
+  scheduledDateConflicts,
   resolvePlanStatusTransition,
 } from './planning.js';
 import { consentCoversPlanWrites, TEST_POLICY_V1_SCOPE, TEST_POLICY_V2_SCOPE } from './consent-scope.js';
@@ -155,7 +158,7 @@ describe('STP 006 plan status transitions', () => {
     expect(missingOccurrenceDates('PAUSED', daily, '2026-09-18', [])).toEqual([]);
   });
 
-  it('cancels future planned rows and restores only PLAN_PAUSED rows still in window', () => {
+  it('cancels future planned rows and restores PLAN_PAUSED rows from today onward', () => {
     expect(occurrenceCancellableOnPlanHalt('PLANNED', '2026-09-17', '2026-09-17')).toBe(true);
     expect(occurrenceCancellableOnPlanHalt('PLANNED', '2026-09-16', '2026-09-17')).toBe(false);
     expect(occurrenceCancellableOnPlanHalt('COMPLETED', '2026-09-18', '2026-09-17')).toBe(false);
@@ -165,7 +168,14 @@ describe('STP 006 plan status transitions', () => {
         cancelReason: 'PLAN_PAUSED',
         scheduledLocalDate: '2026-09-20',
         todayLocalDate: '2026-09-18',
-        windowTo: '2026-10-01',
+      }),
+    ).toBe(true);
+    expect(
+      occurrenceRestorableOnResume({
+        status: 'CANCELLED',
+        cancelReason: 'PLAN_PAUSED',
+        scheduledLocalDate: '2026-10-20',
+        todayLocalDate: '2026-09-18',
       }),
     ).toBe(true);
     expect(
@@ -174,7 +184,6 @@ describe('STP 006 plan status transitions', () => {
         cancelReason: 'PLAN_ARCHIVED',
         scheduledLocalDate: '2026-09-20',
         todayLocalDate: '2026-09-18',
-        windowTo: '2026-10-01',
       }),
     ).toBe(false);
     expect(
@@ -183,8 +192,28 @@ describe('STP 006 plan status transitions', () => {
         cancelReason: 'PLAN_PAUSED',
         scheduledLocalDate: '2026-09-10',
         todayLocalDate: '2026-09-18',
-        windowTo: '2026-10-01',
       }),
+    ).toBe(false);
+  });
+
+  it('allows only planned active occurrences to move to a free future date', () => {
+    expect(canRescheduleOccurrence('ACTIVE', 'PLANNED')).toBe(true);
+    expect(canRescheduleOccurrence('PAUSED', 'PLANNED')).toBe(false);
+    expect(canRescheduleOccurrence('ACTIVE', 'CANCELLED')).toBe(false);
+    expect(rescheduleTargetAllowed('2026-09-18', '2026-09-18')).toBe(true);
+    expect(rescheduleTargetAllowed('2026-09-18', '2026-10-20')).toBe(true);
+    expect(rescheduleTargetAllowed('2026-09-18', '2026-09-17')).toBe(false);
+    expect(
+      scheduledDateConflicts('2026-09-20', 'self', [
+        { id: 'self', scheduledLocalDate: '2026-09-18' },
+        { id: 'other', scheduledLocalDate: '2026-09-20' },
+      ]),
+    ).toBe(true);
+    expect(
+      scheduledDateConflicts('2026-09-21', 'self', [
+        { id: 'self', scheduledLocalDate: '2026-09-18' },
+        { id: 'other', scheduledLocalDate: '2026-09-20' },
+      ]),
     ).toBe(false);
   });
 });

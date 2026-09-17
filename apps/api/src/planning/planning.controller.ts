@@ -5,6 +5,7 @@ import {
   patchPlanSchema,
   previewManualPlanSchema,
   previewTemplateSchema,
+  rescheduleTaskSchema,
   taskHorizonSchema,
 } from '@studysteps/contracts';
 import type { Request, Response } from 'express';
@@ -133,6 +134,26 @@ export class PlanningController {
     const session = await this.guardRead(request);
     res.setHeader('Cache-Control', 'no-store');
     return this.planning.getTask(session, studentId, occurrenceId);
+  }
+
+  @Post('students/:studentId/tasks/:occurrenceId/reschedule')
+  @HttpCode(200)
+  async reschedule(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.rescheduleTask(
+      session,
+      studentId,
+      occurrenceId,
+      rescheduleTaskSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 
   @Post('students/:studentId/task-horizon')

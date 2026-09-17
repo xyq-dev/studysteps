@@ -33,6 +33,7 @@ type EducationDetail = {
 };
 
 const ACTIVE_STUDENT_KEY = 'stp.ui.activeStudentId';
+const TASK_EXTRA_DATES_KEY = 'stp.ui.taskExtraDates';
 
 function isTermCode(value: string | null | undefined): value is TermCode {
   return value === 'FULL_YEAR' || value === 'FIRST_TERM' || value === 'SECOND_TERM';
@@ -53,6 +54,33 @@ function writeStoredStudentId(id: string | null) {
     } else {
       sessionStorage.removeItem(ACTIVE_STUDENT_KEY);
     }
+  } catch {
+    /* ignore private-mode quota */
+  }
+}
+
+function readTaskExtraDates(): string[] {
+  try {
+    const raw = sessionStorage.getItem(TASK_EXTRA_DATES_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberTaskExtraDates(dates: string[]) {
+  const merged = [...new Set([...readTaskExtraDates(), ...dates.filter(Boolean)])];
+  try {
+    sessionStorage.setItem(TASK_EXTRA_DATES_KEY, JSON.stringify(merged));
+  } catch {
+    /* ignore private-mode quota */
+  }
+}
+
+function clearTaskExtraDates() {
+  try {
+    sessionStorage.removeItem(TASK_EXTRA_DATES_KEY);
   } catch {
     /* ignore private-mode quota */
   }
@@ -102,6 +130,11 @@ async function api(path: string, init: RequestInit = {}) {
     throw new Error(data.message ?? data.code ?? '请求失败');
   }
   return data;
+}
+
+function addBrowserLocalDays(localDate: string, days: number) {
+  const [year, month, day] = localDate.split('-').map((part) => Number(part));
+  return new Date(Date.UTC(year as number, (month as number) - 1, (day as number) + days)).toISOString().slice(0, 10);
 }
 
 export function App() {
@@ -160,6 +193,8 @@ export function App() {
       id: string;
       name: string;
       scheduledLocalDate: string;
+      originalLocalDate?: string;
+      version: number;
       status: string;
       planStatus?: string;
       executable?: boolean;
@@ -168,6 +203,10 @@ export function App() {
   const [planActionPending, setPlanActionPending] = useState(false);
   const [archiveConfirmPlanId, setArchiveConfirmPlanId] = useState<string | null>(null);
   const [horizonPending, setHorizonPending] = useState(false);
+  const [rescheduleTaskId, setRescheduleTaskId] = useState<string | null>(null);
+  const [rescheduleDate, setRescheduleDate] = useState('');
+  const [rescheduleReason, setRescheduleReason] = useState('调到合适的一天');
+  const [reschedulePending, setReschedulePending] = useState(false);
   const studentLoadSeq = useRef(0);
   const bootstrapSeq = useRef(0);
 
@@ -176,6 +215,7 @@ export function App() {
     setStudents([]);
     setActiveStudentId(null);
     writeStoredStudentId(null);
+    clearTaskExtraDates();
     setGrades([]);
     setGradeConfigId('');
     setChangeKind('SET');
@@ -193,6 +233,10 @@ export function App() {
     setPlanActionPending(false);
     setArchiveConfirmPlanId(null);
     setHorizonPending(false);
+    setRescheduleTaskId(null);
+    setRescheduleDate('');
+    setRescheduleReason('调到合适的一天');
+    setReschedulePending(false);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -896,14 +940,68 @@ export function App() {
     }
   }
 
-  async function loadTasks() {
+  function openReschedule(task: { id: string; scheduledLocalDate: string; executable?: boolean }) {
+    if (task.executable === false) {
+      return;
+    }
+    const today = new Date().toLocaleDateString('en-CA');
+    setRescheduleTaskId(task.id);
+    setRescheduleDate(addBrowserLocalDays(task.scheduledLocalDate, 1) >= today ? addBrowserLocalDays(task.scheduledLocalDate, 1) : today);
+    setRescheduleReason('调到合适的一天');
+  }
+
+  function cancelReschedule() {
+    if (reschedulePending) {
+      return;
+    }
+    setRescheduleTaskId(null);
+    setRescheduleDate('');
+  }
+
+  async function confirmReschedule() {
+    if (!activeStudentId || !rescheduleTaskId || reschedulePending) {
+      return;
+    }
+    const current = tasks.find((item) => item.id === rescheduleTaskId);
+    if (!current) {
+      return;
+    }
+    setReschedulePending(true);
+    setStatus('正在改期');
+    try {
+      await api(`/v1/students/${activeStudentId}/tasks/${current.id}/reschedule`, {
+        method: 'POST',
+        body: JSON.stringify({
+          scheduledLocalDate: rescheduleDate,
+          reason: rescheduleReason,
+          expectedVersion: current.version,
+        }),
+      });
+      const previousDate = current.scheduledLocalDate;
+      setRescheduleTaskId(null);
+      await loadTasks([previousDate, rescheduleDate]);
+      setStatus(`已将任务从 ${previousDate} 改到 ${rescheduleDate}。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法改期');
+    } finally {
+      setReschedulePending(false);
+    }
+  }
+
+  async function loadTasks(extraDates: string[] = []) {
     if (!activeStudentId) {
       return;
     }
     try {
+      if (extraDates.length > 0) {
+        rememberTaskExtraDates(extraDates);
+      }
       const today = new Date().toLocaleDateString('en-CA');
-      const to = new Date(Date.now() + 13 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA');
-      const result = await api(`/v1/students/${activeStudentId}/tasks?from=${today}&to=${to}`);
+      const defaultTo = addBrowserLocalDays(today, 13);
+      const dates = [today, defaultTo, ...readTaskExtraDates(), ...extraDates].filter(Boolean).sort();
+      const from = dates[0] ?? today;
+      const to = dates[dates.length - 1] ?? defaultTo;
+      const result = await api(`/v1/students/${activeStudentId}/tasks?from=${from}&to=${to}`);
       const listed = await api(`/v1/students/${activeStudentId}/plans`);
       setTasks(result.items ?? []);
       setPlans(listed.items ?? []);
@@ -1336,9 +1434,50 @@ export function App() {
                 {item.scheduledLocalDate} · {item.name} · {item.status}
                 {item.planStatus ? ` · ${item.planStatus}` : ''}
                 {item.executable === false ? ' · 不可继续执行' : ''}
+                {item.executable !== false ? (
+                  <button
+                    type="button"
+                    data-testid={`reschedule-task-${item.id}`}
+                    disabled={reschedulePending}
+                    onClick={() => openReschedule(item)}
+                  >
+                    改期
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>
+          {rescheduleTaskId ? (
+            <div data-testid="reschedule-confirm">
+              <p>
+                将从 {tasks.find((item) => item.id === rescheduleTaskId)?.scheduledLocalDate} 改到 {rescheduleDate || '未选择'}
+              </p>
+              <label>
+                新日期
+                <input
+                  data-testid="reschedule-date"
+                  type="date"
+                  min={new Date().toLocaleDateString('en-CA')}
+                  value={rescheduleDate}
+                  onChange={(event) => setRescheduleDate(event.target.value)}
+                />
+              </label>
+              <label>
+                原因
+                <input
+                  data-testid="reschedule-reason"
+                  value={rescheduleReason}
+                  onChange={(event) => setRescheduleReason(event.target.value)}
+                />
+              </label>
+              <button type="button" data-testid="confirm-reschedule" disabled={reschedulePending} onClick={() => void confirmReschedule()}>
+                {reschedulePending ? '正在改期' : '确认改期'}
+              </button>
+              <button type="button" data-testid="cancel-reschedule" disabled={reschedulePending} onClick={() => cancelReschedule()}>
+                取消
+              </button>
+            </div>
+          ) : null}
           <ul>
             {plans
               .filter((item) => item.status === 'ACTIVE' || item.status === 'PAUSED')

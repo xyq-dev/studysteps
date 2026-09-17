@@ -94,7 +94,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 - **14 天闭区间（确认事务与后续 horizon POST 相同）：** 令 `today` = 锁内读取的服务器时间映射到学生时区后的本地日历日。`from = today`（含），`to = today + 13 个日历日`（含），再与规则 `endLocalDate` 取较早者。共最多 14 个本地日；不含 `today - 1`，不含 `today + 14`。`ongoing=true` 且无结束日时只截到 `to`。暂停期间不生成；恢复后从恢复日起向前看，**不补**暂停缺口。
 - **去重键**必须同时包含规则／条目身份和原始本地日期，不能仅靠日期：`UNIQUE (task_series_id, occurrence_key)`，其中 `occurrence_key` = 该 `TaskSeries`（一条规则／模板条目）**最初安排**的本地日 `YYYY-MM-DD`。同一天两条练习必须两条 series，不得靠日期全局唯一。
 - 改期只改 `scheduledLocalDate`；`id`、`originalLocalDate`、`occurrence_key`、`task_series_id` 不变。改期撞上同 series 已有安排日：提示两项，禁止自动覆盖。
-- 写入口仅：确认事务、显式 `POST .../task-horizon`、以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态（已取消的 key 不复活，除非产品明确「恢复计划」——暂停取消的未来实例保留同一 key，恢复时把仍在窗口内、因暂停取消且无完成记录的行从 `CANCELLED` 拉回 `PLANNED` 仅限 `reason=PLAN_PAUSED`，不新建第二行）。
+- 写入口仅：确认事务、显式 `POST .../task-horizon`、单次改期，以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态（已取消的 key 不复活，除非产品明确「恢复计划」——暂停取消的未来实例保留同一 key，恢复时把安排日 ≥ 今日、因暂停取消且无完成记录的行从 `CANCELLED` 拉回 `PLANNED` 仅限 `reason=PLAN_PAUSED`，不新建第二行，不截 14 天窗口。这是支持改期移出窗口后仍能恢复所需的联动）。
 
 ### 4.3 修改／暂停／结束对已生成任务
 
@@ -206,7 +206,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | PATCH | `/v1/plans/:planId/series/:seriesId` | 更新 | `scope=THIS_OCCURRENCE\|FUTURE`；`fromLocalDate` | 新 series version | version | 409；禁止改完成行 |
 | GET | `/v1/students/:id/tasks?date=` | 读 | 本地日；可 `from`/`to` | 已存在实例；排除取消；跳过仍列出但标未完成 | **只读；不创建、不补齐**。成功请求的会话 `lastSeen` 节流 heartbeat 沿用 STP 004 HB-1，失败不 heartbeat | 401／404 |
 | GET | `/v1/students/:id/tasks/:occurrenceId` | 读 | — | 实例＋不可变快照 | 只读；同上 heartbeat | 404 |
-| POST | `/v1/tasks/:occurrenceId/reschedule` | 调整 | 新本地日、原因、`expectedVersion` | 同 id，原始键不变 | 幂等 | 冲突提示不覆盖；403 |
+| POST | `/v1/students/:id/tasks/:occurrenceId/reschedule` | G／S 调整＋step-up | 新本地日、原因、实例 `expectedVersion` | 同 id／key／快照，只改安排日 | 幂等 `tasks.reschedule`＋实例 version | 409 撞日／不可改／旧版本；403 |
 | POST | `/v1/students/:id/task-horizon` | G／S 写＋系统工人 | CSRF／Origin；`Idempotency-Key`；窗口不得超过 4.2 的 14 日闭区间 | 插入缺失实例数 | 幂等；唯一约束；锁内重验 | 403 失权后不得回放旧对象 |
 
 现网 `TEMPLATE_IMPORT_NOT_AVAILABLE` 仅作占位，实现后不再用于成功路径。
@@ -245,7 +245,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 批 | 内容 | 退出 |
 | --- | --- | --- |
 | **A 最小闭环（第一批，不扩展）** | 第七条迁移；preview／import 真写入；GET plans／plan／tasks（只读）；学生 S07 入口；S03 确认／取消；S05／S08／S04 只读；确认事务内生成 14 天；`POST .../task-horizon` 端点（供窗口外补齐与 T06-P-UNIQ，无工人）；T06-P-*（含 ORIGIN）、T03 生成、T02-D-OCC、T11-3／CON-3 的**计划写** | 闭环可点；无完成；无新同意文档、无重新同意页 |
-| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（本批）；THIS／FUTURE；改期；S12 最小（后延） | 状态控制与按需补齐可点；无改期；无工人 |
+| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（已落地）；单次改期（本批）；THIS／FUTURE；S12 最小（后延） | 单次改期可点；范围编辑／拆分／工人未做 |
 | C | 拆分；Outbox 工人调用同一 `task-horizon` POST（不经 GET）；S09 只读细节打磨 | TASKS 所列后台任务入口 |
 
 A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不是 P1。
@@ -342,7 +342,7 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 第一批功能范围已固定。B04 正式文案／经营主体仍是上线前置，不阻塞隔离开发。生产告知不得用 test-v2 冒充。
 
-后续批次仍开放：范围编辑、改期、拆分、Outbox 工人。按需 `task-horizon` 见 §3.6（本批）。暂停／恢复／归档见 §3.5。打卡、计时、通知、运营发布不在本 STP。
+后续批次仍开放：范围编辑、拆分、Outbox 工人。单次改期见 §3.7（本批）。按需 `task-horizon` 见 §3.6。暂停／恢复／归档见 §3.5（恢复今日及之后 `PLAN_PAUSED`，以支持改期联动）。打卡、计时、通知、运营发布不在本 STP。
 
 ### 3.4 S06 空白创建（第二批最小）
 
@@ -362,7 +362,7 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 | 当前状态 | 动作 | 下一状态 | 前置 | 已生成实例 | 后续生成 |
 | --- | --- | --- | --- | --- | --- |
 | `ACTIVE` | `PAUSE` | `PAUSED` | 权限、必要同意、`expectedVersion` 匹配 | 安排日 ≥ 生效日（学生时区今日）且仍为 `PLANNED` 的行 → `CANCELLED`／`PLAN_PAUSED`。不硬删计划／规则／实例／历史。不改 id、`occurrence_key`、年级快照、完成标准快照。`IN_PROGRESS`／`COMPLETED`／`SKIPPED` 不改（STP 007 前不应出现） | 禁止。共用生成逻辑对非 `ACTIVE` 返回空日期，不 INSERT |
-| `PAUSED` | `RESUME` | `ACTIVE` | 同上 | **不**插入暂停缺口的新行，**不**复制已有行。仅把仍在恢复日窗口内（今日…今日+13，再截规则结束日）、`CANCELLED` 且 `cancel_reason=PLAN_PAUSED`、无完成记录的行拉回 `PLANNED` 并清空 `cancel_reason`。暂停日前的 `PLAN_PAUSED` 行保持取消 | 自恢复日起允许生成。按需 `POST .../task-horizon` 已落地；Outbox 工人仍未实现，不得宣称已验证工人效果。`GET` 仍不补齐 |
+| `PAUSED` | `RESUME` | `ACTIVE` | 同上 | **不**插入暂停缺口的新行，**不**复制已有行。仅把安排日 ≥ 今日、`CANCELLED` 且 `cancel_reason=PLAN_PAUSED`、无完成记录的既有行拉回 `PLANNED` 并清空 `cancel_reason`。不截 14 天窗口，以便改期到窗口外的实例在暂停后仍能恢复。不恢复过去，不恢复其他取消原因。暂停日前的 `PLAN_PAUSED` 行保持取消 | 自恢复日起允许生成。按需 `POST .../task-horizon` 已落地；Outbox 工人仍未实现，不得宣称已验证工人效果。`GET` 仍不补齐 |
 | `ACTIVE` 或 `PAUSED` | `ARCHIVE` | `ARCHIVED` | 同上 | 同暂停取消仍为 `PLANNED` 且安排日 ≥ 今日的行，`cancel_reason=PLAN_ARCHIVED`。已因暂停取消的行不改写原因（不重写历史）。不删行 | 禁止生成。归档为终态 |
 | `ARCHIVED` | `RESUME`／`PAUSE`／`ARCHIVE` | 非法 | — | 不改 | 仍禁止。 **不提供取消归档** |
 
@@ -376,11 +376,21 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 可见性：`GET` 计划列表含 `ARCHIVED`（S08 只读查看历史）。`GET` 任务仍排除 `CANCELLED`，且每条带 `planStatus`／`executable`（仅 `ACTIVE` 且 `PLANNED` 为可执行）。暂停／归档后页面不得把该计划展示为可继续执行。归档记录通过 S08 列表「查看」打开详情；无取消归档按钮。
 
-空白补记（不改整体架构）：共同制定约定只约束创建；归档取消原因用 `PLAN_ARCHIVED` 以便与 4.2「恢复仅限 `PLAN_PAUSED`」一致；生效日=锁内 `now` 映射的学生时区今日。
+空白补记（不改整体架构）：共同制定约定只约束创建；归档取消原因用 `PLAN_ARCHIVED` 以便与 4.2「恢复仅限 `PLAN_PAUSED`」一致；生效日=锁内 `now` 映射的学生时区今日。恢复语义从「窗口内」扩到「今日及之后」是支持单次改期所需的最小联动，不是缩小改期范围。
 
 ### 3.6 按需任务窗口补齐（本批：`POST .../task-horizon`）
 
 主体：持有 `TASK_ADJUST` 的监护人（step-up，与其他学习写入相同，不额外放宽也不另加共同制定）或绑定该档案的学生会话。客户端不能传 `from`／`to` 或指定其他学生；窗口锁内用数据库时间映射到档案时区「今日…今日+13」，再截规则起止与重复。仅 `ACTIVE` 计划生成。只 INSERT 缺失 `(task_series_id, occurrence_key)`，不改已有行、不复活 `CANCELLED`、不清除 `PLAN_PAUSED`／`PLAN_ARCHIVED`、不追补过去日期。新年级快照只写在新行。成功返回实际窗口、`insertedCount` 与正常跳过原因；无新增是 200，不是 403。同键同摘要重放返回首次结果（含跨日本地日仍不得再生成）；同键异体 409；失权后重放仍拒绝。`GET` 与页面只读加载零 INSERT。共用 `fillMissingOccurrences` 留给未来 worker，本批不宣称后台执行时鉴权或工人验收。无第八条迁移：幂等结果缓存在既有 `IdempotencyRecord.resourceId`。
+
+### 3.7 仅本次任务改期（本批）
+
+主体：持有 `TASK_ADJUST` 的监护人（step-up，与其他学习写入相同，不另加共同制定）或绑定该档案的学生会话。仅 `ACTIVE` 计划下仍为 `PLANNED` 的实例可改期。目标日不得早于锁内学生时区今日；允许落到 14 天窗口外或规则结束日之后，因为改期改的是已有行的实际安排日，不改重复规则、不新生成。
+
+保持 `id`、`task_series_id`、`occurrence_key`、`originalLocalDate` 与年级／正文快照不变；只改 `scheduledLocalDate` 并递增实例 `version`。实际安排日不是去重键；目标日若已有同 series 其他实例（任意状态）→ `409 TASK_DATE_CONFLICT`，禁止覆盖或合并。非法状态 → `409 TASK_NOT_ADJUSTABLE` 或 `PLAN_STATUS_INVALID`。取消不写库。目标日等于当前安排日：鉴权／加锁／幂等后 200，不改日期、不写 `plan_adjustments`。
+
+接口：`POST /v1/students/:id/tasks/:occurrenceId/reschedule`（学生作用域，以便复用现网只对 `/v1/students` 附加的 `Idempotency-Key`）。body：`scheduledLocalDate`、`reason`（1–120）、`expectedVersion`（实例 version）。成功与 `plan_adjustments`（`TASK_RESCHEDULED`，含原定日、改后日、原因、操作者）同一事务。同键同摘要重放前仍重验当前 `TASK_ADJUST`，不重复审计；同键异体 409。`GET` 与暂停／归档／恢复按 `scheduledLocalDate` 判断日历与未来行；horizon 仍按 `occurrence_key` 去重，不得把被移动的原任务再生成一份。
+
+第八条最小增量迁移只加 `task_occurrences.version`（默认 1，CHECK ≥ 1），不改 key／快照。七条已发布迁移与 test-v2 不变。历史夹具 `stp006_six_to_seven` 保持七条；合法非空七→八在隔离库 `stp006_seven_to_eight` 用 `migrate deploy` 验证。
 
 ## 12. 与原文冲突（不改 `PROJECT_PLAN.md`）
 

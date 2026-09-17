@@ -541,6 +541,7 @@ model TaskOccurrence {
   termCodeSnapshot       String           @map("term_code_snapshot")
   catalogEntryKeySnapshot String          @map("catalog_entry_key_snapshot")
   sourceOccurrenceId     String?          @map("source_occurrence_id") @db.Uuid
+  version                Int              @default(1)
   createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
   series                 TaskSeries       @relation(fields: [seriesId], references: [id], onDelete: Restrict)

@@ -13,6 +13,10 @@ import {
   FIXTURE_DATABASE as SIX_TO_SEVEN_DATABASE,
   recordSixToSevenFixtureUrl,
 } from './stp006-six-to-seven.mjs';
+import {
+  FIXTURE_DATABASE as SEVEN_TO_EIGHT_DATABASE,
+  recordSevenToEightFixtureUrl,
+} from './stp006-seven-to-eight.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -203,6 +207,71 @@ if (process.env.STP006_SIX_TO_SEVEN_DATABASE_URL !== sixToSevenUrl) {
   throw new Error('STP006_SIX_TO_SEVEN_DATABASE_URL was not applied in the current prepare step');
 }
 
+const sevenToEight = spawnSync(process.execPath, [join(root, 'scripts/stp006-seven-to-eight.mjs')], {
+  cwd: root,
+  env: { ...process.env },
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(sevenToEight.stdout || '');
+process.stderr.write(sevenToEight.stderr || '');
+if (sevenToEight.status !== 0) {
+  process.exit(sevenToEight.status ?? 1);
+}
+
+const sevenToEightUrl = rewriteDb(adminUrl, SEVEN_TO_EIGHT_DATABASE);
+const sevenToEightDbClient = new pg.Client({ connectionString: sevenToEightUrl, connectionTimeoutMillis: 8000 });
+await sevenToEightDbClient.connect();
+const sevenToEightDb = await sevenToEightDbClient.query('SELECT current_database() AS name');
+if (sevenToEightDb.rows[0]?.name !== SEVEN_TO_EIGHT_DATABASE) {
+  await sevenToEightDbClient.end();
+  throw new Error('seven-to-eight fixture connected to the wrong database');
+}
+const eightBaseline = await sevenToEightDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '七到八基线'`,
+);
+const eightApplied = await sevenToEightDbClient.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const eightVersion = await sevenToEightDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM task_occurrences WHERE version = 1`,
+);
+await sevenToEightDbClient.end();
+if (eightBaseline.rows[0]?.n !== 1) {
+  throw new Error('seven-to-eight baseline student missing');
+}
+if (eightApplied.rows[0]?.n !== 8) {
+  throw new Error('seven-to-eight fixture did not apply eight migrations');
+}
+if (eightVersion.rows[0]?.n < 1) {
+  throw new Error('seven-to-eight fixture missing defaulted occurrence version');
+}
+recordSevenToEightFixtureUrl(sevenToEightUrl, process.env);
+if (process.env.STP006_SEVEN_TO_EIGHT_DATABASE_URL !== sevenToEightUrl) {
+  throw new Error('STP006_SEVEN_TO_EIGHT_DATABASE_URL was not applied in the current prepare step');
+}
+
+const sixToSevenStill = new pg.Client({ connectionString: sixToSevenUrl, connectionTimeoutMillis: 8000 });
+await sixToSevenStill.connect();
+const sixToSevenCount = await sixToSevenStill.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const sixToSevenVersion = await sixToSevenStill.query(
+  `SELECT column_name FROM information_schema.columns
+    WHERE table_name = 'task_occurrences' AND column_name = 'version'`,
+);
+await sixToSevenStill.end();
+if (sixToSevenCount.rows[0]?.n !== 7) {
+  throw new Error('six-to-seven fixture must stay at seven migrations');
+}
+if (sixToSevenVersion.rowCount !== 0) {
+  throw new Error('six-to-seven fixture must not receive occurrence version');
+}
+
 process.stdout.write(
-  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}\n`,
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}\n`,
 );

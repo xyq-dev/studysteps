@@ -240,14 +240,33 @@ export function occurrenceRestorableOnResume(input: {
   cancelReason: string | null;
   scheduledLocalDate: string;
   todayLocalDate: string;
-  windowTo: string;
 }): boolean {
   return (
     input.status === 'CANCELLED' &&
     input.cancelReason === 'PLAN_PAUSED' &&
-    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0 &&
-    compareLocalDate(input.scheduledLocalDate, input.windowTo) <= 0
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0
   );
+}
+
+export function canRescheduleOccurrence(planStatus: string, occurrenceStatus: string): boolean {
+  return planStatus === 'ACTIVE' && occurrenceStatus === 'PLANNED';
+}
+
+export function rescheduleTargetAllowed(todayLocalDate: string, targetLocalDate: string): boolean {
+  return isLocalDate(targetLocalDate) && compareLocalDate(targetLocalDate, todayLocalDate) >= 0;
+}
+
+export function scheduledDateConflicts(
+  targetLocalDate: string,
+  selfId: string,
+  siblings: Iterable<{ id: string; scheduledLocalDate: string }>,
+): boolean {
+  for (const row of siblings) {
+    if (row.id !== selfId && row.scheduledLocalDate === targetLocalDate) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export type EducationFingerprint = {

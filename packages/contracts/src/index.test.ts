@@ -10,6 +10,7 @@ import {
   withdrawConsentSchema,
   createManualPlanSchema,
   patchPlanSchema,
+  rescheduleTaskSchema,
   taskHorizonSchema,
 } from './index.js';
 
@@ -27,6 +28,8 @@ describe('@studysteps/contracts export boundary', () => {
     expect(ERROR_CODES).toContain('TEMPLATE_IMPORT_NOT_ALLOWED');
     expect(ERROR_CODES).toContain('PLAN_PREVIEW_STALE');
     expect(ERROR_CODES).toContain('PLAN_STATUS_INVALID');
+    expect(ERROR_CODES).toContain('TASK_DATE_CONFLICT');
+    expect(ERROR_CODES).toContain('TASK_NOT_ADJUSTABLE');
   });
 });
 
@@ -140,6 +143,28 @@ describe('request validation', () => {
       }),
     ).toEqual({ action: 'PAUSE', expectedVersion: 1 });
     expect(patchPlanSchema.safeParse({ action: 'UNARCHIVE', expectedVersion: 1 }).success).toBe(false);
+  });
+
+  it('accepts single-occurrence reschedule bodies and rejects extra fields', () => {
+    expect(
+      rescheduleTaskSchema.parse({
+        scheduledLocalDate: '2026-10-02',
+        reason: '调到周末',
+        expectedVersion: 1,
+      }),
+    ).toEqual({
+      scheduledLocalDate: '2026-10-02',
+      reason: '调到周末',
+      expectedVersion: 1,
+    });
+    expect(
+      rescheduleTaskSchema.safeParse({
+        scheduledLocalDate: '2026-10-02',
+        reason: '调到周末',
+        expectedVersion: 1,
+        occurrenceKey: '2026-09-18',
+      }).success,
+    ).toBe(false);
   });
 
   it('rejects client-chosen task horizon windows', () => {

@@ -63,6 +63,14 @@ export const patchPlanSchema = z.object({
   expectedVersion: z.number().int().positive(),
 });
 
+export const rescheduleTaskSchema = z
+  .object({
+    scheduledLocalDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    reason: z.string().min(1).max(120),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
 export type PreviewTemplateInput = z.infer<typeof previewTemplateSchema>;
 export type ImportTemplateConfirmInput = z.infer<typeof importTemplateConfirmSchema>;
 export type PreviewManualPlanInput = z.infer<typeof previewManualPlanSchema>;
@@ -70,3 +78,4 @@ export type CreateManualPlanInput = z.infer<typeof createManualPlanSchema>;
 export type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
 export type TaskHorizonInput = z.infer<typeof taskHorizonSchema>;
 export type PatchPlanInput = z.infer<typeof patchPlanSchema>;
+export type RescheduleTaskInput = z.infer<typeof rescheduleTaskSchema>;

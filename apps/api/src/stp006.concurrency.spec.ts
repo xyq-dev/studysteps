@@ -644,4 +644,269 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await horizonHolder.end();
     await horizonObserver.end();
   });
+
+  it('pause-first overlapping reschedule is rejected; reschedule-first then pause cancels the moved row', async () => {
+    const { cookies } = await signIn();
+    const pauseFirstReady = await readyStudent(cookies, '暂停先改期');
+    const pauseFirstPlan = await importReadyPlan(cookies, pauseFirstReady);
+    const pauseFirstRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: pauseFirstPlan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+    const farDate = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Shanghai',
+    });
+    const pauseHolder = new pg.Client({ connectionString });
+    const pauseObserver = await observerClient();
+    await pauseHolder.connect();
+    await pauseHolder.query('BEGIN');
+    await pauseHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [pauseFirstReady.pairingId]);
+    const pauseHolderPid = await backendPid(pauseHolder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${pauseFirstReady.studentId}/plans/${pauseFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: pauseFirstPlan.version }),
+    );
+    const pauseWaiter = await waitForWaiterOnHolder(pauseObserver, pauseHolderPid, 'pause waits on pairing');
+    const rescheduleAfterPausePromise = dispatch(
+      agent()
+        .post(`/v1/students/${pauseFirstReady.studentId}/tasks/${pauseFirstRow.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '暂停后改期', expectedVersion: pauseFirstRow.version }),
+    );
+    const rescheduleAfterPauseWaiter = await waitForWaiterOnHolder(
+      pauseObserver,
+      pauseWaiter.waiter_pid,
+      'reschedule waits on pause',
+    );
+    expect(rescheduleAfterPauseWaiter.holder_pid).toBe(pauseWaiter.waiter_pid);
+    await pauseHolder.query('ROLLBACK');
+    const paused = await pausePromise;
+    const rescheduleAfterPause = await rescheduleAfterPausePromise;
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    expect(rescheduleAfterPause.status).toBe(409);
+    expect(['PLAN_STATUS_INVALID', 'TASK_NOT_ADJUSTABLE']).toContain(rescheduleAfterPause.body.code);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: pauseFirstRow.id } })).toMatchObject({
+      scheduledLocalDate: pauseFirstRow.scheduledLocalDate,
+      status: 'CANCELLED',
+      cancelReason: 'PLAN_PAUSED',
+    });
+    await pauseHolder.end();
+    await pauseObserver.end();
+
+    const rescheduleFirstReady = await readyStudent(cookies, '改期先暂停');
+    const rescheduleFirstPlan = await importReadyPlan(cookies, rescheduleFirstReady);
+    const moving = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: rescheduleFirstPlan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const rescheduleHolder = new pg.Client({ connectionString });
+    const rescheduleObserver = await observerClient();
+    await rescheduleHolder.connect();
+    await rescheduleHolder.query('BEGIN');
+    await rescheduleHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [rescheduleFirstReady.pairingId]);
+    const rescheduleHolderPid = await backendPid(rescheduleHolder);
+    const reschedulePromise = dispatch(
+      agent()
+        .post(`/v1/students/${rescheduleFirstReady.studentId}/tasks/${moving.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '先改期', expectedVersion: moving.version }),
+    );
+    const rescheduleWaiter = await waitForWaiterOnHolder(
+      rescheduleObserver,
+      rescheduleHolderPid,
+      'reschedule waits on pairing',
+    );
+    const pauseAfterPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${rescheduleFirstReady.studentId}/plans/${rescheduleFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: rescheduleFirstPlan.version }),
+    );
+    const pauseAfterWaiter = await waitForWaiterOnHolder(
+      rescheduleObserver,
+      rescheduleWaiter.waiter_pid,
+      'pause waits on reschedule',
+    );
+    expect(pauseAfterWaiter.holder_pid).toBe(rescheduleWaiter.waiter_pid);
+    await rescheduleHolder.query('ROLLBACK');
+    const moved = await reschedulePromise;
+    const pausedAfter = await pauseAfterPromise;
+    expect(moved.status).toBe(200);
+    expect(moved.body.scheduledLocalDate).toBe(farDate);
+    expect(pausedAfter.status).toBe(200);
+    expect(pausedAfter.body.status).toBe('PAUSED');
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } })).toMatchObject({
+      scheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+      status: 'CANCELLED',
+      cancelReason: 'PLAN_PAUSED',
+    });
+    expect(today).toBeTruthy();
+    await rescheduleHolder.end();
+    await rescheduleObserver.end();
+  });
+
+  it('archive-first overlapping reschedule is rejected; reschedule-first then archive cancels the moved row', async () => {
+    const { cookies } = await signIn();
+    const archiveFirstReady = await readyStudent(cookies, '归档先改期');
+    const archiveFirstPlan = await importReadyPlan(cookies, archiveFirstReady);
+    const archiveFirstRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: archiveFirstPlan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const farDate = new Date(Date.now() + 21 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Shanghai',
+    });
+    const archiveHolder = new pg.Client({ connectionString });
+    const archiveObserver = await observerClient();
+    await archiveHolder.connect();
+    await archiveHolder.query('BEGIN');
+    await archiveHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [archiveFirstReady.pairingId]);
+    const archiveHolderPid = await backendPid(archiveHolder);
+    const archivePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${archiveFirstReady.studentId}/plans/${archiveFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'ARCHIVE', expectedVersion: archiveFirstPlan.version }),
+    );
+    const archiveWaiter = await waitForWaiterOnHolder(archiveObserver, archiveHolderPid, 'archive waits on pairing');
+    const rescheduleAfterArchivePromise = dispatch(
+      agent()
+        .post(`/v1/students/${archiveFirstReady.studentId}/tasks/${archiveFirstRow.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '归档后改期', expectedVersion: archiveFirstRow.version }),
+    );
+    const rescheduleAfterArchiveWaiter = await waitForWaiterOnHolder(
+      archiveObserver,
+      archiveWaiter.waiter_pid,
+      'reschedule waits on archive',
+    );
+    expect(rescheduleAfterArchiveWaiter.holder_pid).toBe(archiveWaiter.waiter_pid);
+    await archiveHolder.query('ROLLBACK');
+    const archived = await archivePromise;
+    const rescheduleAfterArchive = await rescheduleAfterArchivePromise;
+    expect(archived.status).toBe(200);
+    expect(archived.body.status).toBe('ARCHIVED');
+    expect(rescheduleAfterArchive.status).toBe(409);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: archiveFirstRow.id } })).toMatchObject({
+      scheduledLocalDate: archiveFirstRow.scheduledLocalDate,
+      occurrenceKey: archiveFirstRow.occurrenceKey,
+    });
+    await archiveHolder.end();
+    await archiveObserver.end();
+
+    const rescheduleFirstReady = await readyStudent(cookies, '改期先归档');
+    const rescheduleFirstPlan = await importReadyPlan(cookies, rescheduleFirstReady);
+    const moving = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: rescheduleFirstPlan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const rescheduleHolder = new pg.Client({ connectionString });
+    const rescheduleObserver = await observerClient();
+    await rescheduleHolder.connect();
+    await rescheduleHolder.query('BEGIN');
+    await rescheduleHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [rescheduleFirstReady.pairingId]);
+    const rescheduleHolderPid = await backendPid(rescheduleHolder);
+    const reschedulePromise = dispatch(
+      agent()
+        .post(`/v1/students/${rescheduleFirstReady.studentId}/tasks/${moving.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '先改期再归档', expectedVersion: moving.version }),
+    );
+    const rescheduleWaiter = await waitForWaiterOnHolder(
+      rescheduleObserver,
+      rescheduleHolderPid,
+      'reschedule waits on pairing before archive',
+    );
+    const archiveAfterPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${rescheduleFirstReady.studentId}/plans/${rescheduleFirstPlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'ARCHIVE', expectedVersion: rescheduleFirstPlan.version }),
+    );
+    const archiveAfterWaiter = await waitForWaiterOnHolder(
+      rescheduleObserver,
+      rescheduleWaiter.waiter_pid,
+      'archive waits on reschedule',
+    );
+    expect(archiveAfterWaiter.holder_pid).toBe(rescheduleWaiter.waiter_pid);
+    await rescheduleHolder.query('ROLLBACK');
+    const moved = await reschedulePromise;
+    const archivedAfter = await archiveAfterPromise;
+    expect(moved.status).toBe(200);
+    expect(archivedAfter.status).toBe(200);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } })).toMatchObject({
+      scheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+      status: 'CANCELLED',
+      cancelReason: 'PLAN_ARCHIVED',
+    });
+    await rescheduleHolder.end();
+    await rescheduleObserver.end();
+  });
+
+  it('consent withdraw overlapping reschedule linearizes; late replay stays rejected', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '改期同意竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const moving = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const farDate = new Date(Date.now() + 22 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Shanghai',
+    });
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const reschedulePromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/tasks/${moving.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '撤回竞争', expectedVersion: moving.version }),
+    );
+    const writer = await waitForWaiterOnHolder(observer, holderPid, 'reschedule waits on pairing');
+    const blocked = await observer.query<{ pids: number[] }>('SELECT pg_blocking_pids($1::int) AS pids', [
+      writer.waiter_pid,
+    ]);
+    expect(blocked.rows[0]?.pids ?? []).toContain(holderPid);
+    const withdrawPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/consents/${ready.consentId}/withdraw`)
+        .set(writeHeaders(cookies))
+        .send({ reasonCode: 'GUARDIAN_REQUEST' }),
+    );
+    const overlap = await waitForWaiterOnHolder(observer, writer.waiter_pid, 'withdraw waits on reschedule');
+    expect(overlap.holder_pid).toBe(writer.waiter_pid);
+    await holder.query('ROLLBACK');
+    const moved = await reschedulePromise;
+    expect(moved.status).toBe(200);
+    expect(moved.body.scheduledLocalDate).toBe(farDate);
+    const withdrawn = await withdrawPromise;
+    expect(withdrawn.status).toBeLessThan(300);
+    const late = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${moving.id}/reschedule`)
+      .set(writeHeaders(cookies))
+      .send({
+        scheduledLocalDate: new Date(Date.now() + 23 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', {
+          timeZone: 'Asia/Shanghai',
+        }),
+        reason: '晚到',
+        expectedVersion: moved.body.version,
+      });
+    expect(late.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } })).toMatchObject({
+      scheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+    });
+    await holder.end();
+    await observer.end();
+  });
 });

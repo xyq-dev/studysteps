@@ -18,6 +18,9 @@ import {
   planAllowsOccurrenceGeneration,
   resolvePlanStatusTransition,
   cancelReasonForPlanAction,
+  canRescheduleOccurrence,
+  rescheduleTargetAllowed,
+  scheduledDateConflicts,
   type SeriesRule,
 } from '@studysteps/domain';
 import type {
@@ -26,6 +29,7 @@ import type {
   PatchPlanInput,
   PreviewManualPlanInput,
   PreviewTemplateInput,
+  RescheduleTaskInput,
   TaskHorizonInput,
 } from '@studysteps/contracts';
 import { AppError } from '../common/app-error';
@@ -383,7 +387,6 @@ export class PlanningService {
         throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许该操作', 409);
       }
       const today = localDateInTimeZone(now, current.timezone);
-      const windowTo = horizonWindow(today, null).to;
       const cancelledOccurrenceIds: string[] = [];
       const restoredOccurrenceIds: string[] = [];
       const haltReason = cancelReasonForPlanAction(input.action);
@@ -404,7 +407,6 @@ export class PlanningService {
       }
       if (input.action === 'RESUME') {
         for (const series of plan.series) {
-          const seriesWindowTo = horizonWindow(today, series.endLocalDate).to;
           for (const row of series.occurrences) {
             if (
               occurrenceRestorableOnResume({
@@ -412,7 +414,6 @@ export class PlanningService {
                 cancelReason: row.cancelReason,
                 scheduledLocalDate: row.scheduledLocalDate,
                 todayLocalDate: today,
-                windowTo: seriesWindowTo,
               })
             ) {
               restoredOccurrenceIds.push(row.id);
@@ -444,7 +445,6 @@ export class PlanningService {
             effectiveLocalDate: today,
             cancelledOccurrenceIds,
             restoredOccurrenceIds,
-            windowTo,
           }),
         },
       });
@@ -488,6 +488,160 @@ export class PlanningService {
       }
       return this.occurrenceView(row);
     });
+  }
+
+  async rescheduleTask(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: RescheduleTaskInput,
+    idempotencyKey: string,
+  ) {
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'TASK_ADJUST');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = this.idempotency.requestDigest({
+      operation: 'tasks.reschedule',
+      studentId,
+      occurrenceId,
+      input,
+    });
+    const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'tasks.reschedule', idempotencyKey);
+    const target = await this.prisma.taskOccurrence.findFirst({
+      where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+      include: { series: { include: { plan: true, occurrences: { select: { id: true } } } } },
+    });
+    if (!target) {
+      throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+    }
+    const siblingIds = target.series.occurrences.map((row) => row.id);
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [target.series.planId],
+      taskSeriesIds: [target.seriesId],
+      taskOccurrenceIds: siblingIds,
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'TASK_ADJUST',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      const begun = await this.idempotency.begin(tx, actor, 'tasks.reschedule', idempotencyKey, requestDigest, now);
+      if (begun.kind === 'REPLAY' && begun.resourceId) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return this.getTaskInTx(tx, studentId, begun.resourceId);
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const row = await tx.taskOccurrence.findFirst({
+        where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+        include: { series: { include: { plan: true, occurrences: true } } },
+      });
+      if (!row) {
+        throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+      }
+      if (
+        !lockIdsContain(locked, {
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        })
+      ) {
+        throw new IncompleteLockSetError({
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        });
+      }
+      if (row.version !== input.expectedVersion) {
+        throw new AppError('VERSION_CONFLICT', '任务版本已变化', 409);
+      }
+      if (row.series.plan.status !== 'ACTIVE') {
+        throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许改期', 409);
+      }
+      if (!canRescheduleOccurrence(row.series.plan.status, row.status)) {
+        throw new AppError('TASK_NOT_ADJUSTABLE', '当前任务不能改期', 409);
+      }
+      const today = localDateInTimeZone(now, current.timezone);
+      if (!rescheduleTargetAllowed(today, input.scheduledLocalDate)) {
+        throw new AppError('VALIDATION_ERROR', '不能改到过去的日期', 400, {
+          scheduledLocalDate: 'past',
+        });
+      }
+      if (
+        scheduledDateConflicts(
+          input.scheduledLocalDate,
+          row.id,
+          row.series.occurrences.map((item) => ({
+            id: item.id,
+            scheduledLocalDate: item.scheduledLocalDate,
+          })),
+        )
+      ) {
+        throw new AppError('TASK_DATE_CONFLICT', '该日已有同一规则的任务，不能覆盖', 409, {
+          scheduledLocalDate: 'conflict',
+        });
+      }
+      if (row.scheduledLocalDate !== input.scheduledLocalDate) {
+        await tx.taskOccurrence.update({
+          where: { id: row.id, version: row.version },
+          data: {
+            scheduledLocalDate: input.scheduledLocalDate,
+            version: row.version + 1,
+          },
+        });
+        await tx.planAdjustment.create({
+          data: {
+            planId: row.series.planId,
+            seriesId: row.seriesId,
+            occurrenceId: row.id,
+            reasonCode: 'TASK_RESCHEDULED',
+            payloadJson: JSON.stringify({
+              fromScheduledLocalDate: row.scheduledLocalDate,
+              toScheduledLocalDate: input.scheduledLocalDate,
+              occurrenceKey: row.occurrenceKey,
+              originalLocalDate: row.originalLocalDate,
+              reason: input.reason,
+              actorScope: session.scope,
+              actorAccountId: session.accountId ?? null,
+              actorSessionId: session.id,
+            }),
+          },
+        });
+      }
+      await this.idempotency.complete(tx, begun.recordId, 'TaskOccurrence', row.id, 200, now);
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return this.getTaskInTx(tx, studentId, row.id);
+    }, graph);
+  }
+
+  private async getTaskInTx(tx: Tx, studentId: string, occurrenceId: string) {
+    const row = await tx.taskOccurrence.findFirst({
+      where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+      include: { series: { include: { plan: true } } },
+    });
+    if (!row) {
+      throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+    }
+    return this.occurrenceView(row);
   }
 
   async taskHorizon(session: DeviceSession, studentId: string, input: TaskHorizonInput, idempotencyKey: string) {
@@ -1128,6 +1282,7 @@ export class PlanningService {
     originalLocalDate: string;
     occurrenceKey: string;
     status: string;
+    version: number;
     nameSnapshot: string;
     subjectSnapshot: string;
     completionStandardSnapshot: string;
@@ -1146,6 +1301,7 @@ export class PlanningService {
       scheduledLocalDate: row.scheduledLocalDate,
       originalLocalDate: row.originalLocalDate,
       occurrenceKey: row.occurrenceKey,
+      version: row.version,
       status: row.status,
       planStatus,
       executable: planStatus === 'ACTIVE' && row.status === 'PLANNED',

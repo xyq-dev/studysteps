@@ -202,6 +202,19 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
       .send(body);
   }
 
+  async function postReschedule(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ) {
+    return agent()
+      .post(`/v1/students/${studentId}/tasks/${occurrenceId}/reschedule`)
+      .set(writeHeaders(cookies, idempotencyKey))
+      .send(body);
+  }
+
   async function createManualPlan(
     cookies: CookieJar,
     student: { id: string; version: number },
@@ -1208,6 +1221,273 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     expect(expired.status).toBe(401);
     expect(expired.body.code).toBe('AUTH_SESSION_INVALID');
     const expiredReplay = await postHorizon(other.cookies, otherStudent.id, {}, expiredKey);
+    expect(expiredReplay.status).toBe(401);
+  });
+
+  it('reschedules only the scheduled date, keeps identity, and does not overwrite a sibling day', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '单次改期'));
+    const created = await previewAndImport(auth.cookies, student, { attested: true });
+    expect(created.imported.status).toBe(201);
+    const planId = created.imported.body.id as string;
+    const today = shanghaiToday();
+    const rows = await prisma.taskOccurrence.findMany({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const seriesId = rows.find((row) => rows.filter((item) => item.seriesId === row.seriesId).length > 1)?.seriesId;
+    const sameSeries = rows.filter((row) => row.seriesId === seriesId);
+    expect(sameSeries.length).toBeGreaterThan(1);
+    const moving = sameSeries[0]!;
+    const sibling = sameSeries[1]!;
+    const farDate = addLocalDays(today, 20);
+    const moved = await postReschedule(auth.cookies, student.id, moving.id, {
+      scheduledLocalDate: farDate,
+      reason: '调到窗口外',
+      expectedVersion: moving.version,
+    });
+    expect(moved.status).toBe(200);
+    expect(moved.body).toMatchObject({
+      id: moving.id,
+      occurrenceKey: moving.occurrenceKey,
+      originalLocalDate: moving.originalLocalDate,
+      scheduledLocalDate: farDate,
+      seriesId: moving.seriesId,
+      version: moving.version + 1,
+      gradeLabelSnapshot: moving.gradeLabelSnapshot,
+    });
+    const persisted = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } });
+    expect(persisted).toMatchObject({
+      occurrenceKey: moving.occurrenceKey,
+      originalLocalDate: moving.originalLocalDate,
+      scheduledLocalDate: farDate,
+      gradeLabelSnapshot: moving.gradeLabelSnapshot,
+      gradeConfigId: moving.gradeConfigId,
+    });
+    const audit = await prisma.planAdjustment.findMany({
+      where: { planId, occurrenceId: moving.id, reasonCode: 'TASK_RESCHEDULED' },
+    });
+    expect(audit).toHaveLength(1);
+    expect(JSON.parse(audit[0]!.payloadJson)).toMatchObject({
+      fromScheduledLocalDate: moving.scheduledLocalDate,
+      toScheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+      originalLocalDate: moving.originalLocalDate,
+      reason: '调到窗口外',
+      actorScope: 'GUARDIAN',
+    });
+
+    const oldDay = await agent()
+      .get(`/v1/students/${student.id}/tasks?date=${moving.scheduledLocalDate}`)
+      .set('Cookie', auth.cookies.header());
+    expect(oldDay.body.items.some((item: { id: string }) => item.id === moving.id)).toBe(false);
+    const newDay = await agent()
+      .get(`/v1/students/${student.id}/tasks?date=${farDate}`)
+      .set('Cookie', auth.cookies.header());
+    expect(newDay.body.items.some((item: { id: string; scheduledLocalDate: string }) => item.id === moving.id && item.scheduledLocalDate === farDate)).toBe(true);
+
+    const collision = await postReschedule(auth.cookies, student.id, moving.id, {
+      scheduledLocalDate: sibling.scheduledLocalDate,
+      reason: '撞日',
+      expectedVersion: moved.body.version,
+    });
+    expect(collision.status).toBe(409);
+    expect(collision.body.code).toBe('TASK_DATE_CONFLICT');
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } })).toMatchObject({
+      scheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+    });
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: sibling.id } })).toMatchObject({
+      scheduledLocalDate: sibling.scheduledLocalDate,
+      occurrenceKey: sibling.occurrenceKey,
+      status: sibling.status,
+    });
+    expect(await prisma.taskOccurrence.count({ where: { seriesId: moving.seriesId } })).toBe(
+      rows.filter((row) => row.seriesId === moving.seriesId).length,
+    );
+
+    const sameDay = await postReschedule(auth.cookies, student.id, moving.id, {
+      scheduledLocalDate: farDate,
+      reason: '无变化',
+      expectedVersion: moved.body.version,
+    });
+    expect(sameDay.status).toBe(200);
+    expect(sameDay.body.scheduledLocalDate).toBe(farDate);
+    expect(sameDay.body.version).toBe(moved.body.version);
+    expect(await prisma.planAdjustment.count({ where: { planId, occurrenceId: moving.id, reasonCode: 'TASK_RESCHEDULED' } })).toBe(1);
+
+    const horizon = await postHorizon(auth.cookies, student.id);
+    expect(horizon.status).toBe(200);
+    expect(
+      await prisma.taskOccurrence.count({
+        where: { seriesId: moving.seriesId, occurrenceKey: moving.occurrenceKey },
+      }),
+    ).toBe(1);
+    const afterHorizon = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } });
+    expect(afterHorizon.scheduledLocalDate).toBe(farDate);
+    expect(afterHorizon.occurrenceKey).toBe(moving.occurrenceKey);
+
+    const paused = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'PAUSE',
+      expectedVersion: 1,
+    });
+    expect(paused.status).toBe(200);
+    const pausedFar = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } });
+    expect(pausedFar).toMatchObject({ status: 'CANCELLED', cancelReason: 'PLAN_PAUSED', scheduledLocalDate: farDate });
+    const resumed = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'RESUME',
+      expectedVersion: paused.body.version,
+    });
+    expect(resumed.status).toBe(200);
+    const restoredFar = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } });
+    expect(restoredFar).toMatchObject({
+      status: 'PLANNED',
+      cancelReason: null,
+      scheduledLocalDate: farDate,
+      occurrenceKey: moving.occurrenceKey,
+    });
+  });
+
+  it('rejects past, illegal, unauthorized and stale reschedule requests and keeps idempotency', async () => {
+    const owner = await signIn();
+    const student = await setGrade(owner.cookies, await createStudent(owner.cookies, '改期拒绝'));
+    const created = await previewAndImport(owner.cookies, student, { attested: true });
+    const planId = created.imported.body.id as string;
+    const today = shanghaiToday();
+    const moving = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const target = addLocalDays(today, 20);
+
+    const past = await postReschedule(owner.cookies, student.id, moving.id, {
+      scheduledLocalDate: addLocalDays(today, -1),
+      reason: '改到昨天',
+      expectedVersion: moving.version,
+    });
+    expect(past.status).toBe(400);
+    expect(past.body.code).toBe('VALIDATION_ERROR');
+
+    const stale = await postReschedule(owner.cookies, student.id, moving.id, {
+      scheduledLocalDate: target,
+      reason: '旧版本',
+      expectedVersion: 999,
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('VERSION_CONFLICT');
+
+    const stranger = await signIn();
+    const missing = await postReschedule(stranger.cookies, student.id, moving.id, {
+      scheduledLocalDate: target,
+      reason: '越权',
+      expectedVersion: moving.version,
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.body.code).toBe('RESOURCE_NOT_FOUND');
+
+    const key = randomUUID();
+    const first = await postReschedule(
+      owner.cookies,
+      student.id,
+      moving.id,
+      { scheduledLocalDate: target, reason: '第一次', expectedVersion: moving.version },
+      key,
+    );
+    expect(first.status).toBe(200);
+    const replay = await postReschedule(
+      owner.cookies,
+      student.id,
+      moving.id,
+      { scheduledLocalDate: target, reason: '第一次', expectedVersion: moving.version },
+      key,
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.body.id).toBe(moving.id);
+    expect(replay.body.scheduledLocalDate).toBe(target);
+    expect(await prisma.planAdjustment.count({ where: { planId, occurrenceId: moving.id, reasonCode: 'TASK_RESCHEDULED' } })).toBe(1);
+    const conflict = await postReschedule(
+      owner.cookies,
+      student.id,
+      moving.id,
+      { scheduledLocalDate: addLocalDays(today, 21), reason: '异体', expectedVersion: moving.version },
+      key,
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
+
+    const pausedStudent = await setGrade(owner.cookies, await createStudent(owner.cookies, '暂停后改期'));
+    const pausedPlan = await previewAndImport(owner.cookies, pausedStudent, { attested: true });
+    const pausedId = pausedPlan.imported.body.id as string;
+    const pausedRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: pausedId }, status: 'PLANNED' },
+    });
+    const paused = await patchPlan(owner.cookies, pausedStudent.id, pausedId, { action: 'PAUSE', expectedVersion: 1 });
+    expect(paused.status).toBe(200);
+    const afterPause = await postReschedule(owner.cookies, pausedStudent.id, pausedRow.id, {
+      scheduledLocalDate: addLocalDays(today, 2),
+      reason: '暂停后',
+      expectedVersion: pausedRow.version,
+    });
+    expect(afterPause.status).toBe(409);
+    expect(['PLAN_STATUS_INVALID', 'TASK_NOT_ADJUSTABLE']).toContain(afterPause.body.code);
+
+    const consents = await agent().get(`/v1/students/${student.id}/consents`).set('Cookie', owner.cookies.header());
+    const current = consents.body.items.find((item: { current: boolean }) => item.current);
+    const withdrawn = await agent()
+      .post(`/v1/students/${student.id}/consents/${current.id}/withdraw`)
+      .set(writeHeaders(owner.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    expect(withdrawn.status).toBeLessThan(300);
+    const deniedKey = randomUUID();
+    const latest = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: moving.id } });
+    const denied = await postReschedule(
+      owner.cookies,
+      student.id,
+      moving.id,
+      { scheduledLocalDate: addLocalDays(today, 5), reason: '撤回后', expectedVersion: latest.version },
+      deniedKey,
+    );
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(['SESSION_SCOPE_FORBIDDEN', 'LEARNING_ACCESS_BLOCKED', 'CONSENT_REQUIRED']).toContain(denied.body.code);
+    const deniedReplay = await postReschedule(
+      owner.cookies,
+      student.id,
+      moving.id,
+      { scheduledLocalDate: addLocalDays(today, 5), reason: '撤回后', expectedVersion: latest.version },
+      deniedKey,
+    );
+    expect(deniedReplay.status).toBeGreaterThanOrEqual(400);
+    expect(deniedReplay.status).not.toBe(200);
+
+    const other = await signIn();
+    const otherStudent = await setGrade(other.cookies, await createStudent(other.cookies, '另一家改期'));
+    const otherPlan = await previewAndImport(other.cookies, otherStudent, { attested: true });
+    const otherRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: otherPlan.imported.body.id }, status: 'PLANNED' },
+    });
+    const expiredOut = await agent()
+      .delete('/v1/auth/session')
+      .set('Origin', ORIGIN)
+      .set('Cookie', other.cookies.header())
+      .set('X-CSRF-Token', other.cookies.get('stp_csrf') ?? '');
+    expect(expiredOut.status).toBe(204);
+    const expiredKey = randomUUID();
+    const expired = await postReschedule(
+      other.cookies,
+      otherStudent.id,
+      otherRow.id,
+      { scheduledLocalDate: addLocalDays(today, 2), reason: '过期', expectedVersion: otherRow.version },
+      expiredKey,
+    );
+    expect(expired.status).toBe(401);
+    expect(expired.body.code).toBe('AUTH_SESSION_INVALID');
+    const expiredReplay = await postReschedule(
+      other.cookies,
+      otherStudent.id,
+      otherRow.id,
+      { scheduledLocalDate: addLocalDays(today, 2), reason: '过期', expectedVersion: otherRow.version },
+      expiredKey,
+    );
     expect(expiredReplay.status).toBe(401);
   });
 });

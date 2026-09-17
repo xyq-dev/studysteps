@@ -192,3 +192,43 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 用户可见：S08／S05 可点「更新未来任务」；已满窗口提示无需补齐；失败不假成功。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。未宣称 worker 验收。
 
+## 13. 本批：仅本次任务改期（2026-09-18）
+
+实施前 HEAD：`ca0edb6`（基线 `main@ca0edb6`，与 `origin/main` 一致）。保留工作区既有未提交文件；本批只提交单次改期及必要联动。
+
+原因：落地「仅本次」改期——只改已有实例的实际安排日，不改重复规则、不重建实例、不覆盖同日另一实例。RESUME 从「窗口内 PLAN_PAUSED」扩到「今日及之后所有 PLAN_PAUSED」，否则改到 14 天外的任务暂停后会永久遗漏。不做范围编辑、拆分、worker／Outbox、打卡、计时或通知。
+
+结构：`scheduled_local_date` 已独立于 `occurrence_key`。第八条最小增量只加 `task_occurrences.version`（默认 1），以支持实例乐观锁。七条已发布迁移 checksum 与 test-v2 未改。历史夹具 `stp006_six_to_seven` 保持七条、无 version 列。合法非空七→八在隔离库 `stp006_seven_to_eight` 用 `migrate deploy` 验证。写入只打隔离测试库／CI。
+
+接口：`POST /v1/students/:id/tasks/:occurrenceId/reschedule`。沿用 `TASK_ADJUST`、当前同意、监护人 step-up、CSRF、幂等 `tasks.reschedule`、实例 `expectedVersion`、7.7 锁序、锁内重验、成功 heartbeat。改期与 `plan_adjustments`（`TASK_RESCHEDULED`）同一事务。无变化请求 200 且不写审计。horizon 仍按原始 key 去重。
+
+页面：S05 任务卡「改期」→ 选择新日期 → 显示改期前后 → 确认；处理中防重复提交；取消不写库；失败保留输入；成功后按旧日＋新日重读列表。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 改期后 id／key／快照保持，安排日与审计正确 | 通过 | HTTP 真实 POST，不改夹具 key |
+| 撞日不覆盖、不合并 | 通过 | HTTP `TASK_DATE_CONFLICT`，两行保持 |
+| 改期后再 horizon 不重生原 key | 通过 | HTTP 计数仍 1 |
+| 过去／非法状态／越权／旧版本拒绝 | 通过 | HTTP 400／409／404／401 |
+| 同键重放不重复审计，同键异体冲突 | 通过 | HTTP 幂等 |
+| 改期与暂停／归档、同意撤销真实竞争 | 通过 | 并发独立连接 + `pg_blocking_pids` |
+| 超出 14 天改期后暂停再恢复仍正确 | 通过 | HTTP 真实改期后再 PAUSE／RESUME |
+| Chromium 改期、确认、取消、刷新一致 | 通过 | `stp006-reschedule-walkthrough.spec.ts` |
+| 合法七→八升级 | 通过 | `stp006_seven_to_eight` + `migrate deploy`；`stp006_six_to_seven` 仍 7 条且无 version 列 |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 11、domain 33、ui／admin／web 各 1、api **160 passed / 0 failed / 0 skipped** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `apps/web` e2e | 0 | **10 passed / 0 failed**（含模板导入、S06、状态、horizon、改期 walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright，不宣称已执行；日志 403 时只写证据边界 |
+
+用户可见：S05 可改期并看到确认前后日期。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。范围编辑仍待办。
+
