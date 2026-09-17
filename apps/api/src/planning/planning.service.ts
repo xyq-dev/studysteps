@@ -11,11 +11,18 @@ import {
   normalizePreviewTasks,
   previewCanonicalPayload,
   manualPreviewCanonicalPayload,
+  datesToMaterializeForPlan,
+  occurrenceCancellableOnPlanHalt,
+  occurrenceRestorableOnResume,
+  planAllowsOccurrenceGeneration,
+  resolvePlanStatusTransition,
+  cancelReasonForPlanAction,
   type SeriesRule,
 } from '@studysteps/domain';
 import type {
   CreateManualPlanInput,
   ImportTemplateConfirmInput,
+  PatchPlanInput,
   PreviewManualPlanInput,
   PreviewTemplateInput,
 } from '@studysteps/contracts';
@@ -25,6 +32,8 @@ import { IdempotencyService } from '../common/idempotency.service';
 import {
   assertLockSetComplete,
   acquireLocks,
+  IncompleteLockSetError,
+  lockIdsContain,
   mergeLockIds,
   readLockedNow,
   runWriteTx,
@@ -267,6 +276,152 @@ export class PlanningService {
     });
   }
 
+  async patchPlan(session: DeviceSession, studentId: string, planId: string, input: PatchPlanInput, idempotencyKey: string) {
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'PLAN_UPDATE');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = this.idempotency.requestDigest({
+      operation: 'plans.patch',
+      studentId,
+      planId,
+      input,
+    });
+    const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'plans.patch', idempotencyKey);
+    const existingRows = await this.prisma.taskOccurrence.findMany({
+      where: { series: { plan: { id: planId, studentProfileId: studentId } } },
+      select: { id: true, seriesId: true },
+    });
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [planId],
+      taskSeriesIds: [...new Set(existingRows.map((row) => row.seriesId))],
+      taskOccurrenceIds: existingRows.map((row) => row.id),
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'PLAN_UPDATE',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      const begun = await this.idempotency.begin(tx, actor, 'plans.patch', idempotencyKey, requestDigest, now);
+      if (begun.kind === 'REPLAY' && begun.resourceId) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return this.loadPlan(tx, studentId, begun.resourceId);
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const plan = await tx.studyPlan.findFirst({
+        where: { id: planId, studentProfileId: studentId },
+        include: { series: { include: { occurrences: true } } },
+      });
+      if (!plan) {
+        throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+      }
+      const seriesIds = plan.series.map((item) => item.id);
+      const occurrenceIds = plan.series.flatMap((item) => item.occurrences.map((row) => row.id));
+      if (!lockIdsContain(locked, { planIds: [plan.id], taskSeriesIds: seriesIds, taskOccurrenceIds: occurrenceIds })) {
+        throw new IncompleteLockSetError({
+          planIds: [plan.id],
+          taskSeriesIds: seriesIds,
+          taskOccurrenceIds: occurrenceIds,
+        });
+      }
+      if (plan.version !== input.expectedVersion) {
+        throw new AppError('VERSION_CONFLICT', '计划版本已变化', 409);
+      }
+      const transition = resolvePlanStatusTransition(plan.status, input.action);
+      if (!transition.ok) {
+        throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许该操作', 409);
+      }
+      const today = localDateInTimeZone(now, current.timezone);
+      const windowTo = horizonWindow(today, null).to;
+      const cancelledOccurrenceIds: string[] = [];
+      const restoredOccurrenceIds: string[] = [];
+      const haltReason = cancelReasonForPlanAction(input.action);
+      if (haltReason) {
+        for (const series of plan.series) {
+          for (const row of series.occurrences) {
+            if (occurrenceCancellableOnPlanHalt(row.status, row.scheduledLocalDate, today)) {
+              cancelledOccurrenceIds.push(row.id);
+            }
+          }
+        }
+        if (cancelledOccurrenceIds.length > 0) {
+          await tx.taskOccurrence.updateMany({
+            where: { id: { in: cancelledOccurrenceIds } },
+            data: { status: 'CANCELLED', cancelReason: haltReason },
+          });
+        }
+      }
+      if (input.action === 'RESUME') {
+        for (const series of plan.series) {
+          const seriesWindowTo = horizonWindow(today, series.endLocalDate).to;
+          for (const row of series.occurrences) {
+            if (
+              occurrenceRestorableOnResume({
+                status: row.status,
+                cancelReason: row.cancelReason,
+                scheduledLocalDate: row.scheduledLocalDate,
+                todayLocalDate: today,
+                windowTo: seriesWindowTo,
+              })
+            ) {
+              restoredOccurrenceIds.push(row.id);
+            }
+          }
+        }
+        if (restoredOccurrenceIds.length > 0) {
+          await tx.taskOccurrence.updateMany({
+            where: { id: { in: restoredOccurrenceIds } },
+            data: { status: 'PLANNED', cancelReason: null },
+          });
+        }
+      }
+      await tx.studyPlan.update({
+        where: { id: plan.id },
+        data: { status: transition.next, version: plan.version + 1 },
+      });
+      await tx.planAdjustment.create({
+        data: {
+          planId: plan.id,
+          reasonCode: transition.reasonCode,
+          payloadJson: JSON.stringify({
+            action: input.action,
+            fromStatus: plan.status,
+            toStatus: transition.next,
+            actorScope: session.scope,
+            actorAccountId: session.accountId ?? null,
+            actorSessionId: session.id,
+            effectiveLocalDate: today,
+            cancelledOccurrenceIds,
+            restoredOccurrenceIds,
+            windowTo,
+          }),
+        },
+      });
+      await this.idempotency.complete(tx, begun.recordId, 'StudyPlan', plan.id, 200, now);
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return this.loadPlan(tx, studentId, plan.id);
+    }, graph);
+  }
+
   async listTasks(session: DeviceSession, studentId: string, query: { date?: string; from?: string; to?: string }) {
     return this.readAuthorized(session, studentId, 'TASK_READ', async (tx, student, now) => {
       const today = localDateInTimeZone(now, student.timezone);
@@ -435,8 +590,10 @@ export class PlanningService {
           effectiveToLocalDate: rule.endLocalDate,
         },
       });
-      const window = horizonWindow(today, rule.endLocalDate);
-      const dates = expandSeriesOccurrences(rule, window);
+      if (!planAllowsOccurrenceGeneration(plan.status)) {
+        throw new AppError('PLAN_STATUS_INVALID', '暂停或归档的计划不能生成新实例', 409);
+      }
+      const dates = datesToMaterializeForPlan(plan.status, rule, today);
       if (dates.length === 0) {
         continue;
       }
@@ -652,7 +809,10 @@ export class PlanningService {
   private async loadPlan(tx: Tx, studentId: string, planId: string) {
     const plan = await tx.studyPlan.findFirst({
       where: { id: planId, studentProfileId: studentId },
-      include: { series: { include: { occurrences: true } } },
+      include: {
+        series: { include: { occurrences: true } },
+        adjustments: { orderBy: { createdAt: 'desc' }, take: 5 },
+      },
     });
     if (!plan) {
       throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
@@ -666,6 +826,14 @@ export class PlanningService {
       coCreationAttestedAt: plan.coCreationAttestedAt,
       sourceTemplateVersionId: plan.sourceTemplateVersionId,
       version: plan.version,
+      lastAdjustment: plan.adjustments[0]
+        ? {
+            id: plan.adjustments[0].id,
+            reasonCode: plan.adjustments[0].reasonCode,
+            createdAt: plan.adjustments[0].createdAt.toISOString(),
+            payload: JSON.parse(plan.adjustments[0].payloadJson) as Record<string, unknown>,
+          }
+        : null,
       series: plan.series.map((item) => ({
         id: item.id,
         name: item.name,
@@ -694,8 +862,9 @@ export class PlanningService {
     gradeLabelSnapshot: string;
     catalogEntryKeySnapshot: string;
     timezoneSnapshot: string;
-    series: { id: string; planId: string };
+    series: { id: string; planId: string; plan: { status: string } };
   }) {
+    const planStatus = row.series.plan.status;
     return {
       id: row.id,
       seriesId: row.series.id,
@@ -704,6 +873,8 @@ export class PlanningService {
       originalLocalDate: row.originalLocalDate,
       occurrenceKey: row.occurrenceKey,
       status: row.status,
+      planStatus,
+      executable: planStatus === 'ACTIVE' && row.status === 'PLANNED',
       name: row.nameSnapshot,
       subject: row.subjectSnapshot,
       completionStandard: row.completionStandardSnapshot,

@@ -56,9 +56,15 @@ export const taskHorizonSchema = z.object({
   expectedStudentVersion: z.number().int().positive().optional(),
 });
 
+export const patchPlanSchema = z.object({
+  action: z.enum(['PAUSE', 'RESUME', 'ARCHIVE']),
+  expectedVersion: z.number().int().positive(),
+});
+
 export type PreviewTemplateInput = z.infer<typeof previewTemplateSchema>;
 export type ImportTemplateConfirmInput = z.infer<typeof importTemplateConfirmSchema>;
 export type PreviewManualPlanInput = z.infer<typeof previewManualPlanSchema>;
 export type CreateManualPlanInput = z.infer<typeof createManualPlanSchema>;
 export type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
 export type TaskHorizonInput = z.infer<typeof taskHorizonSchema>;
+export type PatchPlanInput = z.infer<typeof patchPlanSchema>;

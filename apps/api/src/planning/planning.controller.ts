@@ -1,7 +1,8 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req, Res } from '@nestjs/common';
 import {
   createManualPlanSchema,
   listTasksQuerySchema,
+  patchPlanSchema,
   previewManualPlanSchema,
   previewTemplateSchema,
   taskHorizonSchema,
@@ -89,6 +90,25 @@ export class PlanningController {
     const session = await this.guardRead(request);
     res.setHeader('Cache-Control', 'no-store');
     return this.planning.getPlan(session, studentId, planId);
+  }
+
+  @Patch('students/:studentId/plans/:planId')
+  async patchPlan(
+    @Param('studentId') studentId: string,
+    @Param('planId') planId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.patchPlan(
+      session,
+      studentId,
+      planId,
+      patchPlanSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 
   @Get('students/:studentId/tasks')

@@ -245,7 +245,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 批 | 内容 | 退出 |
 | --- | --- | --- |
 | **A 最小闭环（第一批，不扩展）** | 第七条迁移；preview／import 真写入；GET plans／plan／tasks（只读）；学生 S07 入口；S03 确认／取消；S05／S08／S04 只读；确认事务内生成 14 天；`POST .../task-horizon` 端点（供窗口外补齐与 T06-P-UNIQ，无工人）；T06-P-*（含 ORIGIN）、T03 生成、T02-D-OCC、T11-3／CON-3 的**计划写** | 闭环可点；无完成；无新同意文档、无重新同意页 |
-| B | S06 手动 `POST /plans` 最小闭环（本批）；暂停／恢复／归档；THIS／FUTURE；改期；S12 最小（后延） | 手动创建可点；无改期 |
+| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（本批）；THIS／FUTURE；改期；S12 最小（后延） | 状态控制可点；无改期 |
 | C | 拆分；Outbox 工人调用同一 `task-horizon` POST（不经 GET）；S09 只读细节打磨 | TASKS 所列后台任务入口 |
 
 A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不是 P1。
@@ -342,7 +342,7 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 第一批功能范围已固定。B04 正式文案／经营主体仍是上线前置，不阻塞隔离开发。生产告知不得用 test-v2 冒充。
 
-后续批次仍开放：范围编辑、暂停／归档、改期、拆分、`task-horizon` 真补齐与 Outbox 工人。打卡、计时、通知、运营发布不在本 STP。
+后续批次仍开放：范围编辑、改期、拆分、`task-horizon` 真补齐与 Outbox 工人。暂停／恢复／归档见 §3.5（本批）。打卡、计时、通知、运营发布不在本 STP。
 
 ### 3.4 S06 空白创建（第二批最小）
 
@@ -352,6 +352,31 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 - **确认：** `POST /v1/students/:id/plans`。复用第一批确认事务、14 天窗口、去重键、年级快照。保存中禁用按钮；失败保留输入。
 - **自定义年级：** 无 `catalogEntryKey` 只禁止模板导入；手动创建仍要求教育已配置、当前必要同意、`PLAN_CREATE` 与 test-v2 用途。
 - **结构：** 第七条已允许 `source_template_version_id` 为空；本批不新增迁移。
+
+### 3.5 计划状态转换（本批：暂停／恢复／归档）
+
+主体：持有 `PLAN_UPDATE` 的监护人（step-up）或绑定该档案的学生会话。监护人状态变更**不**要求 `coCreationAttested`（该字段只约束创建）；审计写入操作者与状态调整，**不覆盖** `origin`／`created_by_*`／`student_confirmed_at`／共同制定字段。管理员后台不在本批。
+
+乐观锁字段是 **`StudyPlan.version`**（`PATCH` body `expectedVersion`），不是学生档案 version。状态变更与 `plan_adjustments` 同一事务。无第八条迁移：复用 `study_plans.status`、`task_occurrences.status`／`cancel_reason`、`plan_adjustments`。
+
+| 当前状态 | 动作 | 下一状态 | 前置 | 已生成实例 | 后续生成 |
+| --- | --- | --- | --- | --- | --- |
+| `ACTIVE` | `PAUSE` | `PAUSED` | 权限、必要同意、`expectedVersion` 匹配 | 安排日 ≥ 生效日（学生时区今日）且仍为 `PLANNED` 的行 → `CANCELLED`／`PLAN_PAUSED`。不硬删计划／规则／实例／历史。不改 id、`occurrence_key`、年级快照、完成标准快照。`IN_PROGRESS`／`COMPLETED`／`SKIPPED` 不改（STP 007 前不应出现） | 禁止。共用生成逻辑对非 `ACTIVE` 返回空日期，不 INSERT |
+| `PAUSED` | `RESUME` | `ACTIVE` | 同上 | **不**插入暂停缺口的新行，**不**复制已有行。仅把仍在恢复日窗口内（今日…今日+13，再截规则结束日）、`CANCELLED` 且 `cancel_reason=PLAN_PAUSED`、无完成记录的行拉回 `PLANNED` 并清空 `cancel_reason`。暂停日前的 `PLAN_PAUSED` 行保持取消 | 自恢复日起允许生成；本批 horizon／worker 仍未实现，不得宣称已验证工人效果。`GET` 仍不补齐 |
+| `ACTIVE` 或 `PAUSED` | `ARCHIVE` | `ARCHIVED` | 同上 | 同暂停取消仍为 `PLANNED` 且安排日 ≥ 今日的行，`cancel_reason=PLAN_ARCHIVED`。已因暂停取消的行不改写原因（不重写历史）。不删行 | 禁止生成。归档为终态 |
+| `ARCHIVED` | `RESUME`／`PAUSE`／`ARCHIVE` | 非法 | — | 不改 | 仍禁止。 **不提供取消归档** |
+
+重复与冲突：
+
+- 目标状态已成立的再次 `PAUSE`／`RESUME`／`ARCHIVE`（非幂等重放）→ `409 PLAN_STATUS_INVALID`。
+- 同 `Idempotency-Key` 且同摘要：重放前重验当前对象 `PLAN_UPDATE`，返回当前计划，不重复写审计。
+- 同键异体 → `409 IDEMPOTENCY_CONFLICT`。过期／不匹配 `expectedVersion` → `409 VERSION_CONFLICT`。
+- 并发两个状态 PATCH：计划行 `FOR UPDATE` 后第二笔看到新 version，不得静默覆盖。
+- 未授权、同意撤回、会话失效：写入与重放均拒绝；不得把已成功体交给失权主体。
+
+可见性：`GET` 计划列表含 `ARCHIVED`（S08 只读查看历史）。`GET` 任务仍排除 `CANCELLED`，且每条带 `planStatus`／`executable`（仅 `ACTIVE` 且 `PLANNED` 为可执行）。暂停／归档后页面不得把该计划展示为可继续执行。归档记录通过 S08 列表「查看」打开详情；无取消归档按钮。
+
+空白补记（不改整体架构）：共同制定约定只约束创建；归档取消原因用 `PLAN_ARCHIVED` 以便与 4.2「恢复仅限 `PLAN_PAUSED`」一致；生效日=锁内 `now` 映射的学生时区今日。
 
 ## 12. 与原文冲突（不改 `PROJECT_PLAN.md`）
 
@@ -385,8 +410,8 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 | 项 | 状态 |
 | --- | --- |
-| 本设计 | 11.1–11.3 已定稿；第一批已授权并本地实施 |
-| Schema／代码／第七条迁移／隔离 test-v2 | **第一批已落地**（整个阶段未完成） |
+| 本设计 | 11.1–11.3 已定稿；§3.5 状态转换已记录 |
+| Schema／代码／第七条迁移／隔离 test-v2 | **第一批＋S06＋暂停／恢复／归档已落地**（整个阶段未完成；无第八条迁移） |
 | STP 005 | 两页面阻塞已关闭；产品验收未完成（不变） |
 | STP 004 | 进行中（不变） |
 | 打卡／计时／通知／发布 | 不在本任务 |

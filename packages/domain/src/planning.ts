@@ -4,6 +4,12 @@ export type RepeatKind = (typeof REPEAT_KINDS)[number];
 export const PLAN_ORIGINS = ['STUDENT', 'GUARDIAN_ASSISTED', 'MANUAL'] as const;
 export type PlanOrigin = (typeof PLAN_ORIGINS)[number];
 
+export const PLAN_STATUSES = ['ACTIVE', 'PAUSED', 'ARCHIVED'] as const;
+export type PlanStatus = (typeof PLAN_STATUSES)[number];
+
+export const PLAN_STATUS_ACTIONS = ['PAUSE', 'RESUME', 'ARCHIVE'] as const;
+export type PlanStatusAction = (typeof PLAN_STATUS_ACTIONS)[number];
+
 export type IsoWeekday = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
 export type SeriesRule = {
@@ -166,6 +172,72 @@ export function normalizePreviewTasks(
 export function estimateNextLocalDates(rule: SeriesRule, todayLocalDate: string, days = 7): string[] {
   const window = { from: todayLocalDate, to: addLocalDays(todayLocalDate, days - 1) };
   return expandSeriesOccurrences(rule, window);
+}
+
+export function planAllowsOccurrenceGeneration(status: string): boolean {
+  return status === 'ACTIVE';
+}
+
+export function datesToMaterializeForPlan(
+  status: string,
+  rule: SeriesRule,
+  todayLocalDate: string,
+): string[] {
+  if (!planAllowsOccurrenceGeneration(status)) {
+    return [];
+  }
+  return expandSeriesOccurrences(rule, horizonWindow(todayLocalDate, rule.endLocalDate));
+}
+
+export function resolvePlanStatusTransition(
+  current: string,
+  action: string,
+):
+  | { ok: true; next: PlanStatus; reasonCode: 'PLAN_PAUSED' | 'PLAN_RESUMED' | 'PLAN_ARCHIVED' }
+  | { ok: false; code: 'PLAN_STATUS_INVALID' } {
+  if (action === 'PAUSE' && current === 'ACTIVE') {
+    return { ok: true, next: 'PAUSED', reasonCode: 'PLAN_PAUSED' };
+  }
+  if (action === 'RESUME' && current === 'PAUSED') {
+    return { ok: true, next: 'ACTIVE', reasonCode: 'PLAN_RESUMED' };
+  }
+  if (action === 'ARCHIVE' && (current === 'ACTIVE' || current === 'PAUSED')) {
+    return { ok: true, next: 'ARCHIVED', reasonCode: 'PLAN_ARCHIVED' };
+  }
+  return { ok: false, code: 'PLAN_STATUS_INVALID' };
+}
+
+export function cancelReasonForPlanAction(action: string): 'PLAN_PAUSED' | 'PLAN_ARCHIVED' | null {
+  if (action === 'PAUSE') {
+    return 'PLAN_PAUSED';
+  }
+  if (action === 'ARCHIVE') {
+    return 'PLAN_ARCHIVED';
+  }
+  return null;
+}
+
+export function occurrenceCancellableOnPlanHalt(
+  status: string,
+  scheduledLocalDate: string,
+  effectiveLocalDate: string,
+): boolean {
+  return status === 'PLANNED' && compareLocalDate(scheduledLocalDate, effectiveLocalDate) >= 0;
+}
+
+export function occurrenceRestorableOnResume(input: {
+  status: string;
+  cancelReason: string | null;
+  scheduledLocalDate: string;
+  todayLocalDate: string;
+  windowTo: string;
+}): boolean {
+  return (
+    input.status === 'CANCELLED' &&
+    input.cancelReason === 'PLAN_PAUSED' &&
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0 &&
+    compareLocalDate(input.scheduledLocalDate, input.windowTo) <= 0
+  );
 }
 
 export type EducationFingerprint = {

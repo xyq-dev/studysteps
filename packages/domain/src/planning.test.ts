@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
   addLocalDays,
+  datesToMaterializeForPlan,
   expandSeriesOccurrences,
   horizonWindow,
   isoWeekdayFromLocalDate,
   localDateInTimeZone,
   manualPreviewCanonicalPayload,
   normalizePreviewTasks,
+  occurrenceCancellableOnPlanHalt,
+  occurrenceRestorableOnResume,
+  planAllowsOccurrenceGeneration,
   previewCanonicalPayload,
+  resolvePlanStatusTransition,
 } from './planning.js';
 import { consentCoversPlanWrites, TEST_POLICY_V1_SCOPE, TEST_POLICY_V2_SCOPE } from './consent-scope.js';
 import { guardianMay, studentMay } from './permissions.js';
@@ -94,8 +99,86 @@ describe('STP 006 consent purpose vs actions', () => {
     expect(guardianMay('ACTIVE', 'PLAN_CREATE')).toBe(true);
     expect(guardianMay('ONBOARDING', 'PLAN_CREATE')).toBe(false);
     expect(guardianMay('RESTRICTED', 'PLAN_READ')).toBe(false);
+    expect(guardianMay('ACTIVE', 'PLAN_UPDATE')).toBe(true);
+    expect(studentMay('ACTIVE', 'PLAN_UPDATE')).toBe(true);
     expect(studentMay('ACTIVE', 'PLAN_CREATE')).toBe(true);
     expect(studentMay('ONBOARDING', 'PLAN_CREATE')).toBe(false);
     expect(studentMay('ACTIVE', 'PROFILE_UPDATE_AGE')).toBe(false);
+  });
+});
+
+describe('STP 006 plan status transitions', () => {
+  const daily = {
+    name: '阅读',
+    subject: '自定义',
+    completionStandard: '完成',
+    durationMinutes: null,
+    steps: [],
+    repeatKind: 'DAILY' as const,
+    weekdays: null,
+    startLocalDate: '2026-09-17',
+    endLocalDate: null,
+    ongoing: true,
+  };
+
+  it('allows pause, resume and archive, and rejects unarchive', () => {
+    expect(resolvePlanStatusTransition('ACTIVE', 'PAUSE')).toEqual({
+      ok: true,
+      next: 'PAUSED',
+      reasonCode: 'PLAN_PAUSED',
+    });
+    expect(resolvePlanStatusTransition('PAUSED', 'RESUME')).toEqual({
+      ok: true,
+      next: 'ACTIVE',
+      reasonCode: 'PLAN_RESUMED',
+    });
+    expect(resolvePlanStatusTransition('ACTIVE', 'ARCHIVE')).toMatchObject({ ok: true, next: 'ARCHIVED' });
+    expect(resolvePlanStatusTransition('PAUSED', 'ARCHIVE')).toMatchObject({ ok: true, next: 'ARCHIVED' });
+    expect(resolvePlanStatusTransition('ARCHIVED', 'RESUME')).toEqual({ ok: false, code: 'PLAN_STATUS_INVALID' });
+    expect(resolvePlanStatusTransition('ARCHIVED', 'PAUSE')).toEqual({ ok: false, code: 'PLAN_STATUS_INVALID' });
+    expect(resolvePlanStatusTransition('PAUSED', 'PAUSE')).toEqual({ ok: false, code: 'PLAN_STATUS_INVALID' });
+    expect(resolvePlanStatusTransition('ACTIVE', 'RESUME')).toEqual({ ok: false, code: 'PLAN_STATUS_INVALID' });
+  });
+
+  it('does not materialize occurrences while paused or archived', () => {
+    expect(planAllowsOccurrenceGeneration('ACTIVE')).toBe(true);
+    expect(planAllowsOccurrenceGeneration('PAUSED')).toBe(false);
+    expect(planAllowsOccurrenceGeneration('ARCHIVED')).toBe(false);
+    expect(datesToMaterializeForPlan('ACTIVE', daily, '2026-09-17').length).toBeGreaterThan(0);
+    expect(datesToMaterializeForPlan('PAUSED', daily, '2026-09-17')).toEqual([]);
+    expect(datesToMaterializeForPlan('ARCHIVED', daily, '2026-09-17')).toEqual([]);
+  });
+
+  it('cancels future planned rows and restores only PLAN_PAUSED rows still in window', () => {
+    expect(occurrenceCancellableOnPlanHalt('PLANNED', '2026-09-17', '2026-09-17')).toBe(true);
+    expect(occurrenceCancellableOnPlanHalt('PLANNED', '2026-09-16', '2026-09-17')).toBe(false);
+    expect(occurrenceCancellableOnPlanHalt('COMPLETED', '2026-09-18', '2026-09-17')).toBe(false);
+    expect(
+      occurrenceRestorableOnResume({
+        status: 'CANCELLED',
+        cancelReason: 'PLAN_PAUSED',
+        scheduledLocalDate: '2026-09-20',
+        todayLocalDate: '2026-09-18',
+        windowTo: '2026-10-01',
+      }),
+    ).toBe(true);
+    expect(
+      occurrenceRestorableOnResume({
+        status: 'CANCELLED',
+        cancelReason: 'PLAN_ARCHIVED',
+        scheduledLocalDate: '2026-09-20',
+        todayLocalDate: '2026-09-18',
+        windowTo: '2026-10-01',
+      }),
+    ).toBe(false);
+    expect(
+      occurrenceRestorableOnResume({
+        status: 'CANCELLED',
+        cancelReason: 'PLAN_PAUSED',
+        scheduledLocalDate: '2026-09-10',
+        todayLocalDate: '2026-09-18',
+        windowTo: '2026-10-01',
+      }),
+    ).toBe(false);
   });
 });

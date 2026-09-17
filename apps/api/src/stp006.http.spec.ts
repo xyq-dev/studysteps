@@ -172,6 +172,19 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     return { templateId, preview, imported };
   }
 
+  async function patchPlan(
+    cookies: CookieJar,
+    studentId: string,
+    planId: string,
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ) {
+    return agent()
+      .patch(`/v1/students/${studentId}/plans/${planId}`)
+      .set(writeHeaders(cookies, idempotencyKey))
+      .send(body);
+  }
+
   it('T06-P-PREV preview and cancel leave no business rows', async () => {
     const auth = await signIn();
     const student = await setGrade(auth.cookies, await createStudent(auth.cookies));
@@ -644,5 +657,208 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     } finally {
       runtime.value.timing.stepUpMs = previous;
     }
+  });
+
+  it('pause resume archive persist, refuse illegal transitions, and keep occurrence identity', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '状态控制'));
+    const created = await previewAndImport(auth.cookies, student, { attested: true });
+    expect(created.imported.status).toBe(201);
+    const planId = created.imported.body.id as string;
+    const origin = created.imported.body.origin as string;
+    const before = await prisma.taskOccurrence.findMany({
+      where: { series: { planId } },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    expect(before.length).toBeGreaterThan(0);
+    const fingerprints = before.map((row) => ({
+      id: row.id,
+      occurrenceKey: row.occurrenceKey,
+      originalLocalDate: row.originalLocalDate,
+      gradeLabelSnapshot: row.gradeLabelSnapshot,
+      gradeConfigId: row.gradeConfigId,
+    }));
+
+    const paused = await patchPlan(auth.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 });
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    expect(paused.body.origin).toBe(origin);
+    expect(paused.body.studentConfirmedAt).toBeNull();
+    expect(paused.body.lastAdjustment.reasonCode).toBe('PLAN_PAUSED');
+    expect(paused.body.lastAdjustment.payload.actorScope).toBe('GUARDIAN');
+    expect(paused.body.lastAdjustment.payload.actorAccountId).toBeTruthy();
+
+    const reread = await agent().get(`/v1/students/${student.id}/plans/${planId}`).set('Cookie', auth.cookies.header());
+    expect(reread.body.status).toBe('PAUSED');
+    expect(reread.body.version).toBe(paused.body.version);
+    expect(reread.body.lastAdjustment.id).toBe(paused.body.lastAdjustment.id);
+
+    const afterPause = await prisma.taskOccurrence.findMany({
+      where: { series: { planId } },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    expect(afterPause.map((row) => ({
+      id: row.id,
+      occurrenceKey: row.occurrenceKey,
+      originalLocalDate: row.originalLocalDate,
+      gradeLabelSnapshot: row.gradeLabelSnapshot,
+      gradeConfigId: row.gradeConfigId,
+    }))).toEqual(fingerprints);
+    expect(afterPause.every((row) => row.status === 'CANCELLED' && row.cancelReason === 'PLAN_PAUSED')).toBe(true);
+    expect(await prisma.studyPlan.count({ where: { id: planId } })).toBe(1);
+    expect(await prisma.taskSeries.count({ where: { planId } })).toBeGreaterThan(0);
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+    const to = new Date(Date.now() + 13 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+    const firstRead = await agent()
+      .get(`/v1/students/${student.id}/tasks?from=${today}&to=${to}`)
+      .set('Cookie', auth.cookies.header());
+    expect(firstRead.body.items.every((item: { executable: boolean }) => item.executable === false)).toBe(true);
+    const listedPlans = await agent().get(`/v1/students/${student.id}/plans`).set('Cookie', auth.cookies.header());
+    expect(listedPlans.body.items[0].status).toBe('PAUSED');
+    const secondRead = await agent()
+      .get(`/v1/students/${student.id}/tasks?from=${today}&to=${to}`)
+      .set('Cookie', auth.cookies.header());
+    expect(secondRead.body.items.length).toBe(firstRead.body.items.length);
+    expect(await prisma.taskOccurrence.count({ where: { series: { planId } } })).toBe(before.length);
+
+    const horizon = await agent()
+      .post(`/v1/students/${student.id}/task-horizon`)
+      .set(writeHeaders(auth.cookies))
+      .send({});
+    expect(horizon.status).toBe(409);
+    expect(horizon.body.code).toBe('TASK_HORIZON_NOT_AVAILABLE');
+    expect(await prisma.taskOccurrence.count({ where: { series: { planId } } })).toBe(before.length);
+
+    const duplicatePause = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'PAUSE',
+      expectedVersion: paused.body.version,
+    });
+    expect(duplicatePause.status).toBe(409);
+    expect(duplicatePause.body.code).toBe('PLAN_STATUS_INVALID');
+    expect(await prisma.planAdjustment.count({ where: { planId } })).toBe(1);
+
+    const resumed = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'RESUME',
+      expectedVersion: paused.body.version,
+    });
+    expect(resumed.status).toBe(200);
+    expect(resumed.body.status).toBe('ACTIVE');
+    expect(resumed.body.origin).toBe(origin);
+    const afterResume = await prisma.taskOccurrence.findMany({ where: { series: { planId } } });
+    expect(afterResume.length).toBe(before.length);
+    expect(afterResume.filter((row) => row.status === 'PLANNED').length).toBe(before.length);
+    expect(afterResume.every((row) => row.cancelReason === null)).toBe(true);
+    expect(new Set(afterResume.map((row) => row.id))).toEqual(new Set(before.map((row) => row.id)));
+
+    const archived = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'ARCHIVE',
+      expectedVersion: resumed.body.version,
+    });
+    expect(archived.status).toBe(200);
+    expect(archived.body.status).toBe('ARCHIVED');
+    const unarchive = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'RESUME',
+      expectedVersion: archived.body.version,
+    });
+    expect(unarchive.status).toBe(409);
+    expect(unarchive.body.code).toBe('PLAN_STATUS_INVALID');
+    const pauseArchived = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'PAUSE',
+      expectedVersion: archived.body.version,
+    });
+    expect(pauseArchived.body.code).toBe('PLAN_STATUS_INVALID');
+    const visible = await agent().get(`/v1/students/${student.id}/plans/${planId}`).set('Cookie', auth.cookies.header());
+    expect(visible.status).toBe(200);
+    expect(visible.body.status).toBe('ARCHIVED');
+    const afterArchive = await prisma.taskOccurrence.findMany({ where: { series: { planId } } });
+    expect(afterArchive.length).toBe(before.length);
+    expect(afterArchive.every((row) => row.status === 'CANCELLED' && row.cancelReason === 'PLAN_ARCHIVED')).toBe(true);
+    const tasksAfterArchive = await agent()
+      .get(`/v1/students/${student.id}/tasks?from=${today}&to=${to}`)
+      .set('Cookie', auth.cookies.header());
+    expect(tasksAfterArchive.body.items.every((item: { executable?: boolean }) => item.executable !== true)).toBe(true);
+  });
+
+  it('plan status patch is idempotent and rejects same-key different body and stale version', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '状态幂等'));
+    const created = await previewAndImport(auth.cookies, student, { attested: true });
+    const planId = created.imported.body.id as string;
+    const key = randomUUID();
+    const first = await patchPlan(auth.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 }, key);
+    expect(first.status).toBe(200);
+    const replay = await patchPlan(auth.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 }, key);
+    expect(replay.status).toBe(200);
+    expect(replay.body.id).toBe(planId);
+    expect(await prisma.planAdjustment.count({ where: { planId } })).toBe(1);
+    const conflict = await patchPlan(
+      auth.cookies,
+      student.id,
+      planId,
+      { action: 'ARCHIVE', expectedVersion: 1 },
+      key,
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
+    const stale = await patchPlan(auth.cookies, student.id, planId, { action: 'RESUME', expectedVersion: 1 });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('VERSION_CONFLICT');
+  });
+
+  it('unauthorized, withdrawn consent and expired session refuse status writes and replay', async () => {
+    const owner = await signIn();
+    const student = await setGrade(owner.cookies, await createStudent(owner.cookies, '状态拒绝'));
+    const created = await previewAndImport(owner.cookies, student, { attested: true });
+    const planId = created.imported.body.id as string;
+
+    const stranger = await signIn();
+    const missing = await patchPlan(stranger.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 });
+    expect(missing.status).toBe(404);
+    expect(missing.body.code).toBe('RESOURCE_NOT_FOUND');
+
+    const consents = await agent().get(`/v1/students/${student.id}/consents`).set('Cookie', owner.cookies.header());
+    const current = consents.body.items.find((item: { current: boolean }) => item.current);
+    const withdrawn = await agent()
+      .post(`/v1/students/${student.id}/consents/${current.id}/withdraw`)
+      .set(writeHeaders(owner.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    expect(withdrawn.status).toBeLessThan(300);
+    const key = randomUUID();
+    const denied = await patchPlan(owner.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 }, key);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(['SESSION_SCOPE_FORBIDDEN', 'LEARNING_ACCESS_BLOCKED', 'CONSENT_REQUIRED']).toContain(denied.body.code);
+    const replay = await patchPlan(owner.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 }, key);
+    expect(replay.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.studyPlan.findUniqueOrThrow({ where: { id: planId } })).toMatchObject({ status: 'ACTIVE' });
+    expect(await prisma.planAdjustment.count({ where: { planId } })).toBe(0);
+
+    const other = await signIn();
+    const otherStudent = await setGrade(other.cookies, await createStudent(other.cookies, '另一家'));
+    const otherPlan = await previewAndImport(other.cookies, otherStudent, { attested: true });
+    const expiredOut = await agent()
+      .delete('/v1/auth/session')
+      .set('Origin', ORIGIN)
+      .set('Cookie', other.cookies.header())
+      .set('X-CSRF-Token', other.cookies.get('stp_csrf') ?? '');
+    expect(expiredOut.status).toBe(204);
+    const expiredKey = randomUUID();
+    const expired = await patchPlan(
+      other.cookies,
+      otherStudent.id,
+      otherPlan.imported.body.id,
+      { action: 'PAUSE', expectedVersion: 1 },
+      expiredKey,
+    );
+    expect(expired.status).toBe(401);
+    expect(expired.body.code).toBe('AUTH_SESSION_INVALID');
+    const expiredReplay = await patchPlan(
+      other.cookies,
+      otherStudent.id,
+      otherPlan.imported.body.id,
+      { action: 'PAUSE', expectedVersion: 1 },
+      expiredKey,
+    );
+    expect(expiredReplay.status).toBe(401);
   });
 });

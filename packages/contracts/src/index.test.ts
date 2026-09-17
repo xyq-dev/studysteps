@@ -9,6 +9,7 @@ import {
   requestAuthCodeSchema,
   withdrawConsentSchema,
   createManualPlanSchema,
+  patchPlanSchema,
 } from './index.js';
 
 describe('@studysteps/contracts export boundary', () => {
@@ -24,6 +25,7 @@ describe('@studysteps/contracts export boundary', () => {
     expect(ERROR_CODES).toContain('GRADE_CONFIG_INVALID');
     expect(ERROR_CODES).toContain('TEMPLATE_IMPORT_NOT_ALLOWED');
     expect(ERROR_CODES).toContain('PLAN_PREVIEW_STALE');
+    expect(ERROR_CODES).toContain('PLAN_STATUS_INVALID');
   });
 });
 
@@ -126,5 +128,16 @@ describe('request validation', () => {
     });
     expect(parsed.tasks[0]?.name).toBe('自主阅读');
     expect(parsed).not.toHaveProperty('templateId');
+  });
+
+  it('accepts plan status patch bodies without co-creation fields', () => {
+    expect(
+      patchPlanSchema.parse({
+        action: 'PAUSE',
+        expectedVersion: 1,
+        coCreationAttested: true,
+      }),
+    ).toEqual({ action: 'PAUSE', expectedVersion: 1 });
+    expect(patchPlanSchema.safeParse({ action: 'UNARCHIVE', expectedVersion: 1 }).success).toBe(false);
   });
 });

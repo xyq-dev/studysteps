@@ -49,7 +49,7 @@ STP 004 **仍进行中，不得标完成**。STP 005 **产品验收未完成**�
 - 年级快照固化；升年级不改写历史实例
 - `POST .../task-horizon` 保留契约并返回 `409 TASK_HORIZON_NOT_AVAILABLE`
 
-未做（后续批次）：S06 空白创建、范围编辑、改期、拆分、暂停／归档、horizon 真补齐与 Outbox 工人、打卡、计时、通知、运营发布、B04 正式文案。
+未做（后续批次）：范围编辑、改期、拆分、horizon 真补齐与 Outbox 工人、打卡、计时、通知、运营发布、B04 正式文案。S06 与暂停／恢复／归档已在后续小节落地。
 
 ## 5. 业务含义冲突（最小处理）
 
@@ -80,7 +80,7 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 ## 9. 未解决问题
 
-- STP 006 后续：范围编辑、改期、拆分、暂停／归档、horizon 工人
+- STP 006 后续：范围编辑、改期、拆分、horizon 工人
 - B04 正式告知／经营主体
 - STP 004 整体未完成；STP 005 产品验收未完成
 - Playwright 不在 CI
@@ -107,3 +107,47 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 | GitHub Actions | push 后跟踪 | 不以 CI #6 代替；日志 403 时不编造 CI 测试数 |
 
 用户可见：P05／S05／学生视图「自己添加」进入 S06；取消不写库；确认中禁用按钮；刷新后仍可打开计划。模板导入路径未删。
+
+## 11. 本批：计划暂停／恢复／归档（2026-09-17）
+
+实施前 HEAD：`9a2c46fca1e91977f59de48322a0f761f9c2b6e6`（基线 `main@9a2c46f`，与 `origin/main` 一致）。工作区无未提交业务改动。
+
+原因：按 `docs/STP006_DESIGN.md` §3.5 落地计划状态控制，使暂停／归档计划不再生成新实例，且页面不再把已暂停计划显示为可继续执行。不做范围编辑、改期、拆分、horizon worker、Outbox、打卡、计时、通知或运营发布。
+
+结构：现有 `study_plans.status`、`task_occurrences.status`／`cancel_reason`、`plan_adjustments` 足够；**未新增第八条迁移**。七条已发布迁移 checksum 与 test-v2 未改。写入仅隔离测试库／CI。原库与四→六、六→七夹具保持原范围。
+
+接口：`PATCH /v1/students/:id/plans/:planId`（`action=PAUSE|RESUME|ARCHIVE`，`expectedVersion` 为计划 version）。沿用 `PLAN_UPDATE`、test-v2、CSRF、幂等 `plans.patch`、乐观锁、锁内重验、成功 heartbeat。监护人 step-up；不要求共同制定字段；不覆盖 `origin`／`studentConfirmedAt`。状态与审计同一事务。GET 仍不补齐。horizon 仍 `409 TASK_HORIZON_NOT_AVAILABLE`，本批不宣称工人运行效果。
+
+归档为终态，无取消归档。S08 列表仍可查看归档记录。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 合法 PAUSE／RESUME／ARCHIVE 与非法转换 | 通过 | HTTP：pause resume archive persist… |
+| 状态＋审计持久化，刷新一致 | 通过 | 同上；S08 `lastAdjustment` |
+| 已生成实例 id／key／年级快照／历史保持 | 通过 | HTTP fingerprints；resume 不增行 |
+| 同键同摘要不重复审计；同键异体／过期版本拒绝 | 通过 | HTTP idempotent… |
+| 未授权／同意撤回／会话失效写入与重放拒绝 | 通过 | HTTP unauthorized… |
+| 两状态变更竞争 | 通过 | T07：独立连接、`pg_blocking_pids`、败者 `VERSION_CONFLICT` |
+| 状态写入与撤销竞争 | 通过 | CON-3 pause vs withdraw |
+| 共用生成逻辑拒绝暂停／归档 | 通过 | domain `datesToMaterializeForPlan`；HTTP GET／horizon 后行数不变。**不是** worker 端到端 |
+| S05／S08 按钮、归档确认、防重复、失败不假成功 | 通过 | Playwright status walkthrough |
+| 模板导入与 S06 回归 | 通过 | 既有 walkthrough 仍绿 |
+| GET 不补齐 | 通过 | 暂停后两次 GET 行数不变 |
+| 无第八条迁移 | 通过 | db spec 仍断言 7 条 |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 9、domain 32、ui／admin／web 各 1、api **142 passed / 0 failed / 0 skipped** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `apps/web` e2e | 0 | **8 passed / 0 failed**（含模板导入、S06、本批状态 walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright，不宣称已执行；日志不可读时只写证据边界 |
+
+用户可见：S08／S05 对 ACTIVE 计划可暂停／归档，对 PAUSED 可恢复／归档；归档前说明并确认；归档后只读查看历史。S05 显示「计划已暂停」且任务不可继续执行。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。
+

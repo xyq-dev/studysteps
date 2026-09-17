@@ -143,14 +143,30 @@ export function App() {
   const [draftTaskSubject, setDraftTaskSubject] = useState('自定义');
   const [draftTaskStandard, setDraftTaskStandard] = useState('读完指定页并口头复述');
   const [draftRepeatKind, setDraftRepeatKind] = useState<'ONCE' | 'DAILY' | 'WEEKLY_DAYS'>('DAILY');
-  const [plans, setPlans] = useState<Array<{ id: string; status: string; origin: string; seriesCount: number }>>([]);
+  const [plans, setPlans] = useState<
+    Array<{ id: string; status: string; origin: string; seriesCount: number; version: number }>
+  >([]);
   const [planDetail, setPlanDetail] = useState<{
     id: string;
+    status: string;
     origin: string;
+    version: number;
     studentConfirmedAt: string | null;
+    lastAdjustment: { reasonCode: string; createdAt: string } | null;
     series: Array<{ id: string; name: string; occurrenceCount: number }>;
   } | null>(null);
-  const [tasks, setTasks] = useState<Array<{ id: string; name: string; scheduledLocalDate: string; status: string }>>([]);
+  const [tasks, setTasks] = useState<
+    Array<{
+      id: string;
+      name: string;
+      scheduledLocalDate: string;
+      status: string;
+      planStatus?: string;
+      executable?: boolean;
+    }>
+  >([]);
+  const [planActionPending, setPlanActionPending] = useState(false);
+  const [archiveConfirmPlanId, setArchiveConfirmPlanId] = useState<string | null>(null);
   const studentLoadSeq = useRef(0);
   const bootstrapSeq = useRef(0);
 
@@ -173,6 +189,8 @@ export function App() {
     setPlans([]);
     setPlanDetail(null);
     setTasks([]);
+    setPlanActionPending(false);
+    setArchiveConfirmPlanId(null);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -644,6 +662,15 @@ export function App() {
         body: JSON.stringify(body),
       });
       setPlanDetail(result);
+      setPlans([
+        {
+          id: result.id,
+          status: result.status,
+          origin: result.origin,
+          seriesCount: result.series?.length ?? 0,
+          version: result.version,
+        },
+      ]);
       setScreen('s08');
       setStatus(`计划已创建 · ${result.origin}。学生确认时间未自动写入。`);
     } catch (error) {
@@ -682,7 +709,7 @@ export function App() {
       const result = await api(`/v1/students/${activeStudentId}/plans`);
       setPlans(result.items ?? []);
       setScreen('s08');
-      setStatus('已读取计划列表（只读）。');
+      setStatus('已读取计划列表。');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '无法读取计划');
     }
@@ -696,10 +723,133 @@ export function App() {
       const result = await api(`/v1/students/${activeStudentId}/plans/${planId}`);
       setPlanDetail(result);
       setScreen('s08');
-      setStatus('已读取计划详情（只读）。');
+      setStatus(`已读取计划详情 · ${result.status}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '无法读取计划');
     }
+  }
+
+  async function refreshPlanViews(keepScreen?: Screen) {
+    if (!activeStudentId) {
+      return;
+    }
+    const listed = await api(`/v1/students/${activeStudentId}/plans`);
+    setPlans(listed.items ?? []);
+    if (planDetail) {
+      const fresh = await api(`/v1/students/${activeStudentId}/plans/${planDetail.id}`);
+      setPlanDetail(fresh);
+    }
+    if (keepScreen === 's05' || screen === 's05') {
+      const today = new Date().toLocaleDateString('en-CA');
+      const to = new Date(Date.now() + 13 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA');
+      const tasksResult = await api(`/v1/students/${activeStudentId}/tasks?from=${today}&to=${to}`);
+      setTasks(tasksResult.items ?? []);
+    }
+  }
+
+  async function changePlanStatus(planId: string, action: 'PAUSE' | 'RESUME' | 'ARCHIVE', expectedVersion: number) {
+    if (!activeStudentId || planActionPending) {
+      return;
+    }
+    setPlanActionPending(true);
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/plans/${planId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ action, expectedVersion }),
+      });
+      setPlanDetail(result);
+      setArchiveConfirmPlanId(null);
+      await refreshPlanViews();
+      if (action === 'PAUSE') {
+        setStatus('计划已暂停，未删除规则或历史任务。');
+      } else if (action === 'RESUME') {
+        setStatus('计划已恢复，未补暂停期间的缺口任务。');
+      } else {
+        setStatus('计划已归档，历史可查看，不能取消归档。');
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法调整计划状态');
+      try {
+        await refreshPlanViews();
+      } catch {
+        /* keep the failure message */
+      }
+    } finally {
+      setPlanActionPending(false);
+    }
+  }
+
+  function planStatusNotice() {
+    if (plans.some((item) => item.status === 'PAUSED')) {
+      return '计划已暂停';
+    }
+    if (plans.some((item) => item.status === 'ARCHIVED') && plans.every((item) => item.status !== 'ACTIVE')) {
+      return '计划已归档，仅可查看历史';
+    }
+    return null;
+  }
+
+  function renderPlanActions(plan: { id: string; status: string; version: number }) {
+    return (
+      <span>
+        {plan.status === 'ACTIVE' ? (
+          <button
+            type="button"
+            data-testid={`pause-plan-${plan.id}`}
+            disabled={planActionPending}
+            onClick={() => void changePlanStatus(plan.id, 'PAUSE', plan.version)}
+          >
+            暂停
+          </button>
+        ) : null}
+        {plan.status === 'PAUSED' ? (
+          <button
+            type="button"
+            data-testid={`resume-plan-${plan.id}`}
+            disabled={planActionPending}
+            onClick={() => void changePlanStatus(plan.id, 'RESUME', plan.version)}
+          >
+            恢复
+          </button>
+        ) : null}
+        {plan.status === 'ACTIVE' || plan.status === 'PAUSED' ? (
+          <button
+            type="button"
+            data-testid={`archive-plan-${plan.id}`}
+            disabled={planActionPending}
+            onClick={() => setArchiveConfirmPlanId(plan.id)}
+          >
+            归档
+          </button>
+        ) : null}
+      </span>
+    );
+  }
+
+  function renderArchiveConfirm() {
+    if (!archiveConfirmPlanId) {
+      return null;
+    }
+    const target = plans.find((item) => item.id === archiveConfirmPlanId) ?? (planDetail?.id === archiveConfirmPlanId ? planDetail : null);
+    if (!target) {
+      return null;
+    }
+    return (
+      <div data-testid="archive-confirm">
+        <p>归档后不再生成新任务，已有历史保留，且不能恢复为进行中。确定归档？</p>
+        <button
+          type="button"
+          data-testid="confirm-archive"
+          disabled={planActionPending}
+          onClick={() => void changePlanStatus(target.id, 'ARCHIVE', target.version)}
+        >
+          确认归档
+        </button>
+        <button type="button" data-testid="cancel-archive" disabled={planActionPending} onClick={() => setArchiveConfirmPlanId(null)}>
+          取消
+        </button>
+      </div>
+    );
   }
 
   async function loadTasks() {
@@ -710,9 +860,21 @@ export function App() {
       const today = new Date().toLocaleDateString('en-CA');
       const to = new Date(Date.now() + 13 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA');
       const result = await api(`/v1/students/${activeStudentId}/tasks?from=${today}&to=${to}`);
+      const listed = await api(`/v1/students/${activeStudentId}/plans`);
       setTasks(result.items ?? []);
+      setPlans(listed.items ?? []);
       setScreen('s05');
-      setStatus('已读取任务日程（只读，GET 不补齐）。');
+      const paused = (listed.items ?? []).some((item: { status: string }) => item.status === 'PAUSED');
+      const archivedOnly =
+        (listed.items ?? []).length > 0 &&
+        (listed.items ?? []).every((item: { status: string }) => item.status !== 'ACTIVE');
+      setStatus(
+        paused
+          ? '计划已暂停。GET 不补齐任务。'
+          : archivedOnly
+            ? '计划已归档，仅可查看历史。GET 不补齐任务。'
+            : '已读取任务日程（只读，GET 不补齐）。',
+      );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '无法读取任务');
     }
@@ -1085,13 +1247,21 @@ export function App() {
                 <button type="button" data-testid={`open-plan-${item.id}`} onClick={() => void loadPlanDetail(item.id)}>
                   查看
                 </button>
+                {renderPlanActions(item)}
               </li>
             ))}
           </ul>
+          {renderArchiveConfirm()}
           {planDetail ? (
             <div data-testid="plan-detail">
+              <p>状态 {planDetail.status}</p>
               <p>来源 {planDetail.origin}</p>
               <p>学生确认 {planDetail.studentConfirmedAt ?? '未确认'}</p>
+              {planDetail.lastAdjustment ? (
+                <p data-testid="plan-last-adjustment">
+                  最近调整 {planDetail.lastAdjustment.reasonCode}
+                </p>
+              ) : null}
               <ul>
                 {planDetail.series.map((item) => (
                   <li key={item.id}>
@@ -1113,12 +1283,26 @@ export function App() {
       {screen === 's05' ? (
         <section>
           <h2>S05 今日任务</h2>
+          {planStatusNotice() ? <p data-testid="plan-status-notice">{planStatusNotice()}</p> : null}
+          {renderArchiveConfirm()}
           <ul data-testid="task-list">
             {tasks.map((item) => (
               <li key={item.id}>
                 {item.scheduledLocalDate} · {item.name} · {item.status}
+                {item.planStatus ? ` · ${item.planStatus}` : ''}
+                {item.executable === false ? ' · 不可继续执行' : ''}
               </li>
             ))}
+          </ul>
+          <ul>
+            {plans
+              .filter((item) => item.status === 'ACTIVE' || item.status === 'PAUSED')
+              .map((item) => (
+                <li key={`s05-${item.id}`}>
+                  {item.origin} · {item.status}
+                  {renderPlanActions(item)}
+                </li>
+              ))}
           </ul>
           <button type="button" data-testid="open-templates-from-tasks" onClick={() => void openTemplates()}>
             选择模板
@@ -1170,6 +1354,9 @@ export function App() {
           </button>
           <button type="button" data-testid="open-student-tasks" onClick={() => void loadTasks()}>
             打开今日任务
+          </button>
+          <button type="button" data-testid="open-student-plans" onClick={() => void loadPlans()}>
+            打开计划
           </button>
           <button type="button" data-testid="refresh-session" onClick={() => void refreshSession()}>
             刷新会话

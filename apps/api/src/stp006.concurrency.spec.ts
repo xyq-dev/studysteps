@@ -308,4 +308,107 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await holder.end();
     await observer.end();
   });
+
+  async function importReadyPlan(cookies: CookieJar, ready: Awaited<ReturnType<typeof readyStudent>>) {
+    const imported = await agent()
+      .post(`/v1/students/${ready.studentId}/templates/${ready.templateId}/import`)
+      .set(writeHeaders(cookies))
+      .send({
+        expectedStudentVersion: ready.version,
+        previewDigest: ready.preview.previewDigest,
+        templateVersion: ready.preview.template.version,
+        tasks: ready.preview.tasks,
+        coCreationAttested: true,
+      });
+    expect(imported.status).toBe(201);
+    return imported.body as { id: string; version: number };
+  }
+
+  it('T07 two status patches serialize on the plan row; loser gets VERSION_CONFLICT', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '双状态竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM study_plans WHERE id = $1 FOR UPDATE', [plan.id]);
+    const holderPid = await backendPid(holder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/plans/${plan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: plan.version }),
+    );
+    const pauseWaiter = await waitForWaiterOnHolder(observer, holderPid, 'T07 pause waits on plan');
+    const blockedPause = await observer.query<{ pids: number[] }>('SELECT pg_blocking_pids($1::int) AS pids', [
+      pauseWaiter.waiter_pid,
+    ]);
+    expect(blockedPause.rows[0]?.pids ?? []).toContain(holderPid);
+    const archivePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/plans/${plan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'ARCHIVE', expectedVersion: plan.version }),
+    );
+    const archiveWaiter = await waitForWaiterOnHolder(observer, pauseWaiter.waiter_pid, 'T07 archive waits on pause');
+    expect(archiveWaiter.holder_pid).toBe(pauseWaiter.waiter_pid);
+    await holder.query('ROLLBACK');
+    const paused = await pausePromise;
+    const archived = await archivePromise;
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    expect(archived.status).toBe(409);
+    expect(archived.body.code).toBe('VERSION_CONFLICT');
+    expect(await prisma.studyPlan.findUniqueOrThrow({ where: { id: plan.id } })).toMatchObject({ status: 'PAUSED' });
+    expect(await prisma.planAdjustment.count({ where: { planId: plan.id } })).toBe(1);
+    await holder.end();
+    await observer.end();
+  });
+
+  it('T11-3 / CON-3 write-first: pause linearizes before withdraw; late pause fails', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '暂停先撤回');
+    const plan = await importReadyPlan(cookies, ready);
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/plans/${plan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: plan.version }),
+    );
+    const writer = await waitForWaiterOnHolder(observer, holderPid, 'CON-3 pause waits on pairing');
+    const blocked = await observer.query<{ pids: number[] }>('SELECT pg_blocking_pids($1::int) AS pids', [
+      writer.waiter_pid,
+    ]);
+    expect(blocked.rows[0]?.pids ?? []).toContain(holderPid);
+    const withdrawPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/consents/${ready.consentId}/withdraw`)
+        .set(writeHeaders(cookies))
+        .send({ reasonCode: 'GUARDIAN_REQUEST' }),
+    );
+    const overlap = await waitForWaiterOnHolder(observer, writer.waiter_pid, 'CON-3 withdraw waits on pause');
+    expect(overlap.holder_pid).toBe(writer.waiter_pid);
+    await holder.query('ROLLBACK');
+    const paused = await pausePromise;
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    const withdrawn = await withdrawPromise;
+    expect(withdrawn.status).toBeLessThan(300);
+    expect(withdrawn.body.status).toBe('RESTRICTED');
+    const late = await agent()
+      .patch(`/v1/students/${ready.studentId}/plans/${plan.id}`)
+      .set(writeHeaders(cookies))
+      .send({ action: 'RESUME', expectedVersion: paused.body.version });
+    expect(late.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.studyPlan.findUniqueOrThrow({ where: { id: plan.id } })).toMatchObject({ status: 'PAUSED' });
+    await holder.end();
+    await observer.end();
+  });
 });
