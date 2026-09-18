@@ -30,6 +30,7 @@ export const FORBIDDEN = new Set([
   'stp005_rev_four_to_six',
   'stp006_six_to_seven',
   'stp006_fresh',
+  'stp006_eight_to_nine',
 ]);
 export const FIXTURE_DATABASE = 'stp006_seven_to_eight';
 const originalName = 'stp004_identity';
@@ -214,7 +215,12 @@ if (isDirectRun()) {
   for (const folder of SEVEN) {
     if (prisma(['migrate', 'resolve', '--applied', folder], fixtureUrl) !== 0) process.exit(1);
   }
-  if (prisma(['migrate', 'deploy'], fixtureUrl) !== 0) process.exit(1);
+  // Ninth+ must not ride along. migrate deploy would apply every pending folder.
+  const afterSeven = new pg.Client({ connectionString: fixtureUrl, connectionTimeoutMillis: 8000 });
+  await afterSeven.connect();
+  await applySql(afterSeven, EIGHTH);
+  await afterSeven.end();
+  if (prisma(['migrate', 'resolve', '--applied', EIGHTH], fixtureUrl) !== 0) process.exit(1);
 
   const after = new pg.Client({ connectionString: fixtureUrl, connectionTimeoutMillis: 8000 });
   await after.connect();
@@ -231,7 +237,11 @@ if (isDirectRun()) {
     [EIGHTH],
   );
   if (eighth.rowCount !== 1) {
-    throw new Error('eighth migration was not applied by migrate deploy');
+    throw new Error('eighth migration was not recorded as applied');
+  }
+  const revisions = await after.query(`SELECT to_regclass('task_series_revisions') AS revisions`);
+  if (revisions.rows[0]?.revisions) {
+    throw new Error('seven-to-eight fixture must not receive revision tables');
   }
   const kept = await after.query(`SELECT nickname FROM student_profiles WHERE id = $1`, [studentId]);
   if (kept.rows[0]?.nickname !== '七到八基线') {

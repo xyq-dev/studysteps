@@ -312,7 +312,7 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 | `node scripts/stp006-fresh.mjs` | 0 | `stp006_fresh` applied=9 |
 | `node scripts/stp006-eight-to-nine.mjs` | 0 | 业务 digest 保留；内容／改期例外指针回填；约束反例拒绝 |
 | Playwright `apps/web` e2e | 0 | **12 passed**（含 FUTURE content walkthrough） |
-| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright |
+| GitHub Actions `72d02b2` | **failure** | [CI #12](https://github.com/xyq-dev/studysteps/actions/runs/35311343207) job `105493855905` 在「Prepare isolated PostgreSQL」失败（约 36s）。日志 API 403，未读取到远端测试数量。根因：`stp006-seven-to-eight.mjs` 在已 resolve 前七条后仍 `migrate deploy`，第九条出现后会连同第八／九条一起应用，脚本随即以「必须仍为 8 条」失败。已改为与六→七相同：只 SQL 第八条并 `resolve --applied`，禁止后续目录骑行。 |
 
-未执行：006-B SCHEDULE 调整、拆分、worker／Outbox、打卡、计时、通知、运营发布。结构测试不等于 006-B 验收。
+未执行：006-B SCHEDULE 调整、拆分、worker／Outbox、打卡、计时、通知、运营发布。结构测试不等于 006-B 验收。CI 未配置 Playwright，不宣称远端 E2E。
 

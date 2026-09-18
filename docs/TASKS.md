@@ -218,7 +218,7 @@
 
 2026-09-18：本批落地仅本次任务内容编辑。只改选中实例的名称／科目／完成标准／时长／步骤快照，不改 series 与重复规则。无第九条迁移。`TASK_DATE_CONFLICT` 仍只约束同规则撞日，未改。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 164、e2e 11）。未来规则编辑、拆分、horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
 
-2026-09-18：本批落地 006-A 本次及未来内容修改。第九条双轴 revision、真实例外指针、CONTENT preview／confirm 与 revision-aware horizon 已实施。SCHEDULE 入口未启用。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 173、e2e 12）。006-B／拆分／horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
+2026-09-18：本批落地 006-A 本次及未来内容修改。第九条双轴 revision、真实例外指针、CONTENT preview／confirm 与 revision-aware horizon 已实施。SCHEDULE 入口未启用。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 173、e2e 12）。CI #12（`72d02b2`）在隔离库准备失败：七→八夹具 `migrate deploy` 会连同第九条一起应用；已改为只打第八条并 `resolve --applied`，与六→七冻结方式一致。006-B／拆分／horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。
 
 2026-09-18（设计定稿，未实现）：基于 `main@9703303` 已把“本次及未来”固定为下列 006-A／006-B 两批；共同使用 `docs/STP006_DESIGN.md` §15 的原始 key 切点、内容／排期双轴修订、显式单次例外和第九条迁移。用户已持续授权后续实现，执行时无需再次申请；本行不改变 STP 006 完成状态，也不授权 STP 007、commit／push／部署。
 

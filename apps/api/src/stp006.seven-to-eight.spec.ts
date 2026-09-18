@@ -28,7 +28,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seven-to-eight leftover up
     await prisma?.$disconnect();
   });
 
-  it('keeps the seven-baseline student and defaults occurrence version after migrate deploy', async () => {
+  it('keeps the seven-baseline student and defaults occurrence version without later migrations', async () => {
     const applied = await prisma!.$queryRaw<Array<{ n: number }>>`
       SELECT COUNT(*)::int AS n
         FROM _prisma_migrations
@@ -50,6 +50,10 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seven-to-eight leftover up
     expect(versioned.length).toBeGreaterThan(0);
     expect(versioned.every((row) => row.version === 1)).toBe(true);
     expect(versioned.some((row) => row.occurrence_key === '2026-09-17')).toBe(true);
+    const revisions = await prisma!.$queryRaw<Array<{ revisions: string | null }>>`
+      SELECT to_regclass('task_series_revisions')::text AS revisions
+    `;
+    expect(revisions[0]?.revisions).toBeNull();
   });
 
   it('still rejects duplicate occurrence keys after the eighth migration', async () => {

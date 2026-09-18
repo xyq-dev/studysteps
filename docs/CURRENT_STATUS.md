@@ -6,7 +6,7 @@
 
 文档交接已经完成。STP 003 已在本地建立可重复安装、检查、测试和构建的 TypeScript 工作区骨架。这不等于完成 M0、STP 001 或 STP 002，也不等于接口已冻结或业务功能已验收。
 
-STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已在 `f0ffa10` 落地，S06 空白创建已在 `9a2c46f` 落地，暂停／恢复／归档已在 `9274f2e` 落地，按需 task-horizon 已在 `ca0edb6` 落地，单次改期已在 `1f3a4df` 落地，仅本次内容已在 `9703303` 落地，本轮实施 006-A 本次及未来内容与第九条**，见 `docs/STP006_IMPLEMENTATION_REPORT.md` 第 15 节；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。本轮提交后按新 SHA 跟踪。原库 `stp004_identity` 只读。测试目标为 `stp006_fresh`（本批第九条）；夹具 four-to-six／six-to-seven／seven-to-eight 保持各自原范围，新增 `stp006_eight_to_nine`。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 覆盖 STP 004／005 及 **STP 006 第一批＋S06＋计划状态＋horizon＋改期＋仅本次内容＋006-A 本次及未来内容**（仍不覆盖 006-B／拆分／horizon 工人或 STP 009）。
+STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（run [`35179504850`](https://github.com/xyq-dev/studysteps/actions/runs/35179504850)，SHA `9118468`）**success**。STP 005 代码与 CI 夹具已在该 SHA。2026-09-17 走查曾记录 A02 目录无法展示、P05 刷新不回填；随后仅改 web／admin 前端，Chromium 复测两项已关闭，见 `docs/handoffs/STP005_BROWSER_EVIDENCE.md`。STP 005 **产品验收未完成**（完成状态保持）。STP 006 **第一批已在 `f0ffa10` 落地，S06 空白创建已在 `9a2c46f` 落地，暂停／恢复／归档已在 `9274f2e` 落地，按需 task-horizon 已在 `ca0edb6` 落地，单次改期已在 `1f3a4df` 落地，仅本次内容已在 `9703303` 落地，006-A 本次及未来内容与第九条已在 `72d02b2` 落地**，见 `docs/STP006_IMPLEMENTATION_REPORT.md` 第 15 节；**不宣称整个 STP 006 阶段完成**。旧文「STP006 未授权实现」不再作为阻塞。GitHub Actions **CI #12**（run [`35311343207`](https://github.com/xyq-dev/studysteps/actions/runs/35311343207)，SHA `72d02b2`）在「Prepare isolated PostgreSQL」**failure**：七→八夹具仍 `migrate deploy`，第九条被一并应用。本轮冻结该夹具于第八条。日志 API 403，不编造远端测试数量。原库 `stp004_identity` 只读。测试目标为 `stp006_fresh`（第九条）；夹具 four-to-six／six-to-seven／seven-to-eight 保持各自原范围，新增 `stp006_eight_to_nine`。`Implementation Gate = LOCAL_CODE_AUTHORIZED` 覆盖 STP 004／005 及 **STP 006 第一批＋S06＋计划状态＋horizon＋改期＋仅本次内容＋006-A 本次及未来内容**（仍不覆盖 006-B／拆分／horizon 工人或 STP 009）。
 
 下文「STP 004 实现前审查」是 **2026-09-13 代码开始前快照**（当时 API 仅 `/health`、无业务 Prisma 模型）。它不是当前代码状态。当前实现状态以本段、`docs/TASKS.md` 的 STP 004 条目和上述报告为准。
 
@@ -35,7 +35,8 @@ STP 004 **继续进行中，不得标为完成**。GitHub Actions **CI #5**（ru
 | Playwright E2E（本机 2026-09-18 STP 006 仅本次内容） | 11 passed（含模板导入、S06、状态、horizon、改期、本次内容 walkthrough）；exit 0 |
 | `pnpm test`（本机 2026-09-18 STP 006-A 本次及未来） | contracts 13、domain 35、ui/admin/web 各 1、api **173 passed / 0 skipped / 0 failed**；目标库 `stp006_fresh`／夹具 `stp006_eight_to_nine`；exit 0 |
 | Playwright E2E（本机 2026-09-18 STP 006-A 本次及未来） | 12 passed（含 FUTURE content walkthrough）；CI 未配置 Playwright |
-| STP 006 | 第一批 `f0ffa10`。S06 `9a2c46f`。暂停／恢复／归档 `9274f2e`。horizon `ca0edb6`。改期 `1f3a4df`。仅本次内容 `9703303`。本轮 006-A 本次及未来内容 + 第九条。006-B／拆分／horizon 工人未做。不得标整个阶段完成 |
+| GitHub Actions `72d02b2` | [CI #12](https://github.com/xyq-dev/studysteps/actions/runs/35311343207) **failure**（Prepare isolated PostgreSQL）。日志 403；七→八 `migrate deploy` 会打上第九条 |
+| STP 006 | 第一批 `f0ffa10`。S06 `9a2c46f`。暂停／恢复／归档 `9274f2e`。horizon `ca0edb6`。改期 `1f3a4df`。仅本次内容 `9703303`。006-A + 第九条 `72d02b2`。本轮冻结七→八夹具。006-B／拆分／horizon 工人未做。不得标整个阶段完成 |
 
 下方「已核验的工作区事实」表保留 STP 003／审查时快照，其中“无 HEAD／CI 未跑”不是 2026-09-16 现状。
 
@@ -191,4 +192,4 @@ STP 003 实施轮未 commit、未 push、未 pack、未执行数据库迁移、�
 
 1. STP 004 仍进行中。不要把 STP 004 标完成。T11-3／CON-3 已覆盖模板 import、手动 `POST /plans` 与计划状态 PATCH；完成／计时仍延期。
 2. STP 005：两个页面阻塞已关闭，产品验收未完成。STP 006 第一批＋S06＋状态＋horizon＋改期＋仅本次＋006-A 本轮提交，**不宣称整个阶段完成**。Playwright 不在 CI 工作流中。不得宣称 M0／STP 002／接口已冻结。
-3. 本轮提交范围：006-A 本次及未来内容、第九条迁移、revision-aware horizon、H5 预览确认、八→九夹具与文档。SCHEDULE／006-B 未开放。原库与历史夹具保留。GitHub Actions 在 push 后按新 SHA 跟踪。
+3. 006-A 已在 `72d02b2`；本轮修复七→八夹具冻结，使 CI prepare 不再把第九条打进该历史库。SCHEDULE／006-B 未开放。原库与历史夹具保留。GitHub Actions 按新 SHA 跟踪；日志 403 时不编造远端测试数量。CI 未配置 Playwright。
