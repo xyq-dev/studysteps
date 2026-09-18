@@ -6,6 +6,8 @@ import {
   previewManualPlanSchema,
   previewTemplateSchema,
   editOccurrenceSchema,
+  futureChangeConfirmSchema,
+  futureChangePreviewSchema,
   rescheduleTaskSchema,
   taskHorizonSchema,
 } from '@studysteps/contracts';
@@ -152,6 +154,45 @@ export class PlanningController {
       studentId,
       occurrenceId,
       editOccurrenceSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
+  }
+
+  @Post('students/:studentId/tasks/:occurrenceId/future-change/preview')
+  @HttpCode(200)
+  async previewFutureChange(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.previewFutureChange(
+      session,
+      studentId,
+      occurrenceId,
+      futureChangePreviewSchema.parse(body ?? {}),
+    );
+  }
+
+  @Post('students/:studentId/tasks/:occurrenceId/future-change')
+  @HttpCode(200)
+  async confirmFutureChange(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.confirmFutureChange(
+      session,
+      studentId,
+      occurrenceId,
+      futureChangeConfirmSchema.parse(body ?? {}),
       this.idempotency.readKey(request.headers['idempotency-key']),
     );
   }

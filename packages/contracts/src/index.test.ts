@@ -11,6 +11,8 @@ import {
   createManualPlanSchema,
   patchPlanSchema,
   editOccurrenceSchema,
+  futureChangeConfirmSchema,
+  futureChangePreviewSchema,
   rescheduleTaskSchema,
   taskHorizonSchema,
 } from './index.js';
@@ -31,6 +33,7 @@ describe('@studysteps/contracts export boundary', () => {
     expect(ERROR_CODES).toContain('PLAN_STATUS_INVALID');
     expect(ERROR_CODES).toContain('TASK_DATE_CONFLICT');
     expect(ERROR_CODES).toContain('TASK_NOT_ADJUSTABLE');
+    expect(ERROR_CODES).toContain('TASK_FUTURE_PREVIEW_STALE');
   });
 });
 
@@ -214,5 +217,50 @@ describe('request validation', () => {
     expect(taskHorizonSchema.parse({ expectedStudentVersion: 3 })).toEqual({ expectedStudentVersion: 3 });
     expect(taskHorizonSchema.safeParse({ from: '2026-01-01', to: '2026-12-31' }).success).toBe(false);
     expect(taskHorizonSchema.safeParse({ studentId: 'other' }).success).toBe(false);
+  });
+
+  it('accepts FUTURE content preview/confirm and rejects schedule or history fields', () => {
+    const proposal = {
+      kind: 'CONTENT',
+      name: '朗读',
+      subject: '语文',
+      standard: '读完一页',
+      durationMinutes: 15,
+      steps: ['先读'],
+      reason: '统一后续课文',
+    };
+    const preview = {
+      expectedStudentVersion: 2,
+      expectedPlanVersion: 1,
+      expectedSeriesVersion: 1,
+      expectedOccurrenceVersion: 3,
+      proposal,
+    };
+    expect(futureChangePreviewSchema.parse(preview)).toEqual(preview);
+    expect(
+      futureChangeConfirmSchema.parse({
+        ...preview,
+        previewDigest: 'd'.repeat(16),
+      }).previewDigest,
+    ).toHaveLength(16);
+    expect(
+      futureChangePreviewSchema.safeParse({
+        ...preview,
+        proposal: { ...proposal, kind: 'SCHEDULE', repeatKind: 'DAILY' },
+      }).success,
+    ).toBe(false);
+    expect(
+      futureChangeConfirmSchema.safeParse({
+        ...preview,
+        previewDigest: 'd'.repeat(16),
+        coCreationAttested: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      futureChangePreviewSchema.safeParse({
+        ...preview,
+        fromLocalDate: '2026-09-20',
+      }).success,
+    ).toBe(false);
   });
 });

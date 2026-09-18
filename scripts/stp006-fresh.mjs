@@ -95,8 +95,8 @@ const applied = await verify.query(
 );
 const tables = await verify.query(`SELECT to_regclass('study_plans') AS plans, to_regclass('task_occurrences') AS occ`);
 await verify.end();
-if (applied.rows[0].n !== 7) {
-  throw new Error(`expected 7 applied migrations on ${freshName}, found ${applied.rows[0].n}`);
+if (applied.rows[0].n !== 9) {
+  throw new Error(`expected 9 applied migrations on ${freshName}, found ${applied.rows[0].n}`);
 }
 if (!tables.rows[0].plans || !tables.rows[0].occ) {
   throw new Error('seventh migration tables missing');

@@ -513,9 +513,36 @@ model TaskSeries {
   plan                  StudyPlan        @relation(fields: [planId], references: [id], onDelete: Restrict)
   occurrences           TaskOccurrence[]
   adjustments           PlanAdjustment[]
+  revisions             TaskSeriesRevision[]
 
   @@index([planId])
   @@map("task_series")
+}
+
+model TaskSeriesRevision {
+  taskSeriesId               String   @map("task_series_id") @db.Uuid
+  revisionNo                 Int      @map("revision_no")
+  changeKind                 String   @map("change_kind")
+  effectiveFromOccurrenceKey String   @map("effective_from_occurrence_key")
+  name                       String?
+  subject                    String?
+  completionStandard         String?  @map("completion_standard")
+  durationMinutes            Int?     @map("duration_minutes")
+  stepsJson                  String?  @map("steps_json")
+  repeatKind                 String?  @map("repeat_kind")
+  weekdaysJson               String?  @map("weekdays_json")
+  endLocalDate               String?  @map("end_local_date")
+  ongoing                    Boolean?
+  sourceAdjustmentId         String?  @unique @map("source_adjustment_id") @db.Uuid
+  createdAt                  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  series                     TaskSeries @relation(fields: [taskSeriesId], references: [id], onDelete: Restrict)
+  sourceAdjustment           PlanAdjustment? @relation("RevisionSourceAdjustment", fields: [sourceAdjustmentId], references: [id], onDelete: Restrict)
+  contentOccurrences         TaskOccurrence[] @relation("OccurrenceContentRevision")
+  scheduleOccurrences        TaskOccurrence[] @relation("OccurrenceScheduleRevision")
+
+  @@id([taskSeriesId, revisionNo])
+  @@index([taskSeriesId, changeKind, effectiveFromOccurrenceKey, revisionNo(sort: Desc)])
+  @@map("task_series_revisions")
 }
 
 model TaskOccurrence {
@@ -542,15 +569,28 @@ model TaskOccurrence {
   catalogEntryKeySnapshot String          @map("catalog_entry_key_snapshot")
   sourceOccurrenceId     String?          @map("source_occurrence_id") @db.Uuid
   version                Int              @default(1)
+  contentRevisionNo      Int              @default(1) @map("content_revision_no")
+  scheduleRevisionNo     Int              @default(1) @map("schedule_revision_no")
+  contentExceptionAdjustmentId String?    @map("content_exception_adjustment_id") @db.Uuid
+  scheduleExceptionAdjustmentId String?   @map("schedule_exception_adjustment_id") @db.Uuid
   createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
   series                 TaskSeries       @relation(fields: [seriesId], references: [id], onDelete: Restrict)
+  contentRevision        TaskSeriesRevision @relation("OccurrenceContentRevision", fields: [seriesId, contentRevisionNo], references: [taskSeriesId, revisionNo], onDelete: Restrict)
+  scheduleRevision       TaskSeriesRevision @relation("OccurrenceScheduleRevision", fields: [seriesId, scheduleRevisionNo], references: [taskSeriesId, revisionNo], onDelete: Restrict)
+  contentException       PlanAdjustment?  @relation("OccurrenceContentException", fields: [contentExceptionAdjustmentId], references: [id], onDelete: Restrict)
+  scheduleException      PlanAdjustment?  @relation("OccurrenceScheduleException", fields: [scheduleExceptionAdjustmentId], references: [id], onDelete: Restrict)
   sourceOccurrence       TaskOccurrence?  @relation("OccurrenceSplit", fields: [sourceOccurrenceId], references: [id], onDelete: Restrict)
   splitFrom              TaskOccurrence[] @relation("OccurrenceSplit")
   adjustments            PlanAdjustment[]
 
   @@unique([seriesId, occurrenceKey])
+  @@unique([seriesId, scheduledLocalDate])
   @@index([scheduledLocalDate])
+  @@index([seriesId, contentRevisionNo])
+  @@index([seriesId, scheduleRevisionNo])
+  @@index([contentExceptionAdjustmentId])
+  @@index([scheduleExceptionAdjustmentId])
   @@map("task_occurrences")
 }
 
@@ -565,7 +605,12 @@ model PlanAdjustment {
   plan            StudyPlan       @relation(fields: [planId], references: [id], onDelete: Restrict)
   series          TaskSeries?     @relation(fields: [seriesId], references: [id], onDelete: Restrict)
   occurrence      TaskOccurrence? @relation(fields: [occurrenceId], references: [id], onDelete: Restrict)
+  futureRevisions TaskSeriesRevision[] @relation("RevisionSourceAdjustment")
+  contentExceptions TaskOccurrence[] @relation("OccurrenceContentException")
+  scheduleExceptions TaskOccurrence[] @relation("OccurrenceScheduleException")
 
   @@index([planId, createdAt])
+  @@index([seriesId])
+  @@index([occurrenceId])
   @@map("plan_adjustments")
 }

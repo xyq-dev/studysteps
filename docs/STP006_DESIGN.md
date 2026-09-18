@@ -2,7 +2,7 @@
 
 实施前设计基线，第一批已按本文落地。STP 004 **仍进行中**。STP 005 **两个页面阻塞已关闭、产品验收未完成**。不得宣称 M0／STP 002／接口冻结。整个 STP 006 阶段未完成。
 
-工作区事实（2026-09-17 核验）：`main` = `origin/main`，HEAD `911846895adcba9ad2958f2b4c707655903cd56a`（报告基线 `main@9118468`）。另有已验证、未提交的 P05 会话回填、A02 `/v1` 代理、walkthrough E2E 与验收记录；**设计以该实际工作区为准**，不得当作「仅有 9118468 树」。
+工作区事实（2026-09-18 本次及未来定稿核验）：`main` = `origin/main`，HEAD `9703303edbcde6d32940bbc805a83a08c939bb4b`（报告基线 `main@9703303`）。工作区另有 `docs/handoffs/STP004_PG_ISOLATION.md` 的既有本地 PID 变化；该文件不属于本设计，不得纳入后续范围编辑提交。
 
 2026-09-17 权限与政策三项已定稿（第 11 节）：监护人协助创建、同意覆盖证据、任务生成窗口。先前「推荐决定」升格为约束。STP 006 **第一批已授权并本地实施**；整个阶段未完成。
 
@@ -18,7 +18,7 @@
 
 **首选产品闭环（第一批最小实现）：** 已配合法年级且 `learningAccess.allowed=true` 的档案，从现有 S07 进入预览（S03），确认后写入计划并生成任务，在 S05／S08／S04 只读日程查看。S06 手动创建、范围编辑、暂停／归档、改期、拆分、14 天 Outbox 工人**不删**，见第 10 节批次，不得默认为「不做」。
 
-`LOCAL_CODE_AUTHORIZED` 覆盖 STP 004、STP 005 及 **STP 006 第一批**。不覆盖后续批次、STP 009、commit／push／部署。
+`LOCAL_CODE_AUTHORIZED` 最初覆盖 STP 004、STP 005 及 **STP 006 第一批**。2026-09-18 用户又持续授权第 15 节 A／B 两批后续实现，执行时无需重复申请授权；该授权仍不覆盖 STP 007／009、commit／push／部署。
 
 ## 2. 推荐方案（只此一条）
 
@@ -79,7 +79,7 @@ StudentProfile 1──n StudyPlan 1──n TaskSeries 1──n TaskOccurrence
 | 对象 | 状态 | 本任务谁改 |
 | --- | --- | --- |
 | `StudyPlan` | `DRAFT` 不采用（预览不落库）。确认即 `ACTIVE`。另有 `PAUSED`、`ARCHIVED` | 确认→ACTIVE；暂停／归档第二批 |
-| `TaskSeries` | 有 `version`、`effectiveFromLocalDate`、`effectiveToLocalDate?`。规则变更=截断旧版+新版，不覆盖旧版正文 | 创建时一条；未来范围编辑第二批 |
+| `TaskSeries` | 稳定规则身份，`version` 是整条规则的乐观锁／修订头。未来范围编辑不复制或更换 series id，而是追加正文／排期分维度修订；详见第 15 节 | 创建时一条；未来范围编辑按第 15 节落地 |
 | `TaskOccurrence` | `PLANNED`／`IN_PROGRESS`／`COMPLETED`／`SKIPPED`／`CANCELLED` | 本任务生成 `PLANNED`，可 `CANCELLED`（暂停／取消／拆分）。`IN_PROGRESS`／`COMPLETED` 由 STP 007 转入 |
 
 P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集）。均有 `startLocalDate`，以及 `endLocalDate` 或 `ongoing=true`。不解析自然语言，不做「每周几次」。
@@ -94,7 +94,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 - **14 天闭区间（确认事务与后续 horizon POST 相同）：** 令 `today` = 锁内读取的服务器时间映射到学生时区后的本地日历日。`from = today`（含），`to = today + 13 个日历日`（含），再与规则 `endLocalDate` 取较早者。共最多 14 个本地日；不含 `today - 1`，不含 `today + 14`。`ongoing=true` 且无结束日时只截到 `to`。暂停期间不生成；恢复后从恢复日起向前看，**不补**暂停缺口。
 - **去重键**必须同时包含规则／条目身份和原始本地日期，不能仅靠日期：`UNIQUE (task_series_id, occurrence_key)`，其中 `occurrence_key` = 该 `TaskSeries`（一条规则／模板条目）**最初安排**的本地日 `YYYY-MM-DD`。同一天两条练习必须两条 series，不得靠日期全局唯一。
 - 改期只改 `scheduledLocalDate`；`id`、`originalLocalDate`、`occurrence_key`、`task_series_id` 不变。`TASK_DATE_CONFLICT`（409）只针对**同一 `TaskSeries`** 已有另一实例占用该实际安排日，禁止覆盖或合并这两行。实际安排日不是 `occurrence_key`，也不是全局唯一键；不同规则／不同系列可以同日并存，horizon 仍按原始 key 去重。这是 4.2／4.3「同规则已有安排日」的既定限制，不是任意任务同日禁止。
-- 写入口仅：确认事务、显式 `POST .../task-horizon`、单次改期，以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态（已取消的 key 不复活，除非产品明确「恢复计划」——暂停取消的未来实例保留同一 key，恢复时把安排日 ≥ 今日、因暂停取消且无完成记录的行从 `CANCELLED` 拉回 `PLANNED` 仅限 `reason=PLAN_PAUSED`，不新建第二行，不截 14 天窗口。这是支持改期移出窗口后仍能恢复所需的联动）。
+- 写入口仅：确认事务、显式 `POST .../task-horizon`、单次改期、future-change，以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态。已取消 key 默认不复活，只有两项明确例外：恢复计划可把安排日 ≥ 今日、因暂停取消且无完成记录的同行从 `CANCELLED/PLAN_PAUSED` 拉回 `PLANNED`；第 15 节排期修订可把重新命中的同行从 `CANCELLED/SERIES_RULE_REMOVED` 拉回 `PLANNED`。二者都不新建第二行，其他取消原因永不复活。
 
 ### 4.3 修改／暂停／结束对已生成任务
 
@@ -103,7 +103,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 动作 | 已 `PLANNED` 且安排日 ≥ 生效日 | 已 `IN_PROGRESS`／`COMPLETED`／`SKIPPED` | 历史完成标准 |
 | --- | --- | --- | --- |
 | 仅本次 | 只改该实例快照字段或改期 | 禁止用规则编辑覆盖；完成接口未交付前不可出现完成行 | 不改 |
-| 从某日起未来 | 截断 series，重写未来 `PLANNED` | 不改 | 不改 |
+| 从选中实例起未来 | 保持 series id，按该实例 `occurrence_key`（含）追加分维度修订；只协调允许变化的未来实例，保护显式单次例外 | 不改 | 不改 |
 | 暂停 | 未来 `PLANNED` → `CANCELLED`／`PLAN_PAUSED` | 不改 | 不改 |
 | 归档 | 同暂停，且计划 `ARCHIVED`，不再滚动生成 | 不删行 | 不改 |
 | 拆分 | 原实例 `CANCELLED`／`SPLIT`，新实例 `sourceOccurrenceId` 指向原 `id` | 原完成不得再算一次（STP 007 约束，表结构本任务预留） | 不改 |
@@ -203,7 +203,8 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | POST | `/v1/students/:id/plans/preview` | G 读／S 读 | 无模板；`tasks` 至少一条；零 INSERT | 200 规范化预览、7 日估量、`previewDigest`、教育指纹；`template=null` | 无写 | 400 非法条目；403 会话范围；学习访问未开通时 `confirmAllowed=false`，**不得**返回 `TEMPLATE_IMPORT_NOT_ALLOWED` |
 | POST | `/v1/students/:id/plans` | 同创建 | 无模板手动确认；`expectedStudentVersion`；`previewDigest`；Guardian 必带 `coCreationAttested: true`；**禁止**伪造 `templateId` | 201 计划＋规则＋确认事务内 14 日实例；`sourceTemplateVersionId=null`；`origin` 仍为 `GUARDIAN_ASSISTED`／`STUDENT`（不用 `MANUAL` 绕过双方约定 CHECK） | Idempotency `plans.create`；学生 version | 403 同意／授权／step-up；400 缺双方约定／非法条目；409 预览过期／version／异体幂等。自定义年级无映射时**允许**本入口 |
 | PATCH | `/v1/students/:id/plans/:planId` | G／S 更新 | `expectedVersion`；暂停／恢复／归档 | 新 version | 幂等+version | 409；403 |
-| PATCH | `/v1/plans/:planId/series/:seriesId` | 更新 | `scope=THIS_OCCURRENCE\|FUTURE`；`fromLocalDate` | 新 series version | version | 409；禁止改完成行 |
+| POST | `/v1/students/:id/tasks/:occurrenceId/future-change/preview` | G／S 调整＋Guardian step-up | 服务端由选中实例导出切点；`kind=CONTENT\|SCHEDULE`；不得传 `fromLocalDate` | 200 只读影响预览与 `previewDigest` | 零业务写；版本快照 | 409 版本／预览陈旧；禁止改历史与终态 |
+| POST | `/v1/students/:id/tasks/:occurrenceId/future-change` | G／S 调整＋Guardian step-up | 与 preview 同一 proposal；版本、digest、原因 | 200 新 series 修订与影响摘要 | Idempotency＋series／实例 version | 409 版本／陈旧预览／同系列安排日冲突 |
 | GET | `/v1/students/:id/tasks?date=` | 读 | 本地日；可 `from`/`to` | 已存在实例；排除取消；跳过仍列出但标未完成 | **只读；不创建、不补齐**。成功请求的会话 `lastSeen` 节流 heartbeat 沿用 STP 004 HB-1，失败不 heartbeat | 401／404 |
 | GET | `/v1/students/:id/tasks/:occurrenceId` | 读 | — | 实例＋不可变快照 | 只读；同上 heartbeat | 404 |
 | POST | `/v1/students/:id/tasks/:occurrenceId/reschedule` | G／S 调整＋step-up | 新本地日、原因、实例 `expectedVersion` | 同 id／key／快照，只改安排日 | 幂等 `tasks.reschedule`＋实例 version | 409 同规则撞日／不可改／旧版本；403 |
@@ -212,7 +213,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 
 现网 `TEMPLATE_IMPORT_NOT_AVAILABLE` 仅作占位，实现后不再用于成功路径。
 
-**T11-3／CON-3：** 上表 **import／plans 写／horizon／reschedule／series PATCH** 是本阶段可承接的学习写入。同意撤回后学生会话 401、监护人创建 403／404、撤销响应之后不得提交成功、失权后幂等重放不得返回计划。**完成、撤销完成、计时、待同步完成重放仍不存在，继续延期**，不得用计划写入冒充 T05／T06／T09。
+**T11-3／CON-3：** 上表 **import／plans 写／horizon／reschedule／future-change** 是本阶段可承接的学习写入。同意撤回后学生会话 401、监护人创建 403／404、撤销响应之后不得提交成功、失权后幂等重放不得返回计划。**完成、撤销完成、计时、待同步完成重放仍不存在，继续延期**，不得用计划写入冒充 T05／T06／T09。
 
 ## 9. 验收矩阵
 
@@ -241,12 +242,12 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 
 页面：合法导入、取消预览、刷新后仍见已保存计划（依赖已修复的 P05 会话恢复，不单测二次 SET）。
 
-## 10. 实施批次（实现授权之后才开工）
+## 10. 实施批次（按既定授权分批开工）
 
 | 批 | 内容 | 退出 |
 | --- | --- | --- |
 | **A 最小闭环（第一批，不扩展）** | 第七条迁移；preview／import 真写入；GET plans／plan／tasks（只读）；学生 S07 入口；S03 确认／取消；S05／S08／S04 只读；确认事务内生成 14 天；`POST .../task-horizon` 端点（供窗口外补齐与 T06-P-UNIQ，无工人）；T06-P-*（含 ORIGIN）、T03 生成、T02-D-OCC、T11-3／CON-3 的**计划写** | 闭环可点；无完成；无新同意文档、无重新同意页 |
-| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（已落地）；单次改期（已落地）；仅本次内容编辑（本批）；FUTURE 范围编辑；S12 最小（后延） | 仅本次内容可点；未来规则／拆分／工人未做 |
+| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（已落地）；单次改期（已落地）；仅本次内容编辑（已落地）；FUTURE 范围编辑按第 15 节再拆 A／B；S12 最小（后延） | 仅本次内容可点；未来规则／拆分／工人未做 |
 | C | 拆分；Outbox 工人调用同一 `task-horizon` POST（不经 GET）；S09 只读细节打磨 | TASKS 所列后台任务入口 |
 
 A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不是 P1。
@@ -337,13 +338,13 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 ### 11.4 实现授权（第一批已解除）
 
-2026-09-17 用户已授权 STP 006 第一批实现、独占隔离库、test-v2 隔离同意与第七条迁移。`LOCAL_CODE_AUTHORIZED` 覆盖本批，不再以「未授权」停工。不覆盖后续批次、STP 009、commit／push／部署。
+2026-09-17 用户已授权 STP 006 第一批实现、独占隔离库、test-v2 隔离同意与第七条迁移。2026-09-18 又持续授权第 15 节 A／B 两批实现，后续执行不再新增授权申请。不覆盖 STP 007／009、commit／push／部署。
 
 ### 11.5 本批之后仍开放的项
 
 第一批功能范围已固定。B04 正式文案／经营主体仍是上线前置，不阻塞隔离开发。生产告知不得用 test-v2 冒充。
 
-后续批次仍开放：未来规则编辑、拆分、Outbox 工人。仅本次内容编辑见 §3.8（本批）。单次改期见 §3.7。按需 `task-horizon` 见 §3.6。暂停／恢复／归档见 §3.5。打卡、计时、通知、运营发布不在本 STP。
+后续实现仍开放：第 15 节已定稿的未来规则编辑 A／B、拆分、Outbox 工人。仅本次内容编辑见 §3.8。单次改期见 §3.7。按需 `task-horizon` 见 §3.6。暂停／恢复／归档见 §3.5。打卡、计时、通知、运营发布不在本 STP。
 
 ### 3.4 S06 空白创建（第二批最小）
 
@@ -381,7 +382,7 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 ### 3.6 按需任务窗口补齐（本批：`POST .../task-horizon`）
 
-主体：持有 `TASK_ADJUST` 的监护人（step-up，与其他学习写入相同，不额外放宽也不另加共同制定）或绑定该档案的学生会话。客户端不能传 `from`／`to` 或指定其他学生；窗口锁内用数据库时间映射到档案时区「今日…今日+13」，再截规则起止与重复。仅 `ACTIVE` 计划生成。只 INSERT 缺失 `(task_series_id, occurrence_key)`，不改已有行、不复活 `CANCELLED`、不清除 `PLAN_PAUSED`／`PLAN_ARCHIVED`、不追补过去日期。新年级快照只写在新行。成功返回实际窗口、`insertedCount` 与正常跳过原因；无新增是 200，不是 403。同键同摘要重放返回首次结果（含跨日本地日仍不得再生成）；同键异体 409；失权后重放仍拒绝。`GET` 与页面只读加载零 INSERT。共用 `fillMissingOccurrences` 留给未来 worker，本批不宣称后台执行时鉴权或工人验收。无第八条迁移：幂等结果缓存在既有 `IdempotencyRecord.resourceId`。
+主体：持有 `TASK_ADJUST` 的监护人（step-up，与其他学习写入相同，不额外放宽也不另加共同制定）或绑定该档案的学生会话。客户端不能传 `from`／`to` 或指定其他学生；窗口锁内用数据库时间映射到档案时区「今日…今日+13」，再截规则起止与重复。仅 `ACTIVE` 计划生成。当前八迁移实现只 INSERT 缺失 `(task_series_id, occurrence_key)`，不改已有行、不复活 `CANCELLED`、不清除 `PLAN_PAUSED`／`PLAN_ARCHIVED`、不追补过去日期；第 15 节 A／B 实施后，horizon 改为 revision-aware，唯一新增复活例外是重新命中的 `SERIES_RULE_REMOVED` 同行，其他取消仍不复活。新年级快照只写在新行。成功返回实际窗口、`insertedCount` 与正常跳过原因；无新增是 200，不是 403。同键同摘要重放返回首次结果（含跨日本地日仍不得再生成）；同键异体 409；失权后重放仍拒绝。`GET` 与页面只读加载零 INSERT。共用 `fillMissingOccurrences` 留给未来 worker，本批不宣称后台执行时鉴权或工人验收。无第八条迁移：幂等结果缓存在既有 `IdempotencyRecord.resourceId`。
 
 ### 3.7 仅本次任务改期（本批）
 
@@ -435,8 +436,186 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 | 项 | 状态 |
 | --- | --- |
-| 本设计 | 11.1–11.3 已定稿；§3.5 状态转换已记录 |
-| Schema／代码／第七条迁移／隔离 test-v2 | **第一批＋S06＋暂停／恢复／归档已落地**（整个阶段未完成；无第八条迁移） |
+| 本设计 | 11.1–11.3 与第 15 节已定稿；§3.5 状态转换已记录 |
+| Schema／代码／迁移／隔离 test-v2 | 第一批＋S06＋暂停／恢复／归档＋horizon＋单次改期＋仅本次内容已落地；第八条只增加 occurrence version；第 15 节未来范围编辑仍未实现，整个阶段未完成 |
 | STP 005 | 两页面阻塞已关闭；产品验收未完成（不变） |
 | STP 004 | 进行中（不变） |
 | 打卡／计时／通知／发布 | 不在本任务 |
+
+## 15. “本次及未来”编辑定稿（2026-09-18）
+
+本节基于 `main@9703303`（完整 SHA `9703303edbcde6d32940bbc805a83a08c939bb4b`）及当前八条迁移定稿，是后续实现的唯一方案；若前文对 FUTURE 范围只有原则或泛化路径，以本节为准。保持稳定 `TaskSeries`、稳定 `TaskOccurrence.id` 和原始 `occurrenceKey`，不复制 series、不改写迁移 1–8 或 `test-v2`。本节只覆盖同一规则的“本次及未来”内容或重复安排，不默认影响同计划其他规则，不引入拆分、worker／Outbox、打卡、计时或通知。
+
+### 15.1 生效切点、时区与锚点资格
+
+**唯一切点是服务端从选中实例读取的 `cutoffOccurrenceKey = anchor.occurrenceKey`，包含该 key。** 客户端不得传 `fromLocalDate`、`effectiveFrom` 或另一实例 key。该值是规则最初生成身份中的 `YYYY-MM-DD` 本地日，按锁内重读的 `StudentProfile.timezone` 解释；不经 UTC 或浏览器时区换算。
+
+- `occurrenceKey`／`originalLocalDate`：原始生成身份和 FUTURE 作用域比较轴，永不因改期改变。
+- `scheduledLocalDate`：实际安排、日历展示、是否已经成为历史以及撞日检查轴；不用于决定 FUTURE 切点。
+- 锚点曾改期时，预览同时展示“原始规则日期／切点”和“当前实际安排日”，不得把二者混成一个日期。
+- 锚点必须归属该学生的 `ACTIVE` 计划、状态为 `PLANNED`，且锁内本地今日同时满足 `occurrenceKey >= today`、`scheduledLocalDate >= today`。原始 key 已过去但改期到未来，或原始 key 尚未来但实际安排已过去，均返回 `409 TASK_NOT_ADJUSTABLE`。
+- 影响集先按 `occurrenceKey >= cutoffOccurrenceKey` 划定，再按状态和 `scheduledLocalDate` 保护历史；key 小于切点的实例即使改期到切点之后也不受影响。
+- 锚点自身若已有同维度单次例外，规则修订仍从该 key 生效，但例外叠加在规则上，所以锚点保持原单次结果。预览必须显著说明；若用户也要改锚点，另走现有“仅本次”入口，确认过程不隐式清除例外。
+
+### 15.2 唯一数据方案：稳定系列＋分维度追加修订＋显式例外
+
+新增 `task_series_revisions`，不新增第二套 series 表，不用“拆成新 series”表达 FUTURE。物理字段固定如下：
+
+| 字段／约束 | 定义 |
+| --- | --- |
+| `task_series_id UUID`、`revision_no INTEGER` | 复合主键；`revision_no >= 1`，同一 series 在 `TaskSeries` 行锁内单调递增 |
+| `change_kind` | `BASELINE`／`CONTENT`／`SCHEDULE` |
+| `effective_from_occurrence_key` | 含边界的原始 key；合法本地日期。baseline 取现有 `start_local_date`，迁移前要求它与 `effective_from_local_date` 相等；后续修订等于 adjustment 所指锚点的 key |
+| 内容列 | `name`、`subject`、`completion_standard`、`duration_minutes`、`steps_json`；`BASELINE`／`CONTENT` 的正文 payload 完整（时长仍可为 null），`SCHEDULE` 全空 |
+| 排期列 | `repeat_kind`、`weekdays_json`、`end_local_date`、`ongoing`；`BASELINE`／`SCHEDULE` 按 repeat／ongoing 形状完整（星期和结束日可按规则为 null），`CONTENT` 全空。修订的开始日就是切点，不另收客户端 `startLocalDate` |
+| `source_adjustment_id` | baseline 为空；CONTENT／SCHEDULE 必须指向同 plan／series、且 occurrence key 等于切点的不可变 `PlanAdjustment`，原因分别为 `SERIES_FUTURE_CONTENT_CHANGED`／`SERIES_FUTURE_SCHEDULE_CHANGED`；非空值唯一，不能让一条 audit 支撑多条修订 |
+| `created_at` | UTC 审计展示字段，不参与来源判定、切点选择或修订先后 |
+
+数据库用 kind-shape CHECK、现有正文长度／JSON 形状、重复规则、`ongoing`／结束日和本地日期约束拒绝半填修订；索引固定为 `(task_series_id, change_kind, effective_from_occurrence_key, revision_no DESC)`。`TaskSeries.version` 改为整条 series 的**聚合修订头**：baseline 为 1，每次真实 FUTURE 变更加 1；延迟约束触发器在事务提交时保证它等于该 series 的最大 `revision_no`。现有 `task_series` 正文和排期列保留为 revision 1 的兼容基线，并由触发器禁止 UPDATE；新代码读取修订，不能再把这些列当“当前规则”直接覆盖。
+
+对任意原始 key `K`：
+
+1. 内容版本是 `effective_from_occurrence_key <= K` 的 `BASELINE|CONTENT` 中 `revision_no` 最大者。
+2. 排期版本是同条件的 `BASELINE|SCHEDULE` 中 `revision_no` 最大者。
+3. 后创建的较早切点可从该点起取代先前较晚切点；两个维度独立解析，后续内容编辑不会抹掉排期修订，反之亦然。
+4. `ONCE` 只命中修订切点；`DAILY` 命中每日本地 key；`WEEKLY_DAYS` 命中非空、去重的 ISO 星期。`ongoing=false` 时 `endLocalDate >= cutoffOccurrenceKey`。
+
+`task_occurrences` 在第九条迁移增加：
+
+- `content_revision_no INTEGER NOT NULL`、`schedule_revision_no INTEGER NOT NULL`，与 `series_id` 组成复合 FK 指向修订表，并分别建 `(series_id, *_revision_no)` 引用侧索引；轴类型由约束触发器保证只能指向 `BASELINE|CONTENT` 或 `BASELINE|SCHEDULE`。
+- `content_exception_adjustment_id UUID NULL`、`schedule_exception_adjustment_id UUID NULL`，分别 FK 到 `plan_adjustments.id` 并建立 FK 索引。非空本身就是单次例外的来源事实；触发器验证 adjustment 与 occurrence／series／plan 一致且原因为 `TASK_CONTENT_EDITED`／`TASK_RESCHEDULED`。
+- exception 指针是“存在显式单次操作”的规范证据，不声称是最后一次编辑。第一次单次操作时由同一事务从 null 设为有效 adjustment；数据库禁止之后替换或清空。后续单次操作继续追加 audit，但保留该指针。即使内容后来手工改回规则值、日期改回原日，仍是例外；本范围没有“重新跟随规则”操作。
+- `PlanAdjustment` 与 `TaskSeriesRevision` 均以数据库触发器禁止 UPDATE／DELETE。快照差异和 `created_at` 都不得用来猜例外。
+
+### 15.3 历史与单次例外保护矩阵
+
+| 实例情况 | CONTENT 修订 | SCHEDULE 修订 |
+| --- | --- | --- |
+| `occurrenceKey < cutoff` | 不改 | 不改 |
+| 原始 key 或实际安排日已早于锁内今日 | 不改 | 不改 |
+| `IN_PROGRESS`／`COMPLETED`／`SKIPPED` | 不改正文、版本指针或历史 | 不改日期、状态或存在性 |
+| `CANCELLED` | 不直接改；将来仅在合法恢复时解析内容版本 | 只允许 `SERIES_RULE_REMOVED` 按 15.4 恢复；其他取消原因不动 |
+| `PLANNED`＋同轴 exception 非空 | 整个正文包保留：名称、科目、完成标准、时长、步骤 | 实际日期及该实例的存在性保留，即使新规则不再命中原始 key |
+| `PLANNED`＋只有另一轴 exception | 仍可按新内容修订更新正文 | 仍可按新排期修订协调；内容例外快照不丢 |
+| 无例外的未来 `PLANNED` | 按 CONTENT 修订更新 | 按 SCHEDULE 修订保留、取消、恢复或新增 |
+
+保护粒度是整个维度，不是逐字段猜测。CONTENT 的任一单次正文编辑保护完整正文包；SCHEDULE 的任一单次改期保护实际日期和存在性。选中实例也遵守同一矩阵，没有“锚点自动覆盖例外”的特例。
+
+### 15.4 已生成实例与 horizon 的统一协调
+
+**A：内容修改。** 确认后追加 CONTENT 修订；对 key 在切点起、原始 key 与实际安排都未过去、状态 `PLANNED`、无 content exception 的既有实例，更新五项正文快照和 `content_revision_no`。排期例外不妨碍正文更新。被保护、历史、终态及取消行不改。只有实际发生行级变化的实例递增 `TaskOccurrence.version`；无语义变化请求不创建修订、不写 adjustment、不递增版本，但在完成鉴权／锁内重验／幂等后返回 200 并成功 heartbeat。
+
+**B：重复安排调整。** 确认后追加 SCHEDULE 修订，并在同一事务中按每个本地候选 key 解析有效排期版本：
+
+1. 对所有已生成且 `occurrenceKey >= cutoff` 的未来行协调，不只看当前 14 日窗口。
+2. 新规则不再命中且无 schedule exception 的未来 `PLANNED` 行改为 `CANCELLED`／`SERIES_RULE_REMOVED`；保留 id、key、原始日、快照和历史。
+3. 新规则重新命中已有 `CANCELLED`／`SERIES_RULE_REMOVED` 行时恢复**同一行**为 `PLANNED` 并清空取消原因；`USER_CANCELLED`、`PLAN_PAUSED`、`PLAN_ARCHIVED`、`SPLIT` 或其他原因绝不复活。
+4. 仍被新规则命中且无 schedule exception 的未来行推进到新 `schedule_revision_no`；revision 指针变化也递增 occurrence version，即使实际日期未变。schedule exception 行不推进该轴指针。
+5. 新增日期只在锁内实际 horizon `[today, today+13]` 中立即插入；窗口外不预建，之后由同一 revision-aware horizon 补齐。新行 `occurrenceKey = originalLocalDate = scheduledLocalDate`，正文取该 key 的有效 CONTENT 修订，教育快照取生成时当前合法档案。
+6. 恢复旧行保留原教育快照；若有 content exception，保留其正文，否则物化该 key 的有效内容修订。schedule exception 行保持实际日期和存在性。
+7. horizon 必须改为共享的 revision-aware 协调函数：仍以 `(series_id, occurrence_key)` 去重，插入缺失、只恢复 `SERIES_RULE_REMOVED`、永不复活其他取消原因、永不覆盖例外。GET 继续零写入。
+
+第九条迁移增加 `UNIQUE (series_id, scheduled_local_date)`，把现有“同系列任意状态不能占用同一实际安排日”从应用检查落实到数据库；不同 series 仍可同日。预览列出所有撞日，确认在相同约束下重新计算并以 `409 TASK_DATE_CONFLICT` 拒绝，禁止自动覆盖、合并或改写另一实例。可调整的冲突实例由用户先走现有单次改期；若冲突行已终态／不可调整，本阶段没有删除或强制取消入口，见 15.10。
+
+### 15.5 交互：选择范围 → 编辑 → 预览 → 确认
+
+1. 用户必须从 S08／S09 的**具体已生成实例**进入“编辑内容”或“调整重复安排”；不得以“今天”或规则首日臆造锚点。
+2. 先选“仅本次”或“本次及未来”。仅本次沿用现有入口；本次及未来进入本节接口。
+3. FUTURE 表单初值取锚点 key 对应的有效**规则修订**，不是锚点可能存在的单次例外快照。若锚点有同轴例外，表单上方说明该实例会保留，仅规则及其他合格实例变化。
+4. 点击“预览影响”才调用 preview。预览按“修改”“保留单次例外”“取消”“恢复”“新增”“保持不变”分组展示实例原始日、实际日及原因；撞日单列阻塞。持续规则只精确列出现有行和本次 horizon 内新增，并说明窗口外将由新规则在后续 horizon 生成，不能伪造无限清单。
+5. “返回编辑”保留本地输入但不写库；“取消”不调用 API、不写业务数据。确认按钮只在无 blocking conflict 时可用。
+6. 确认必须提交同一 proposal、版本和 `previewDigest`，服务端重新计算，不信任预览列表。网络重试复用一次确认意图生成的稳定 `Idempotency-Key`；修改 proposal 或重新预览后生成新 key。现有 web `api()` 每次请求自动换 key 的行为必须在 A 批修正，并保留结构化 `code／fields` 供 409 分流。
+
+共同制定约定只约束计划创建，不适用于既有计划的范围编辑。请求 schema 严格拒绝 `coCreationAttested`、`studentConfirmedAt`、`origin` 或 `createdBy*`；编辑不得改变这些计划历史字段，监护人 step-up 也不得伪造学生确认。
+
+### 15.6 API、乐观锁、陈旧预览与错误码
+
+只使用下列学生作用域路径，不保留 `/v1/plans/:planId/series/:seriesId` 的竞争方案：
+
+| 方法／路径 | 请求 | 成功响应 |
+| --- | --- | --- |
+| `POST /v1/students/:studentId/tasks/:occurrenceId/future-change/preview` | `expectedStudentVersion`、`expectedPlanVersion`、`expectedSeriesVersion`、`expectedOccurrenceVersion`、严格 `proposal` | 200：锚点／切点／时区、四个版本、content／schedule 修订头、规则 before／after、影响分组、阻塞冲突、窗口外说明、`previewDigest` |
+| `POST /v1/students/:studentId/tasks/:occurrenceId/future-change` | preview 原请求＋`previewDigest`；header `Idempotency-Key` | 200：series 当前／新 version、两个修订头、plan version（不变）、实际影响分组及可空审计 ID（语义 no-op 为空） |
+
+`proposal` 是不可混填的判别联合：
+
+- `kind: CONTENT`：完整 `name`、`subject`、`standard`、`durationMinutes`、`steps` 与 `reason`（1–120）。长度沿用 §3.8；必须提交完整包，不做字段级 PATCH。
+- `kind: SCHEDULE`：`repeatKind`、`weekdays`、`endLocalDate`、`ongoing` 与 `reason`（1–120）。不得提交 start／cut；`WEEKLY_DAYS` 才允许非空 weekdays，其他类型必须为 null；ongoing 与结束日严格互斥。
+
+乐观锁规则固定：显式 student／plan／series／anchor 版本不一致返回 `409 VERSION_CONFLICT`；成功 FUTURE 只递增目标 `TaskSeries.version` 和实际改动实例的 version，**不递增 `StudyPlan.version`**，避免同计划其他规则无故冲突。计划状态操作仍递增 plan version并与本操作串行。
+
+`previewDigest` 至少覆盖：student／plan／series／anchor ID 与版本、锚点 key、锁内时区和 today、两个修订头、规范化 proposal，以及所有受影响或冲突 sibling 的 id／key／实际日／状态／取消原因／version／revision 指针／exception 指针。确认时：
+
+- 上述四个显式版本变化 → `VERSION_CONFLICT`；
+- sibling、例外、影响集、有效规则、时区／本地日界或冲突变化，而显式版本仍相同 → `409 TASK_FUTURE_PREVIEW_STALE`；
+- 计划非 ACTIVE → `409 PLAN_STATUS_INVALID`；锚点／状态／历史不可调 → `409 TASK_NOT_ADJUSTABLE`；同系列撞日 → `409 TASK_DATE_CONFLICT`；
+- 同 idempotency key 异体 → `409 IDEMPOTENCY_CONFLICT`；同键同体在重新授权成功后重放首个响应。
+
+语义 no-op 的判定是“从切点起两个维度的最终投影均不变”，不是仅比较表单文字；no-op 不产生 revision／adjustment／实例 version，但完成成功 heartbeat。
+
+### 15.7 权限、事务锁序、审计与竞争
+
+preview 和 confirm 均要求当前对象级 `TASK_ADJUST`、当前必要同意与合法教育配置；Guardian 均要求 5 分钟 step-up。二者都是 POST，执行现有 Origin／CSRF。外层快速检查仅改善响应，权威判断必须在锁后用数据库 `clock_timestamp()` 重读会话并重验 step-up；真实锁等待跨过到期点时拒绝，且 revision、occurrence、adjustment、idempotency 成功记录和 heartbeat 均为零。
+
+preview 不创建或更新 plan／series／occurrence／revision／adjustment／idempotency；只有成功请求可沿用节流 session heartbeat。页面取消不发请求，所以也无 heartbeat。
+
+confirm 复用 `acquireLocks` 的完整统一顺序，不另造锁序：
+
+`Idempotency → Identity／Lookup → Account → StudentProfile → GradeConfig／Template → ConsentPolicy → GuardianLink → ConsentRecord → Pairing／Challenge → DeviceSession → StudyPlan → TaskSeries → TaskOccurrence（id 升序）`。
+
+实现顺序固定：外层鉴权与 target／idempotency peek → 收集完整学生图和该 series sibling ID → 开事务并按统一顺序加锁 → 锁内重新发现，缺锁则整事务重试 → 读取 DB now → 重验 session／step-up／对象授权／当前同意／教育 → `idempotency.begin` → 重读 plan／series／全部 siblings → 校验版本和 digest → 追加 adjustment／revision并协调实例 → `idempotency.complete` → 成功 heartbeat → 提交。新 revision 不增加锁类别，因为其父 `TaskSeries` 已锁；horizon、单次内容、单次改期、暂停／归档也必须先锁同一 plan／series，再按 id 锁 occurrence。
+
+同意、关系或会话撤销竞争沿现有授权图锁线性化：撤销先提交则 confirm／重放拒绝；confirm 先提交只能发生在撤销响应之前。幂等 replay 也先重验当前权限，失权主体不得取回旧成功体。暂停／归档先提交则确认因 plan version／status 拒绝；FUTURE 先提交则状态操作看到新锁后状态再执行。horizon 与单次编辑／改期无论先后都由 series 锁串行，后者必须看到最新 revision／exception，禁止静默覆盖。
+
+一次有效确认只写一条不可变 aggregate adjustment：`SERIES_FUTURE_CONTENT_CHANGED` 或 `SERIES_FUTURE_SCHEDULE_CHANGED`。payload 至少含切点、时区、锁内 today、before／after revision、proposal 摘要、modified／preserved／cancelled／restored／added ID 与计数、reason、actor scope／account／session、preview digest；不写令牌、同意正文或儿童复盘正文。
+
+### 15.8 第九条迁移与合法非空八→九证明
+
+**需要第九条增量迁移。** 已发布 1–8 和 `test-v2` 一字不改。A 批一次性铺好 CONTENT／SCHEDULE 两轴，B 批复用，不再另选模型。
+
+迁移 SQL 必须显式事务化，并在任何 precheck／回填前用单条 `LOCK TABLE task_series, task_occurrences, plan_adjustments IN SHARE ROW EXCLUSIVE MODE` 阻断这些表的并发写（读可继续），避免检查后又插入旧形态行。步骤固定：
+
+1. precheck：所有现有 `TaskSeries.version=1`、`effective_from_local_date=start_local_date`，且 `effective_to_local_date` 与 `end_local_date` 含 null 等值；key／original 合法；同 series 无重复 `scheduledLocalDate`；规则和实例数据满足将新增的 shape／FK；audit JSON 可解析且 plan／series／occurrence 归属一致。任一异常直接失败，不以 `created_at` 白名单放行。
+2. 建 revision 表和 nullable 新列；每条现有 series 从其真实现有字段写 revision 1。新增 series 的 AFTER INSERT 触发器同步建立 baseline 1，使迁移后、应用切换前的旧创建路径仍合法。
+3. 例外回填只依据不可变 audit lineage：`TASK_CONTENT_EDITED`／`TASK_RESCHEDULED` 的 before→after 转换必须能从 baseline／原日期重放到当前行；回退到与 baseline 相同的值仍标为例外。`created_at` 只展示，不排序或认定来源；链不完整、分叉后无法得到唯一当前状态、归属错误或无 audit 的漂移均使迁移失败，先人工修复数据，禁止按快照不同自行打标。
+4. 将 revision 指针置 1；写规范 exception adjustment 证据；再设 NOT NULL、复合 FK、全部引用侧索引（含现有 `plan_adjustments.series_id／occurrence_id` 的缺失索引）、kind-shape CHECK、`UNIQUE(series_id, scheduled_local_date)`、legacy series 字段不可变、exception 指针只许 null→证据、adjustment／revision 不可变以及延迟一致性触发器。旧版单次编辑／改期在应用切换窗口由 adjustment INSERT 触发器补 exception 指针，并在提交时校验，不能产生“已改单次但未标例外”的已提交状态。
+5. 迁移后新 revision 的 `source_adjustment_id`、轴类型、series version head 与 occurrence revision pointer 必须由实际 FK／CHECK／触发器约束；不能只靠 Prisma 类型或迁移账本。
+
+兼容与前滚：迁移后、尚无 revision > 1 时旧应用仍可创建 baseline、做单次编辑／改期和 horizon；一旦写入 FUTURE revision，旧 horizon 会误读 legacy baseline，因此应用回滚不再安全。发布顺序是九号迁移 → 新应用；若新功能已写数据，关闭 FUTURE 写入口并前滚修复，禁止 drop revision／pointer／audit 数据。
+
+验证必须包含 `scripts/stp006-fresh.mjs` 的九迁移 fresh，以及新增 `scripts/stp006-eight-to-nine.mjs` 的**合法非空**升级：夹具至少含 baseline 计划／系列、多个未来实例、历史／终态实例、一次内容例外、一次改期例外、值已改回 baseline／原日但仍有 audit 的例外、取消行。升级前后记录并比较业务 digest（全部 id、key、实际日、状态、正文／教育快照、版本、audit payload）和行数；只允许新增 revision／pointer 元数据。升级后实际尝试并拒绝错误轴 FK、跨 series adjustment、revision／adjustment UPDATE／DELETE、legacy 规则 UPDATE、version head 不一致及同 series 撞日，同时证明不同 series 同日成功。CI 新增 fresh gate 与 eight-to-nine gate，不能以“共九条”或 `_prisma_migrations` 记录代替约束验证。
+
+### 15.9 实施拆分：A 内容、B 重复安排
+
+两批共用本节数据、切点、接口、锁序、预览 digest 与例外语义；Cursor 不再选择其他架构。
+
+**A：本次及未来的内容修改（先做）。**
+
+- 数据：完成第九条迁移的全部双轴结构与旧单次例外回填；公开 API 的 `proposal.kind` 在 A 批只接受 `CONTENT`，内部判别联合和响应形状为 B 预留但不得假装 SCHEDULE 已可用。
+- 领域／API：实现 revision 解析、CONTENT 预览／确认、revision-aware 内容物化；改造 horizon 使新实例选择有效 CONTENT；现有仅本次内容／改期显式维护 exception 证据；plan status 行为保持。
+- H5：在具体实例内容编辑中增加范围选择、规则值表单、影响预览、取消和稳定确认 key；结构化处理 `VERSION_CONFLICT`／`TASK_FUTURE_PREVIEW_STALE`。
+- 文件入口：`prisma/schema.prisma`、新 `prisma/migrations/<timestamp>_stp006_series_revisions/migration.sql`；`packages/domain/src/planning.ts` 及测试；`packages/contracts/src/plans.ts`、`errors.ts`、`index.ts` 及契约测试；`apps/api/src/planning/planning.controller.ts`、`planning.service.ts`、现有 `stp006.http/db/concurrency` 测试、新 eight-to-nine／CI gate；`apps/web/src/app.tsx`、`styles.css`、`app.test.tsx` 和新增 FUTURE walkthrough。只有实现完成时才更新实施报告／状态证据。
+- A 退出：正文修订能修改合格未来行、保护历史／终态／显式单次例外、供后续 horizon 正确生成；preview／取消零业务写；陈旧确认、幂等、锁后 step-up、撤权和所有实际九号约束有证据。不得把双轴表已存在写成 B 已完成。
+
+**B：重复安排调整（随后做）。**
+
+- 在同一路径将公共 contract 扩为 `SCHEDULE`，启用既有 schedule 列和协调器；不新建第十条迁移，除非 A 实施时发现与本节明确冲突并先回报。
+- H5 增加重复方式、星期、结束日／持续编辑及修改／保留例外／取消／恢复／新增预览；不加入拆分或强制删除。
+- B 退出：新增日、移除日、连续多次排期编辑、先后混合 CONTENT／SCHEDULE、`SERIES_RULE_REMOVED` 恢复、其他取消不复活、窗口外再次 horizon、改期撞日和同日跨 series 全部成立；并复测 A 的正文和单次例外。
+
+必要测试矩阵：
+
+| 组 | 必须证明 |
+| --- | --- |
+| CUT／HISTORY | 改期锚点仍以原始 key 切分；key 前或实际过去不改；终态不改；跨本地午夜旧 preview 陈旧 |
+| EXCEPTION | 正文／日期分别保护；值改回 baseline 仍保护；锚点本身有例外时展示并保留；交叉维度仍更新 |
+| CONTENT | 已生成合格行正文更新；窗口外后续 horizon 用有效内容；新年级只进入新实例，旧实例教育快照不变 |
+| SCHEDULE | 新增、移除、同 key 恢复、其他取消不复活、持续编辑不重复；ONCE／DAILY／WEEKLY_DAYS 与 end／ongoing |
+| CONFLICT | 同 series 实际日并发冲突，跨 series 同日允许；不可调整冲突不被覆盖 |
+| STALE／IDEM | 四种 expected version、sibling／规则／today digest 变化；同键同体一次、同键异体 409；客户端重试 key 稳定 |
+| AUTH／RACE | Guardian 真实锁等待跨 5 分钟后拒绝且零业务副作用；与仅本次编辑、改期、horizon、暂停／归档、同意／link／session 撤销双向竞争；失权 replay 拒绝 |
+| MIGRATION | fresh 九条、合法非空八→九保留、回退值例外、并发写被迁移锁阻断、所有 CHECK／FK／unique／immutability 的真实反例 |
+
+### 15.10 仍存在的具体边界
+
+架构上无待 Cursor 选择的分叉。唯一已知产品限制是：新排期若撞到同 series 的终态、已取消或其他不可调整实例，系统只能在预览列出并以 `TASK_DATE_CONFLICT` 拒绝；本阶段不新增删除、强制取消或覆盖入口。可调整实例可先用现有单次改期解除冲突。该限制是显式阻塞，不得通过忽略唯一约束、改 occurrence key、自动换日或影响同计划其他规则来绕过。

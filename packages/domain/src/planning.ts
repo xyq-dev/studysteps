@@ -327,6 +327,222 @@ export function scheduledDateConflicts(
   return false;
 }
 
+export const REVISION_CHANGE_KINDS = ['BASELINE', 'CONTENT', 'SCHEDULE'] as const;
+export type RevisionChangeKind = (typeof REVISION_CHANGE_KINDS)[number];
+
+export type SeriesRevisionRecord = {
+  revisionNo: number;
+  changeKind: RevisionChangeKind;
+  effectiveFromOccurrenceKey: string;
+  name: string | null;
+  subject: string | null;
+  completionStandard: string | null;
+  durationMinutes: number | null;
+  stepsJson: string | null;
+  repeatKind: string | null;
+  weekdaysJson: string | null;
+  endLocalDate: string | null;
+  ongoing: boolean | null;
+};
+
+export function selectEffectiveRevision(
+  revisions: Iterable<SeriesRevisionRecord>,
+  kinds: readonly RevisionChangeKind[],
+  occurrenceKey: string,
+): SeriesRevisionRecord | null {
+  let best: SeriesRevisionRecord | null = null;
+  for (const row of revisions) {
+    if (!kinds.includes(row.changeKind)) {
+      continue;
+    }
+    if (compareLocalDate(row.effectiveFromOccurrenceKey, occurrenceKey) > 0) {
+      continue;
+    }
+    if (!best || row.revisionNo > best.revisionNo) {
+      best = row;
+    }
+  }
+  return best;
+}
+
+export function contentFromRevision(revision: SeriesRevisionRecord): OccurrenceContent {
+  return {
+    name: revision.name ?? '',
+    subject: revision.subject ?? '',
+    completionStandard: revision.completionStandard ?? '',
+    durationMinutes: revision.durationMinutes,
+    steps: revision.stepsJson ? (JSON.parse(revision.stepsJson) as string[]) : [],
+  };
+}
+
+export function keyHitsEffectiveSchedule(
+  revisions: Iterable<SeriesRevisionRecord>,
+  occurrenceKey: string,
+): boolean {
+  const schedule = selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], occurrenceKey);
+  if (!schedule || !schedule.repeatKind) {
+    return false;
+  }
+  if (schedule.ongoing === false && schedule.endLocalDate && compareLocalDate(occurrenceKey, schedule.endLocalDate) > 0) {
+    return false;
+  }
+  if (schedule.repeatKind === 'ONCE') {
+    return occurrenceKey === schedule.effectiveFromOccurrenceKey;
+  }
+  if (schedule.repeatKind === 'DAILY') {
+    return true;
+  }
+  const weekdays = new Set((schedule.weekdaysJson ? (JSON.parse(schedule.weekdaysJson) as IsoWeekday[]) : []) ?? []);
+  return weekdays.has(isoWeekdayFromLocalDate(occurrenceKey));
+}
+
+export function datesToMaterializeFromRevisions(
+  planStatus: string,
+  revisions: Iterable<SeriesRevisionRecord>,
+  todayLocalDate: string,
+): string[] {
+  if (!planAllowsOccurrenceGeneration(planStatus)) {
+    return [];
+  }
+  const window = horizonWindow(todayLocalDate, null);
+  const dates: string[] = [];
+  let cursor = window.from;
+  while (compareLocalDate(cursor, window.to) <= 0) {
+    if (keyHitsEffectiveSchedule(revisions, cursor)) {
+      dates.push(cursor);
+    }
+    cursor = addLocalDays(cursor, 1);
+  }
+  return dates;
+}
+
+export function canAnchorFutureChange(input: {
+  planStatus: string;
+  occurrenceStatus: string;
+  occurrenceKey: string;
+  scheduledLocalDate: string;
+  todayLocalDate: string;
+}): boolean {
+  return (
+    input.planStatus === 'ACTIVE' &&
+    input.occurrenceStatus === 'PLANNED' &&
+    compareLocalDate(input.occurrenceKey, input.todayLocalDate) >= 0 &&
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0
+  );
+}
+
+export type FutureContentEffect =
+  | 'modified'
+  | 'preserved_exception'
+  | 'preserved_history'
+  | 'preserved_terminal'
+  | 'preserved_cancelled'
+  | 'unchanged';
+
+export function classifyFutureContentEffect(input: {
+  occurrenceKey: string;
+  scheduledLocalDate: string;
+  status: string;
+  cutoffOccurrenceKey: string;
+  todayLocalDate: string;
+  hasContentException: boolean;
+  currentContent: OccurrenceContent;
+  nextContent: OccurrenceContent;
+}): FutureContentEffect {
+  if (compareLocalDate(input.occurrenceKey, input.cutoffOccurrenceKey) < 0) {
+    return 'unchanged';
+  }
+  if (
+    compareLocalDate(input.occurrenceKey, input.todayLocalDate) < 0 ||
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) < 0
+  ) {
+    return 'preserved_history';
+  }
+  if (input.status === 'IN_PROGRESS' || input.status === 'COMPLETED' || input.status === 'SKIPPED') {
+    return 'preserved_terminal';
+  }
+  if (input.status === 'CANCELLED') {
+    return 'preserved_cancelled';
+  }
+  if (input.status === 'PLANNED' && input.hasContentException) {
+    return 'preserved_exception';
+  }
+  if (input.status === 'PLANNED' && !occurrenceContentEquals(input.currentContent, input.nextContent)) {
+    return 'modified';
+  }
+  return 'unchanged';
+}
+
+export function futureContentProjectionUnchanged(
+  revisions: SeriesRevisionRecord[],
+  cutoffOccurrenceKey: string,
+  proposal: OccurrenceContent,
+): boolean {
+  const points = new Set<string>([cutoffOccurrenceKey]);
+  for (const row of revisions) {
+    if (
+      (row.changeKind === 'BASELINE' || row.changeKind === 'CONTENT') &&
+      compareLocalDate(row.effectiveFromOccurrenceKey, cutoffOccurrenceKey) >= 0
+    ) {
+      points.add(row.effectiveFromOccurrenceKey);
+    }
+  }
+  for (const key of points) {
+    const current = selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], key);
+    if (!current || !occurrenceContentEquals(contentFromRevision(current), proposal)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function futurePreviewCanonicalPayload(input: {
+  studentId: string;
+  studentVersion: number;
+  planId: string;
+  planVersion: number;
+  seriesId: string;
+  seriesVersion: number;
+  anchorId: string;
+  anchorVersion: number;
+  cutoffOccurrenceKey: string;
+  timezone: string;
+  todayLocalDate: string;
+  contentHead: number;
+  scheduleHead: number;
+  proposal: unknown;
+  siblings: Array<{
+    id: string;
+    occurrenceKey: string;
+    scheduledLocalDate: string;
+    status: string;
+    cancelReason: string | null;
+    version: number;
+    contentRevisionNo: number;
+    scheduleRevisionNo: number;
+    contentExceptionAdjustmentId: string | null;
+    scheduleExceptionAdjustmentId: string | null;
+  }>;
+}) {
+  return {
+    studentId: input.studentId,
+    studentVersion: input.studentVersion,
+    planId: input.planId,
+    planVersion: input.planVersion,
+    seriesId: input.seriesId,
+    seriesVersion: input.seriesVersion,
+    anchorId: input.anchorId,
+    anchorVersion: input.anchorVersion,
+    cutoffOccurrenceKey: input.cutoffOccurrenceKey,
+    timezone: input.timezone,
+    todayLocalDate: input.todayLocalDate,
+    contentHead: input.contentHead,
+    scheduleHead: input.scheduleHead,
+    proposal: input.proposal,
+    siblings: [...input.siblings].sort((left, right) => left.id.localeCompare(right.id)),
+  };
+}
+
 export type EducationFingerprint = {
   gradeConfigId: string;
   gradeConfigVersionId: string;

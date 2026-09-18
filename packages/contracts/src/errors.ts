@@ -24,6 +24,7 @@ export const ERROR_CODES = [
   'PLAN_STATUS_INVALID',
   'TASK_DATE_CONFLICT',
   'TASK_NOT_ADJUSTABLE',
+  'TASK_FUTURE_PREVIEW_STALE',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

@@ -91,3 +91,35 @@ export type TaskHorizonInput = z.infer<typeof taskHorizonSchema>;
 export type PatchPlanInput = z.infer<typeof patchPlanSchema>;
 export type RescheduleTaskInput = z.infer<typeof rescheduleTaskSchema>;
 export type EditOccurrenceInput = z.infer<typeof editOccurrenceSchema>;
+
+export const futureContentProposalSchema = z
+  .object({
+    kind: z.literal('CONTENT'),
+    name: z.string().min(1).max(64),
+    subject: z.string().min(1).max(32),
+    standard: z.string().min(1).max(240),
+    durationMinutes: z.number().int().positive().max(24 * 60).nullable(),
+    steps: z.array(z.string().min(1).max(120)).max(12),
+    reason: z.string().min(1).max(120),
+  })
+  .strict();
+
+export const futureChangePreviewSchema = z
+  .object({
+    expectedStudentVersion: z.number().int().positive(),
+    expectedPlanVersion: z.number().int().positive(),
+    expectedSeriesVersion: z.number().int().positive(),
+    expectedOccurrenceVersion: z.number().int().positive(),
+    proposal: futureContentProposalSchema,
+  })
+  .strict();
+
+export const futureChangeConfirmSchema = futureChangePreviewSchema
+  .extend({
+    previewDigest: z.string().min(16).max(128),
+  })
+  .strict();
+
+export type FutureContentProposal = z.infer<typeof futureContentProposalSchema>;
+export type FutureChangePreviewInput = z.infer<typeof futureChangePreviewSchema>;
+export type FutureChangeConfirmInput = z.infer<typeof futureChangeConfirmSchema>;

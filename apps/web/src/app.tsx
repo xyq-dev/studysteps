@@ -111,7 +111,17 @@ function readCookie(name: string): string | undefined {
     ?.slice(name.length + 1);
 }
 
-async function api(path: string, init: RequestInit = {}) {
+class ApiRequestError extends Error {
+  code?: string;
+  fields?: Record<string, string>;
+  constructor(message: string, code?: string, fields?: Record<string, string>) {
+    super(message);
+    this.code = code;
+    this.fields = fields;
+  }
+}
+
+async function api(path: string, init: RequestInit & { idempotencyKey?: string } = {}) {
   const csrf = readCookie('stp_csrf');
   const headers = new Headers(init.headers);
   headers.set('Content-Type', 'application/json');
@@ -119,15 +129,16 @@ async function api(path: string, init: RequestInit = {}) {
     headers.set('X-CSRF-Token', decodeURIComponent(csrf));
   }
   if (init.method && init.method !== 'GET' && path.startsWith('/v1/students')) {
-    headers.set('Idempotency-Key', crypto.randomUUID());
+    headers.set('Idempotency-Key', init.idempotencyKey ?? crypto.randomUUID());
   }
-  const response = await fetch(path, { ...init, headers, credentials: 'include' });
+  const { idempotencyKey: _idempotencyKey, ...requestInit } = init;
+  const response = await fetch(path, { ...requestInit, headers, credentials: 'include' });
   const data = response.status === 204 ? {} : await response.json();
   if (!response.ok) {
     if (response.status === 401) {
-      throw new Error(data.message ?? '未登录');
+      throw new ApiRequestError(data.message ?? '未登录', data.code, data.fields);
     }
-    throw new Error(data.message ?? data.code ?? '请求失败');
+    throw new ApiRequestError(data.message ?? data.code ?? '请求失败', data.code, data.fields);
   }
   return data;
 }
@@ -135,6 +146,43 @@ async function api(path: string, init: RequestInit = {}) {
 function addBrowserLocalDays(localDate: string, days: number) {
   const [year, month, day] = localDate.split('-').map((part) => Number(part));
   return new Date(Date.UTC(year as number, (month as number) - 1, (day as number) + days)).toISOString().slice(0, 10);
+}
+
+type FutureEffectItem = {
+  id?: string;
+  occurrenceKey?: string;
+  originalLocalDate?: string;
+  scheduledLocalDate?: string;
+  reason?: string;
+};
+
+function futureEffectItems(preview: Record<string, unknown>, key: string): FutureEffectItem[] {
+  const effects = preview.effects as Record<string, unknown> | undefined;
+  const rows = effects?.[key];
+  return Array.isArray(rows) ? (rows as FutureEffectItem[]) : [];
+}
+
+function futurePreservedItems(preview: Record<string, unknown>): FutureEffectItem[] {
+  return [
+    ...futureEffectItems(preview, 'preservedException'),
+    ...futureEffectItems(preview, 'preservedHistory'),
+    ...futureEffectItems(preview, 'preservedTerminal'),
+    ...futureEffectItems(preview, 'preservedCancelled'),
+  ];
+}
+
+function formatFutureEffectItems(items: FutureEffectItem[]): string {
+  if (items.length === 0) {
+    return '';
+  }
+  return `：${items
+    .map((item) => {
+      const original = item.originalLocalDate ?? item.occurrenceKey ?? '';
+      const scheduled = item.scheduledLocalDate ?? '';
+      return scheduled && scheduled !== original ? `${original}（实际 ${scheduled}）` : original;
+    })
+    .filter(Boolean)
+    .join('、')}`;
 }
 
 export function App() {
@@ -199,9 +247,13 @@ export function App() {
       scheduledLocalDate: string;
       originalLocalDate?: string;
       version: number;
+      seriesVersion?: number;
+      planVersion?: number;
       status: string;
       planStatus?: string;
       executable?: boolean;
+      hasContentException?: boolean;
+      occurrenceKey?: string;
     }>
   >([]);
   const [planActionPending, setPlanActionPending] = useState(false);
@@ -218,6 +270,17 @@ export function App() {
   const [editDuration, setEditDuration] = useState('');
   const [editSteps, setEditSteps] = useState('');
   const [editPending, setEditPending] = useState(false);
+  const [futureTaskId, setFutureTaskId] = useState<string | null>(null);
+  const [futurePreview, setFuturePreview] = useState<Record<string, unknown> | null>(null);
+  const [futurePending, setFuturePending] = useState(false);
+  const [futureConfirmKey, setFutureConfirmKey] = useState<string | null>(null);
+  const [futureReason, setFutureReason] = useState('统一后续内容');
+  const [futureVersions, setFutureVersions] = useState({
+    student: 1,
+    plan: 1,
+    series: 1,
+    occurrence: 1,
+  });
   const studentLoadSeq = useRef(0);
   const bootstrapSeq = useRef(0);
 
@@ -255,6 +318,10 @@ export function App() {
     setEditDuration('');
     setEditSteps('');
     setEditPending(false);
+    setFutureTaskId(null);
+    setFuturePreview(null);
+    setFuturePending(false);
+    setFutureConfirmKey(null);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -1020,6 +1087,8 @@ export function App() {
       return;
     }
     setRescheduleTaskId(null);
+    setFutureTaskId(null);
+    setFuturePreview(null);
     setEditTaskId(task.id);
     setEditName(task.name);
     setEditSubject(task.subject ?? '');
@@ -1065,9 +1134,156 @@ export function App() {
       setStatus('已只改本次任务，其他日期仍用原来的内容。');
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法保存本次任务';
-      setStatus(message.includes('任务版本已变化') ? '任务已被其他人改过，请重新加载后再编辑，不会自动覆盖。' : message);
+      setStatus(
+        error instanceof ApiRequestError && error.code === 'VERSION_CONFLICT'
+          ? '任务已被其他人改过，请重新加载后再编辑，不会自动覆盖。'
+          : message.includes('任务版本已变化')
+            ? '任务已被其他人改过，请重新加载后再编辑，不会自动覆盖。'
+            : message,
+      );
     } finally {
       setEditPending(false);
+    }
+  }
+
+  function futureProposal() {
+    return {
+      kind: 'CONTENT' as const,
+      name: editName,
+      subject: editSubject,
+      standard: editStandard,
+      durationMinutes: editDuration.trim() === '' ? null : Number(editDuration),
+      steps: editSteps
+        .split('\n')
+        .map((item) => item.trim())
+        .filter(Boolean),
+      reason: futureReason,
+    };
+  }
+
+  async function openFutureEdit(task: { id: string; executable?: boolean }) {
+    if (!activeStudentId || task.executable === false) {
+      return;
+    }
+    setRescheduleTaskId(null);
+    setEditTaskId(null);
+    setFuturePreview(null);
+    setFutureConfirmKey(null);
+    setStatus('正在读取规则内容');
+    try {
+      const [student, detail] = await Promise.all([
+        api(`/v1/students/${activeStudentId}`),
+        api(`/v1/students/${activeStudentId}/tasks/${task.id}`),
+      ]);
+      const rule = detail.ruleContent ?? {
+        name: detail.name,
+        subject: detail.subject,
+        completionStandard: detail.completionStandard,
+        durationMinutes: detail.durationMinutes,
+        steps: detail.steps ?? [],
+      };
+      setFutureTaskId(task.id);
+      setFutureVersions({
+        student: student.version,
+        plan: detail.planVersion,
+        series: detail.seriesVersion,
+        occurrence: detail.version,
+      });
+      setEditName(rule.name);
+      setEditSubject(rule.subject);
+      setEditStandard(rule.completionStandard);
+      setEditDuration(rule.durationMinutes == null ? '' : String(rule.durationMinutes));
+      setEditSteps((rule.steps ?? []).join('\n'));
+      setFutureReason('统一后续内容');
+      setStatus(detail.hasContentException ? '该实例有单次内容例外，本次及未来不会覆盖它。' : '已载入规则内容，仅影响本次及未来。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法开始本次及未来编辑');
+    }
+  }
+
+  function cancelFutureEdit() {
+    if (futurePending) {
+      return;
+    }
+    setFutureTaskId(null);
+    setFuturePreview(null);
+    setFutureConfirmKey(null);
+  }
+
+  async function previewFutureEdit() {
+    if (!activeStudentId || !futureTaskId || futurePending) {
+      return;
+    }
+    setFuturePending(true);
+    setFutureConfirmKey(null);
+    setStatus('正在预览影响');
+    try {
+      const preview = await api(`/v1/students/${activeStudentId}/tasks/${futureTaskId}/future-change/preview`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedStudentVersion: futureVersions.student,
+          expectedPlanVersion: futureVersions.plan,
+          expectedSeriesVersion: futureVersions.series,
+          expectedOccurrenceVersion: futureVersions.occurrence,
+          proposal: futureProposal(),
+        }),
+      });
+      setFuturePreview(preview);
+      setFutureVersions({
+        student: preview.versions.student,
+        plan: preview.versions.plan,
+        series: preview.versions.series,
+        occurrence: preview.versions.occurrence,
+      });
+      setStatus('已生成影响预览，确认前不会写库。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法预览本次及未来');
+    } finally {
+      setFuturePending(false);
+    }
+  }
+
+  async function confirmFutureEdit() {
+    if (!activeStudentId || !futureTaskId || !futurePreview || futurePending) {
+      return;
+    }
+    const key = futureConfirmKey ?? crypto.randomUUID();
+    setFutureConfirmKey(key);
+    setFuturePending(true);
+    setStatus('正在确认本次及未来');
+    try {
+      await api(
+        `/v1/students/${activeStudentId}/tasks/${futureTaskId}/future-change`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expectedStudentVersion: futureVersions.student,
+            expectedPlanVersion: futureVersions.plan,
+            expectedSeriesVersion: futureVersions.series,
+            expectedOccurrenceVersion: futureVersions.occurrence,
+            proposal: futureProposal(),
+            previewDigest: futurePreview.previewDigest,
+          }),
+          idempotencyKey: key,
+        },
+      );
+      const cutoff = String(futurePreview.cutoffOccurrenceKey ?? '');
+      setFutureTaskId(null);
+      setFuturePreview(null);
+      setFutureConfirmKey(null);
+      await loadTasks([cutoff]);
+      setStatus('已修改本次及未来的任务内容。单次例外仍保留。');
+    } catch (error) {
+      const code = error instanceof ApiRequestError ? error.code : '';
+      if (code === 'TASK_FUTURE_PREVIEW_STALE') {
+        setStatus('预览已过期，请重新预览后再确认，不会自动覆盖。');
+      } else if (code === 'VERSION_CONFLICT') {
+        setStatus('版本已变化，请重新预览后再确认，不会自动覆盖。');
+      } else {
+        setStatus(error instanceof Error ? error.message : '无法确认本次及未来');
+      }
+    } finally {
+      setFuturePending(false);
     }
   }
 
@@ -1522,7 +1738,7 @@ export function App() {
                     <button
                       type="button"
                       data-testid={`reschedule-task-${item.id}`}
-                      disabled={reschedulePending || editPending}
+                      disabled={reschedulePending || editPending || futurePending}
                       onClick={() => openReschedule(item)}
                     >
                       改期
@@ -1530,10 +1746,18 @@ export function App() {
                     <button
                       type="button"
                       data-testid={`edit-task-${item.id}`}
-                      disabled={reschedulePending || editPending}
+                      disabled={reschedulePending || editPending || futurePending}
                       onClick={() => openEdit(item)}
                     >
                       编辑本次
+                    </button>
+                    <button
+                      type="button"
+                      data-testid={`future-edit-task-${item.id}`}
+                      disabled={reschedulePending || editPending || futurePending}
+                      onClick={() => void openFutureEdit(item)}
+                    >
+                      本次及未来
                     </button>
                   </>
                 ) : null}
@@ -1600,6 +1824,73 @@ export function App() {
               <button type="button" data-testid="cancel-edit-occurrence" disabled={editPending} onClick={() => cancelEdit()}>
                 取消
               </button>
+            </div>
+          ) : null}
+          {futureTaskId ? (
+            <div data-testid="future-edit">
+              <p data-testid="future-edit-scope">本次及未来只改同一规则。切点是选中任务的原始日期，不含其他规则。</p>
+              {tasks.find((item) => item.id === futureTaskId)?.hasContentException ||
+              (futurePreview &&
+                futureEffectItems(futurePreview, 'preservedException').some((item) => item.id === futureTaskId)) ? (
+                <p data-testid="future-anchor-exception">选中任务有单次内容例外，确认后该实例仍保留原内容。</p>
+              ) : null}
+              <label>
+                名称
+                <input data-testid="future-edit-name" value={editName} onChange={(event) => setEditName(event.target.value)} />
+              </label>
+              <label>
+                科目
+                <input data-testid="future-edit-subject" value={editSubject} onChange={(event) => setEditSubject(event.target.value)} />
+              </label>
+              <label>
+                完成标准
+                <input data-testid="future-edit-standard" value={editStandard} onChange={(event) => setEditStandard(event.target.value)} />
+              </label>
+              <label>
+                预计时长（分钟，可空）
+                <input data-testid="future-edit-duration" value={editDuration} onChange={(event) => setEditDuration(event.target.value)} />
+              </label>
+              <label>
+                步骤（每行一条）
+                <textarea data-testid="future-edit-steps" value={editSteps} onChange={(event) => setEditSteps(event.target.value)} />
+              </label>
+              <label>
+                原因
+                <input data-testid="future-edit-reason" value={futureReason} onChange={(event) => setFutureReason(event.target.value)} />
+              </label>
+              <button type="button" data-testid="preview-future-edit" disabled={futurePending} onClick={() => void previewFutureEdit()}>
+                {futurePending && !futurePreview ? '正在预览' : '预览影响'}
+              </button>
+              <button type="button" data-testid="cancel-future-edit" disabled={futurePending} onClick={() => cancelFutureEdit()}>
+                取消
+              </button>
+              {futurePreview ? (
+                <div data-testid="future-preview">
+                  <p data-testid="future-preview-cutoff">
+                    原始生效切点 {String(futurePreview.cutoffOccurrenceKey)}
+                    {futurePreview.anchor && typeof futurePreview.anchor === 'object'
+                      ? `；当前实际安排日 ${String((futurePreview.anchor as { scheduledLocalDate?: string }).scheduledLocalDate ?? '')}`
+                      : ''}
+                  </p>
+                  <p data-testid="future-preview-modified">
+                    将修改 {futureEffectItems(futurePreview, 'modified').length} 个实例
+                    {formatFutureEffectItems(futureEffectItems(futurePreview, 'modified'))}
+                  </p>
+                  <p data-testid="future-preview-preserved">
+                    因历史、终态或单次例外保留 {futurePreservedItems(futurePreview).length} 个实例
+                    {formatFutureEffectItems(futurePreservedItems(futurePreview))}
+                  </p>
+                  <p data-testid="future-preview-beyond">{String(futurePreview.beyondHorizonNote ?? '')}</p>
+                  <button
+                    type="button"
+                    data-testid="confirm-future-edit"
+                    disabled={futurePending}
+                    onClick={() => void confirmFutureEdit()}
+                  >
+                    {futurePending ? '正在确认' : '确认修改'}
+                  </button>
+                </div>
+              ) : null}
             </div>
           ) : null}
           <ul>

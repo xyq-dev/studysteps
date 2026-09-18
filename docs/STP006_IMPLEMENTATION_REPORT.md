@@ -273,3 +273,46 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 用户可见：S05 可「编辑本次」。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。未来规则编辑仍待办。
 
+## 15. 本批：006-A 本次及未来内容修改（2026-09-18）
+
+实施前 HEAD：`9703303edbcde6d32940bbc805a83a08c939bb4b`。保留 Codex 未提交定稿文档；不把 `docs/handoffs/STP004_PG_ISOLATION.md` 的本地 PID 纳入提交。
+
+原因：按 §15 落地稳定 series + 双轴 revision、真实例外指针、CONTENT 预览／确认，以及 revision-aware horizon。SCHEDULE 入口未启用。第九条一次铺双轴。
+
+切点：只读锚点 `occurrenceKey`（含）。`scheduledLocalDate` 只管日历、历史资格与撞日。例外只认 `PlanAdjustment` 指针，改回默认值仍保护。CONTENT 不改日期、原始 key、身份、年级快照或学生确认。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 切点前后、改期锚点、其他系列不受影响 | 通过 | `stp006.http.spec.ts` FUTURE：改期锚点仍用原始 key；切点前实例与其他 series 名称不变 |
+| 单次例外及改回默认值仍保护 | 通过 | HTTP 先改后改回仍保留指针；八→九夹具 `reverted` 行 name 已回基线但指针仍是首次 audit |
+| CONTENT 不影响日期／SCHEDULE 解析 | 通过 | 改期实例日期／原始 key 保持；公开 schema 拒绝 `kind=SCHEDULE` |
+| 连续修订与 horizon 选对版本 | 通过 | 第二切点后缺口 POST horizon 用第二次正文；第一切点行仍用第一次正文 |
+| 新年级只进新行 | 通过 | 既有 promote／horizon 回归：旧行一年级，新行二年级 |
+| 预览取消、陈旧 digest、无变化、幂等 | 通过 | preview 不写 revision；陈旧 digest `TASK_FUTURE_PREVIEW_STALE`；no-op 无 adjustment；同键同体 200、异体 409 |
+| 失权重放拒绝 | 通过 | 撤回同意后同键确认非 200 |
+| 五分钟配置不变，锁等待跨过 step-up | 通过 | 独立连接 + `pg_blocking_pids`；admin 事务内 `SET LOCAL session_replication_role=replica` 回写 `step_up_verified_at`，不改 `stepUpMs`；拒绝后无 FUTURE revision／audit |
+| 与单次编辑／改期／状态竞争 | 通过 | 单次编辑先提交则 FUTURE 409；`pg_blocking_pids` 证明等待 |
+| 第九条约束与八→九保留 | 通过 | fresh 9 条；合法非空八→九 digest 不变、例外指针回填、legacy／撞日／不可变拒绝 |
+| Chromium 预览、取消、确认、例外、刷新 | 通过 | `stp006-future-content-walkthrough.spec.ts`；整包 e2e 12 passed |
+| SCHEDULE 调整入口 | **未执行（006-B）** | 公开 schema 只接受 `CONTENT` |
+
+对既有脏库 `stp006_fresh` 的第九条预检曾失败：9 条历史 `去重` 测试行 `end_local_date='2026-09-17'` 而 `effective_to_local_date` 为空。未猜测回填、未弱化约束。该库是可丢弃测试库，随后按 `scripts/stp006-fresh.mjs` 重建并成功应用九条。原库 `stp004_identity` 未写。
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 13、domain 35、ui/admin/web 各 1、api **173 passed / 0 skipped / 0 failed** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| `node scripts/stp006-fresh.mjs` | 0 | `stp006_fresh` applied=9 |
+| `node scripts/stp006-eight-to-nine.mjs` | 0 | 业务 digest 保留；内容／改期例外指针回填；约束反例拒绝 |
+| Playwright `apps/web` e2e | 0 | **12 passed**（含 FUTURE content walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright |
+
+未执行：006-B SCHEDULE 调整、拆分、worker／Outbox、打卡、计时、通知、运营发布。结构测试不等于 006-B 验收。
+

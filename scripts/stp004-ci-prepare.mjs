@@ -17,6 +17,10 @@ import {
   FIXTURE_DATABASE as SEVEN_TO_EIGHT_DATABASE,
   recordSevenToEightFixtureUrl,
 } from './stp006-seven-to-eight.mjs';
+import {
+  FIXTURE_DATABASE as EIGHT_TO_NINE_DATABASE,
+  recordEightToNineFixtureUrl,
+} from './stp006-eight-to-nine.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -253,6 +257,50 @@ if (process.env.STP006_SEVEN_TO_EIGHT_DATABASE_URL !== sevenToEightUrl) {
   throw new Error('STP006_SEVEN_TO_EIGHT_DATABASE_URL was not applied in the current prepare step');
 }
 
+const eightToNine = spawnSync(process.execPath, [join(root, 'scripts/stp006-eight-to-nine.mjs')], {
+  cwd: root,
+  env: { ...process.env },
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(eightToNine.stdout || '');
+process.stderr.write(eightToNine.stderr || '');
+if (eightToNine.status !== 0) {
+  process.exit(eightToNine.status ?? 1);
+}
+
+const eightToNineUrl = rewriteDb(adminUrl, EIGHT_TO_NINE_DATABASE);
+const eightToNineDbClient = new pg.Client({ connectionString: eightToNineUrl, connectionTimeoutMillis: 8000 });
+await eightToNineDbClient.connect();
+const eightToNineDb = await eightToNineDbClient.query('SELECT current_database() AS name');
+if (eightToNineDb.rows[0]?.name !== EIGHT_TO_NINE_DATABASE) {
+  await eightToNineDbClient.end();
+  throw new Error('eight-to-nine fixture connected to the wrong database');
+}
+const nineBaseline = await eightToNineDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '八到九基线'`,
+);
+const nineApplied = await eightToNineDbClient.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const nineRevisions = await eightToNineDbClient.query(`SELECT COUNT(*)::int AS n FROM task_series_revisions`);
+await eightToNineDbClient.end();
+if (nineBaseline.rows[0]?.n !== 1) {
+  throw new Error('eight-to-nine baseline student missing');
+}
+if (nineApplied.rows[0]?.n !== 9) {
+  throw new Error('eight-to-nine fixture did not apply nine migrations');
+}
+if (nineRevisions.rows[0]?.n < 1) {
+  throw new Error('eight-to-nine fixture missing baseline revisions');
+}
+recordEightToNineFixtureUrl(eightToNineUrl, process.env);
+if (process.env.STP006_EIGHT_TO_NINE_DATABASE_URL !== eightToNineUrl) {
+  throw new Error('STP006_EIGHT_TO_NINE_DATABASE_URL was not applied in the current prepare step');
+}
+
 const sixToSevenStill = new pg.Client({ connectionString: sixToSevenUrl, connectionTimeoutMillis: 8000 });
 await sixToSevenStill.connect();
 const sixToSevenCount = await sixToSevenStill.query(`
@@ -272,6 +320,24 @@ if (sixToSevenVersion.rowCount !== 0) {
   throw new Error('six-to-seven fixture must not receive occurrence version');
 }
 
+const sevenToEightStill = new pg.Client({ connectionString: sevenToEightUrl, connectionTimeoutMillis: 8000 });
+await sevenToEightStill.connect();
+const sevenToEightCount = await sevenToEightStill.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const sevenToEightRevision = await sevenToEightStill.query(
+  `SELECT to_regclass('task_series_revisions') AS revisions`,
+);
+await sevenToEightStill.end();
+if (sevenToEightCount.rows[0]?.n !== 8) {
+  throw new Error('seven-to-eight fixture must stay at eight migrations');
+}
+if (sevenToEightRevision.rows[0]?.revisions) {
+  throw new Error('seven-to-eight fixture must not receive revision tables');
+}
+
 process.stdout.write(
-  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}\n`,
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}; eightToNine=${EIGHT_TO_NINE_DATABASE}\n`,
 );

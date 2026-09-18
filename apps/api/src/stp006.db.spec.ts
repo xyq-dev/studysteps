@@ -38,13 +38,13 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
     await prisma.$disconnect();
   });
 
-  it('applies eight migrations and does not publish policy in the structure migration', async () => {
+  it('applies nine migrations and does not publish policy in the structure migration', async () => {
     const applied = await prisma.$queryRaw<Array<{ n: number }>>`
       SELECT COUNT(*)::int AS n
         FROM _prisma_migrations
        WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    expect(applied[0]?.n).toBe(8);
+    expect(applied[0]?.n).toBe(9);
     const seventh = await prisma.$queryRaw<Array<{ migration_name: string }>>`
       SELECT migration_name FROM _prisma_migrations
        WHERE migration_name = '20260917120000_stp006_study_plans_occurrences'
@@ -60,6 +60,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
        WHERE migration_name = '20260918090000_stp006_occurrence_version'
     `;
     expect(eighth).toHaveLength(1);
+    const ninth = await prisma.$queryRaw<Array<{ migration_name: string }>>`
+      SELECT migration_name FROM _prisma_migrations
+       WHERE migration_name = '20260918120000_stp006_series_revisions'
+    `;
+    expect(ninth).toHaveLength(1);
   });
 
   it('keeps test-v1 body/scope and publishes informal test-v2 separately', async () => {
@@ -109,6 +114,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
         endLocalDate: '2026-09-17',
         ongoing: false,
         effectiveFromLocalDate: '2026-09-17',
+        effectiveToLocalDate: '2026-09-17',
       },
     });
     const grade = await prisma.gradeConfig.findFirstOrThrow({
@@ -146,5 +152,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
         },
       }),
     ).rejects.toThrow();
+    await expect(
+      prisma.taskOccurrence.create({
+        data: { ...occ, occurrenceKey: '2026-09-18', originalLocalDate: '2026-09-18' },
+      }),
+    ).rejects.toThrow();
+    await expect(prisma.taskSeries.update({ where: { id: series.id }, data: { name: '不该改' } })).rejects.toThrow();
   });
 });

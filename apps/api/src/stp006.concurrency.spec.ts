@@ -1082,4 +1082,135 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await holder.end();
     await observer.end();
   });
+
+  it('future content waits on single edit and expired step-up after lock wait writes nothing', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '未来竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const student = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.studentId } });
+    const versions = {
+      expectedStudentVersion: student.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: row.series.version,
+      expectedOccurrenceVersion: row.version,
+    };
+    const proposal = {
+      kind: 'CONTENT',
+      name: '未来竞争名',
+      subject: '语文',
+      standard: '读完指定页',
+      durationMinutes: 10,
+      steps: ['先读'],
+      reason: '并发',
+    };
+    const preview = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/future-change/preview`)
+      .set(writeHeaders(cookies))
+      .send({ ...versions, proposal });
+    expect(preview.status).toBe(200);
+
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const editPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/tasks/${row.id}`)
+        .set(writeHeaders(cookies))
+        .send({
+          name: '单次先写',
+          subject: '语文',
+          standard: '读完指定页',
+          durationMinutes: 10,
+          steps: ['先读'],
+          expectedVersion: row.version,
+        }),
+    );
+    const editor = await waitForWaiterOnHolder(observer, holderPid, 'single edit waits on pairing');
+    const futurePromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/tasks/${row.id}/future-change`)
+        .set(writeHeaders(cookies))
+        .send({ ...versions, proposal, previewDigest: preview.body.previewDigest }),
+    );
+    const futureWaiter = await waitForWaiterOnHolder(observer, editor.waiter_pid, 'future waits on edit');
+    expect(futureWaiter.holder_pid).toBe(editor.waiter_pid);
+    await holder.query('ROLLBACK');
+    const edited = await editPromise;
+    const future = await futurePromise;
+    expect(edited.status).toBe(200);
+    expect(future.status).toBe(409);
+    expect(['VERSION_CONFLICT', 'TASK_FUTURE_PREVIEW_STALE']).toContain(future.body.code);
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: row.seriesId } })).toBe(1);
+    await holder.end();
+    await observer.end();
+
+    const stepReady = await readyStudent(cookies, '未来二次验证');
+    const stepPlan = await importReadyPlan(cookies, stepReady);
+    const stepRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: stepPlan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const stepStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: stepReady.studentId } });
+    const stepPreview = await agent()
+      .post(`/v1/students/${stepReady.studentId}/tasks/${stepRow.id}/future-change/preview`)
+      .set(writeHeaders(cookies))
+      .send({
+        expectedStudentVersion: stepStudent.version,
+        expectedPlanVersion: stepPlan.version,
+        expectedSeriesVersion: stepRow.series.version,
+        expectedOccurrenceVersion: stepRow.version,
+        proposal,
+      });
+    expect(stepPreview.status).toBe(200);
+    const pairing = await prisma.devicePairing.findUniqueOrThrow({ where: { id: stepReady.pairingId } });
+    const adminUrl = process.env.STP004_ADMIN_DATABASE_URL;
+    if (!adminUrl) {
+      throw new Error('STP004_ADMIN_DATABASE_URL is required to backdate step-up without changing stepUpMs');
+    }
+    const stepHolder = new pg.Client({ connectionString: adminUrl });
+    const stepObserver = await observerClient();
+    await stepHolder.connect();
+    await stepHolder.query('BEGIN');
+    await stepHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [stepReady.pairingId]);
+    const stepHolderPid = await backendPid(stepHolder);
+    const pending = dispatch(
+      agent()
+        .post(`/v1/students/${stepReady.studentId}/tasks/${stepRow.id}/future-change`)
+        .set(writeHeaders(cookies))
+        .send({
+          expectedStudentVersion: stepStudent.version,
+          expectedPlanVersion: stepPlan.version,
+          expectedSeriesVersion: stepRow.series.version,
+          expectedOccurrenceVersion: stepRow.version,
+          proposal,
+          previewDigest: stepPreview.body.previewDigest,
+        }),
+    );
+    const waiter = await waitForWaiterOnHolder(stepObserver, stepHolderPid, 'future waits for expired step-up');
+    expect((await stepObserver.query('SELECT pg_blocking_pids($1::int) AS pids', [waiter.waiter_pid])).rows[0].pids).toContain(
+      stepHolderPid,
+    );
+    await stepHolder.query('SET LOCAL session_replication_role = replica');
+    await stepHolder.query(
+      `UPDATE device_sessions SET step_up_verified_at = clock_timestamp() - interval '6 minutes' WHERE id = $1`,
+      [pairing.createdBySessionId],
+    );
+    await stepHolder.query('COMMIT');
+    const denied = await pending;
+    expect(denied.status).toBe(403);
+    expect(denied.body.code).toBe('STEP_UP_REQUIRED');
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: stepRow.seriesId } })).toBe(1);
+    expect(await prisma.planAdjustment.count({
+      where: { seriesId: stepRow.seriesId, reasonCode: 'SERIES_FUTURE_CONTENT_CHANGED' },
+    })).toBe(0);
+    await stepHolder.end();
+    await stepObserver.end();
+  });
 });

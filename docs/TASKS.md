@@ -214,9 +214,13 @@
 
 ## STP 006：计划与任务生成
 
-状态：第一批＋S06＋暂停／恢复／归档＋按需 task-horizon＋单次改期＋仅本次内容编辑已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
+状态：第一批＋S06＋暂停／恢复／归档＋按需 task-horizon＋单次改期＋仅本次内容＋006-A 本次及未来内容已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
 
 2026-09-18：本批落地仅本次任务内容编辑。只改选中实例的名称／科目／完成标准／时长／步骤快照，不改 series 与重复规则。无第九条迁移。`TASK_DATE_CONFLICT` 仍只约束同规则撞日，未改。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 164、e2e 11）。未来规则编辑、拆分、horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
+
+2026-09-18：本批落地 006-A 本次及未来内容修改。第九条双轴 revision、真实例外指针、CONTENT preview／confirm 与 revision-aware horizon 已实施。SCHEDULE 入口未启用。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 173、e2e 12）。006-B／拆分／horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。GitHub Actions 在 push 后按新 SHA 跟踪。
+
+2026-09-18（设计定稿，未实现）：基于 `main@9703303` 已把“本次及未来”固定为下列 006-A／006-B 两批；共同使用 `docs/STP006_DESIGN.md` §15 的原始 key 切点、内容／排期双轴修订、显式单次例外和第九条迁移。用户已持续授权后续实现，执行时无需再次申请；本行不改变 STP 006 完成状态，也不授权 STP 007、commit／push／部署。
 
 目标：实现计划、重复规则、每日任务实例、范围编辑、暂停、归档、改期和拆分。
 
@@ -227,6 +231,7 @@
 - `packages/domain` 的重复、生成、编辑范围、状态转换和日期规则。
 - S05、S06、S08、S09、S12 及 S04 的日程读取部分。
 - 未来 14 天预生成与显式 `task-horizon` POST／Outbox 入口（GET 日程不补齐）。
+- FUTURE 共用的 `TaskSeriesRevision`、实例 revision／exception 指针、第九条迁移，以及学生作用域 preview／confirm 接口；不复制 series、不改迁移 1–8／`test-v2`。
 
 验收标准：
 
@@ -234,9 +239,75 @@
 - P0 支持单次、每天、每周指定日期及起止日期／持续标记，不解析任意自然语言规则。
 - `series_id＋occurrence_key` 唯一；确认生成、horizon POST 和并发重试不会重复（GET 不补齐）。
 - 改期保持实例 ID、最初安排日期和发生键；同日冲突只提示，不自动覆盖。
-- “仅本次”和“未来”作用范围正确，历史完成标准与已完成记录不被覆盖。
+- “仅本次”和“未来”作用范围按 `STP006_DESIGN.md` §15 正确：切点只取选中实例原始 `occurrenceKey`，实际日期另管历史／撞日，显式单次例外、历史与终态不被覆盖。
 - 暂停、恢复、归档已按 §3.5 落地（保留历史，归档不可恢复）。单次改期已按 §3.7 落地。仅本次内容编辑已按 §3.8 落地。未来规则编辑、拆分仍待后续批次；拆分后的原任务不会再次计为完成。
 - 并发写入使用版本；冲突返回 409 和可解释差异，不静默覆盖。
+
+### STP 006-A：本次及未来的内容修改
+
+状态：**本批已实施并通过本地验证，见实施报告第 15 节**。不得把 006-B、拆分或 worker 写成已完成。整个 STP 006 仍未完成。
+
+目标：从一个具体、合格的 `TaskOccurrence` 起修改同一 `TaskSeries` 的正文；不影响同计划其他 series，不覆盖过去、终态或显式单次例外；窗口外实例在后续 horizon 使用新正文。
+
+固定语义：
+
+- 切点由服务端读取锚点 `occurrenceKey`（含），按锁内档案时区解释；客户端不传日期。锚点已改期时，实际日仅用于历史资格与撞日展示。
+- 内容是名称／科目／完成标准／时长／步骤完整包。`content_exception_adjustment_id` 非空即保护整包，即使快照值已回到规则值也不清除。
+- 选中实例已有内容例外时保留该实例；表单从有效规则版本取值，预览明确说明。排期例外不阻止正文更新。
+- `TaskSeries.version` 是聚合修订头；成功只递增目标 series 和实际变化 occurrence 的 version，plan version 不变。
+
+实现范围：
+
+- **迁移 9：** 新建 `task_series_revisions`，一次铺好 `BASELINE|CONTENT|SCHEDULE` 两轴；为 occurrence 增加 content／schedule revision 指针与两种 exception adjustment 指针；增加复合 FK、FK 索引、shape CHECK、不可变触发器、series version-head 延迟校验和 `UNIQUE(series_id, scheduled_local_date)`。迁移 1–8 与 `test-v2` 不改。
+- **回填：** series 真实字段成为 revision 1；旧 `TASK_CONTENT_EDITED`／`TASK_RESCHEDULED` 通过可重放 audit lineage 标记例外，不用快照差异或 `created_at` 推断。异常来源使迁移失败。
+- **API：** 新增 `POST /v1/students/:studentId/tasks/:occurrenceId/future-change/preview` 与同路径 `/future-change` confirm；A 期公开 proposal 只接受严格 `kind=CONTENT`。请求带 student／plan／series／anchor expected version；confirm 另带 opaque `previewDigest` 和稳定 `Idempotency-Key`。
+- **事务：** 沿用统一授权图和锁序；Guardian preview／confirm 都做 5 分钟 step-up，锁后用 DB 时钟复验；重验当前同意、教育、会话与对象权限后才开始幂等写。失权 replay 拒绝，成功才 heartbeat。
+- **horizon：** 提取 revision-aware 共用生成／协调逻辑；新行按 key 选择有效 CONTENT，仍按原始 key 去重，GET 零写入。现有仅本次内容／改期在同一事务维护显式 exception 证据。
+- **交互：** 具体实例“编辑内容”先选“仅本次／本次及未来”；FUTURE 编辑后必须看影响预览再确认。预览分组显示修改／保留例外／保持不变；取消零写。修正 web API 层，确认重试复用同一 key，并保留结构化错误 `code／fields`。
+
+文件入口：
+
+- `prisma/schema.prisma`；新 `prisma/migrations/<timestamp>_stp006_series_revisions/migration.sql`；新增 `scripts/stp006-eight-to-nine.mjs`，更新 fresh 校验但不改旧升级夹具含义。
+- `packages/domain/src/planning.ts` 及单测；`packages/contracts/src/plans.ts`、`errors.ts`、`index.ts`、`index.test.ts`。
+- `apps/api/src/planning/planning.controller.ts`、`planning.service.ts`；`stp006.http.spec.ts`、`stp006.db.spec.ts`、`stp006.concurrency.spec.ts`；新增 eight-to-nine 与 CI migration gate。
+- `apps/web/src/app.tsx`、`styles.css`、`app.test.tsx`，以及独立 FUTURE content E2E；实现完成后才更新 `STP006_IMPLEMENTATION_REPORT.md`／`CURRENT_STATUS.md`／本任务真实证据。
+
+验收矩阵：
+
+- 切点：改期锚点仍按原始 key；key 前、实际已过去、`IN_PROGRESS`／`COMPLETED`／`SKIPPED`／`CANCELLED` 不改。
+- 例外：普通单次内容、已改回 baseline 的单次内容、锚点自身例外均保留；只有排期例外的合格行仍更新正文。
+- 生成：已生成未来行更新；窗口外随后 horizon 使用有效正文；跨学年时旧实例教育快照不变，新实例取生成时当前教育。
+- 陈旧／幂等：四个 expected version、sibling／revision／本地 today 变化；同键同体一次、同键异体 409；预览／取消零业务写。
+- 权限／竞争：真实锁等待使有效 step-up 跨过 5 分钟后拒绝且零业务副作用；与单次内容、改期、horizon、暂停／归档、同意／link／session 撤销双向竞争及失权 replay。
+- 数据库：九迁移 fresh、合法非空八→九保留、回退值仍识别例外、迁移期写被锁住，以及 FK／CHECK／unique／immutability／version-head 的实际反例；不得仅查迁移数量或账本。
+
+退出：上述行为、实际约束和 UI 流程都有证据，且 `git diff --check`、项目规定静态／测试／构建门槛按风险执行通过。A 完成不等于 006-B、拆分或 worker 完成。
+
+### STP 006-B：本次及未来的重复安排调整
+
+状态：**设计已定稿，实现待开始**。依赖 006-A 的第九条迁移、修订解析、preview／confirm 外壳和 revision-aware horizon；使用同一语义，不新增平行模型。
+
+目标：从选中实例原始 key 起修改同一 series 的 `ONCE`／`DAILY`／`WEEKLY_DAYS`、星期、结束日／持续；协调已生成未来实例，并让窗口外实例随后按新规则补齐。
+
+实现范围：
+
+- 将同一 API 判别联合公开扩为 `kind=SCHEDULE`；start／cut 仍由服务端锚点导出，客户端只传 repeatKind／weekdays／endLocalDate／ongoing／reason。正常情况下不新增第十条迁移。
+- 新规则移除的未来无例外 `PLANNED` 行变为 `CANCELLED/SERIES_RULE_REMOVED`；再次加入时恢复同一 id/key。其他取消原因不复活；schedule exception 保护实际日期和存在性，content exception 保护正文但不阻止排期协调。
+- 当前 horizon 内新增缺失 key；窗口外留给之后的 revision-aware horizon。恢复行保留教育快照；新行用当前合法教育和该 key 的有效 CONTENT。
+- 预览显示修改／保留例外／取消／恢复／新增／保持不变及所有撞日；确认重算。`UNIQUE(series_id, scheduled_local_date)` 和 `TASK_DATE_CONFLICT` 禁止同 series 任意状态撞日，不同 series 同日允许。
+- H5 在具体实例“调整重复安排”提供范围选择、规则编辑、影响预览和确认；不加入删除、强制取消、拆分或自动换日。
+
+主要文件：复用 006-A 的 domain／contracts／planning controller-service／web 入口；扩展 `stp006.http/db/concurrency`、migration gate 复测和独立 FUTURE schedule E2E。若 A 已按定稿完成，不应再改 schema；发现确切冲突必须先记录，不能自行选择新架构。
+
+验收矩阵：
+
+- 新增／移除日期、`SERIES_RULE_REMOVED` 同行恢复、其他取消不复活；ONCE／DAILY／WEEKLY_DAYS 和 end／ongoing 边界。
+- 连续两次较早／较晚切点编辑，以及 CONTENT→SCHEDULE、SCHEDULE→CONTENT 都按各轴最高有效 revision 解析，不重复生成。
+- 改期例外与选中锚点例外保留；无例外行正确取消／恢复；窗口外再次 horizon 使用新规则。
+- 同 series 撞日（含终态／取消行）预览阻塞且确认 409；不同 series 同日成功。不可调整冲突不自动覆盖，作为既定产品边界返回。
+- 与单次改期、内容编辑、horizon、暂停／归档和撤权的双向真实并发不死锁、不静默覆盖；跨本地午夜旧 preview 被拒绝。
+
+退出：006-A 全量回归和本批矩阵通过，才可把“本次及未来重复安排”标为完成。仍不进入拆分、worker／Outbox、STP 007、打卡、计时或通知。
 
 ## STP 007：完成与计时
 

@@ -10,7 +10,14 @@ import {
   manualPreviewCanonicalPayload,
   normalizePreviewTasks,
   canAdjustOccurrence,
+  canAnchorFutureChange,
   canRescheduleOccurrence,
+  classifyFutureContentEffect,
+  contentFromRevision,
+  datesToMaterializeFromRevisions,
+  futureContentProjectionUnchanged,
+  keyHitsEffectiveSchedule,
+  selectEffectiveRevision,
   occurrenceContentDiff,
   occurrenceContentEquals,
   occurrenceContentFromSnapshots,
@@ -254,5 +261,93 @@ describe('STP 006 plan status transitions', () => {
       { field: 'durationMinutes', from: 20, to: null },
       { field: 'steps', from: ['先读', '再复述'], to: ['先读'] },
     ]);
+  });
+
+  it('selects the highest eligible revision independently for content and schedule', () => {
+    const revisions = [
+      {
+        revisionNo: 1,
+        changeKind: 'BASELINE' as const,
+        effectiveFromOccurrenceKey: '2026-09-10',
+        name: '朗读',
+        subject: '语文',
+        completionStandard: '读完一页',
+        durationMinutes: 20,
+        stepsJson: '[]',
+        repeatKind: 'DAILY',
+        weekdaysJson: null,
+        endLocalDate: null,
+        ongoing: true,
+      },
+      {
+        revisionNo: 2,
+        changeKind: 'CONTENT' as const,
+        effectiveFromOccurrenceKey: '2026-09-20',
+        name: '晚改',
+        subject: '语文',
+        completionStandard: '读完一页',
+        durationMinutes: 20,
+        stepsJson: '[]',
+        repeatKind: null,
+        weekdaysJson: null,
+        endLocalDate: null,
+        ongoing: null,
+      },
+      {
+        revisionNo: 3,
+        changeKind: 'CONTENT' as const,
+        effectiveFromOccurrenceKey: '2026-09-15',
+        name: '早改',
+        subject: '语文',
+        completionStandard: '读完一页',
+        durationMinutes: 20,
+        stepsJson: '[]',
+        repeatKind: null,
+        weekdaysJson: null,
+        endLocalDate: null,
+        ongoing: null,
+      },
+    ];
+    expect(contentFromRevision(selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], '2026-09-14')!).name).toBe(
+      '朗读',
+    );
+    expect(contentFromRevision(selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], '2026-09-16')!).name).toBe(
+      '早改',
+    );
+    expect(contentFromRevision(selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], '2026-09-21')!).name).toBe(
+      '早改',
+    );
+    expect(keyHitsEffectiveSchedule(revisions, '2026-09-18')).toBe(true);
+    expect(datesToMaterializeFromRevisions('ACTIVE', revisions, '2026-09-18').length).toBe(14);
+    expect(
+      futureContentProjectionUnchanged(revisions, '2026-09-15', {
+        name: '早改',
+        subject: '语文',
+        completionStandard: '读完一页',
+        durationMinutes: 20,
+        steps: [],
+      }),
+    ).toBe(true);
+    expect(
+      canAnchorFutureChange({
+        planStatus: 'ACTIVE',
+        occurrenceStatus: 'PLANNED',
+        occurrenceKey: '2026-09-10',
+        scheduledLocalDate: '2026-09-20',
+        todayLocalDate: '2026-09-18',
+      }),
+    ).toBe(false);
+    expect(
+      classifyFutureContentEffect({
+        occurrenceKey: '2026-09-20',
+        scheduledLocalDate: '2026-09-20',
+        status: 'PLANNED',
+        cutoffOccurrenceKey: '2026-09-18',
+        todayLocalDate: '2026-09-18',
+        hasContentException: true,
+        currentContent: { name: '例外', subject: '语文', completionStandard: '读完', durationMinutes: null, steps: [] },
+        nextContent: { name: '新规则', subject: '语文', completionStandard: '读完', durationMinutes: null, steps: [] },
+      }),
+    ).toBe('preserved_exception');
   });
 });

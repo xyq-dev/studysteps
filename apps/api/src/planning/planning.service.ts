@@ -12,7 +12,14 @@ import {
   previewCanonicalPayload,
   manualPreviewCanonicalPayload,
   datesToMaterializeForPlan,
-  missingOccurrenceDates,
+  datesToMaterializeFromRevisions,
+  canAnchorFutureChange,
+  classifyFutureContentEffect,
+  compareLocalDate,
+  contentFromRevision,
+  futureContentProjectionUnchanged,
+  futurePreviewCanonicalPayload,
+  selectEffectiveRevision,
   occurrenceCancellableOnPlanHalt,
   occurrenceRestorableOnResume,
   planAllowsOccurrenceGeneration,
@@ -25,10 +32,13 @@ import {
   occurrenceContentFromSnapshots,
   rescheduleTargetAllowed,
   scheduledDateConflicts,
+  type SeriesRevisionRecord,
   type SeriesRule,
 } from '@studysteps/domain';
 import type {
   CreateManualPlanInput,
+  FutureChangeConfirmInput,
+  FutureChangePreviewInput,
   ImportTemplateConfirmInput,
   PatchPlanInput,
   PreviewManualPlanInput,
@@ -84,6 +94,8 @@ type OccurrenceSnapshot = {
   completionStandard: string;
   durationMinutes: number | null;
   stepsJson: string;
+  contentRevisionNo?: number;
+  scheduleRevisionNo?: number;
 };
 
 @Injectable()
@@ -486,7 +498,7 @@ export class PlanningService {
     return this.readAuthorized(session, studentId, 'TASK_READ', async (tx) => {
       const row = await tx.taskOccurrence.findFirst({
         where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
-        include: { series: { include: { plan: true } } },
+        include: { series: { include: { plan: true, revisions: true } } },
       });
       if (!row) {
         throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
@@ -769,6 +781,411 @@ export class PlanningService {
     }, graph);
   }
 
+  async previewFutureChange(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: FutureChangePreviewInput,
+  ) {
+    return this.runFutureChange(session, studentId, occurrenceId, input, null);
+  }
+
+  async confirmFutureChange(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: FutureChangeConfirmInput,
+    idempotencyKey: string,
+  ) {
+    return this.runFutureChange(session, studentId, occurrenceId, input, idempotencyKey);
+  }
+
+  private async runFutureChange(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: FutureChangePreviewInput | FutureChangeConfirmInput,
+    idempotencyKey: string | null,
+  ) {
+    if (input.proposal.kind !== 'CONTENT') {
+      throw new AppError('VALIDATION_ERROR', '本批只开放内容修改', 400, { kind: 'unsupported' });
+    }
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'TASK_ADJUST');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = idempotencyKey
+      ? this.idempotency.requestDigest({
+          operation: 'tasks.future-change',
+          studentId,
+          occurrenceId,
+          input,
+        })
+      : null;
+    const existingIdem =
+      idempotencyKey && requestDigest
+        ? await this.idempotency.peekId(this.prisma, actor, 'tasks.future-change', idempotencyKey)
+        : null;
+    const target = await this.prisma.taskOccurrence.findFirst({
+      where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+      include: { series: { include: { plan: true, occurrences: { select: { id: true } } } } },
+    });
+    if (!target) {
+      throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+    }
+    const siblingIds = target.series.occurrences.map((row) => row.id);
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [target.series.planId],
+      taskSeriesIds: [target.seriesId],
+      taskOccurrenceIds: siblingIds,
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'TASK_ADJUST',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      let begun: Awaited<ReturnType<IdempotencyService['begin']>> | null = null;
+      if (idempotencyKey && requestDigest) {
+        begun = await this.idempotency.begin(tx, actor, 'tasks.future-change', idempotencyKey, requestDigest, now);
+        if (begun.kind === 'REPLAY' && begun.resourceId) {
+          await this.identity.touchLastSeenLocked(tx, currentSession, now);
+          return JSON.parse(begun.resourceId) as Record<string, unknown>;
+        }
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const row = await tx.taskOccurrence.findFirst({
+        where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+        include: {
+          series: { include: { plan: true, occurrences: true, revisions: true } },
+        },
+      });
+      if (!row) {
+        throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+      }
+      if (
+        !lockIdsContain(locked, {
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        })
+      ) {
+        throw new IncompleteLockSetError({
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        });
+      }
+      if (current.version !== input.expectedStudentVersion) {
+        throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
+      }
+      if (row.series.plan.version !== input.expectedPlanVersion) {
+        throw new AppError('VERSION_CONFLICT', '计划版本已变化', 409);
+      }
+      if (row.series.version !== input.expectedSeriesVersion) {
+        throw new AppError('VERSION_CONFLICT', '规则版本已变化', 409);
+      }
+      if (row.version !== input.expectedOccurrenceVersion) {
+        throw new AppError('VERSION_CONFLICT', '任务版本已变化', 409);
+      }
+      if (row.series.plan.status !== 'ACTIVE') {
+        throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许范围编辑', 409);
+      }
+      const today = localDateInTimeZone(now, current.timezone);
+      if (
+        !canAnchorFutureChange({
+          planStatus: row.series.plan.status,
+          occurrenceStatus: row.status,
+          occurrenceKey: row.occurrenceKey,
+          scheduledLocalDate: row.scheduledLocalDate,
+          todayLocalDate: today,
+        })
+      ) {
+        throw new AppError('TASK_NOT_ADJUSTABLE', '当前任务不能作为本次及未来的锚点', 409);
+      }
+      const revisions = row.series.revisions.map((item) => this.asRevision(item));
+      const cutoffOccurrenceKey = row.occurrenceKey;
+      const nextContent = {
+        name: input.proposal.name,
+        subject: input.proposal.subject,
+        completionStandard: input.proposal.standard,
+        durationMinutes: input.proposal.durationMinutes,
+        steps: input.proposal.steps,
+      };
+      const currentRule = selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], cutoffOccurrenceKey);
+      if (!currentRule) {
+        throw new AppError('VALIDATION_ERROR', '规则修订缺失', 400);
+      }
+      const beforeContent = contentFromRevision(currentRule);
+      const contentHead = revisions
+        .filter((item) => item.changeKind === 'BASELINE' || item.changeKind === 'CONTENT')
+        .reduce((max, item) => Math.max(max, item.revisionNo), 1);
+      const scheduleHead = revisions
+        .filter((item) => item.changeKind === 'BASELINE' || item.changeKind === 'SCHEDULE')
+        .reduce((max, item) => Math.max(max, item.revisionNo), 1);
+      const groups = {
+        modified: [] as Array<Record<string, unknown>>,
+        preservedException: [] as Array<Record<string, unknown>>,
+        preservedHistory: [] as Array<Record<string, unknown>>,
+        preservedTerminal: [] as Array<Record<string, unknown>>,
+        preservedCancelled: [] as Array<Record<string, unknown>>,
+        unchanged: [] as Array<Record<string, unknown>>,
+        cancelled: [] as Array<Record<string, unknown>>,
+        restored: [] as Array<Record<string, unknown>>,
+        added: [] as Array<Record<string, unknown>>,
+      };
+      for (const sibling of row.series.occurrences) {
+        const effect = classifyFutureContentEffect({
+          occurrenceKey: sibling.occurrenceKey,
+          scheduledLocalDate: sibling.scheduledLocalDate,
+          status: sibling.status,
+          cutoffOccurrenceKey,
+          todayLocalDate: today,
+          hasContentException: sibling.contentExceptionAdjustmentId != null,
+          currentContent: occurrenceContentFromSnapshots(sibling),
+          nextContent,
+        });
+        const item = {
+          id: sibling.id,
+          occurrenceKey: sibling.occurrenceKey,
+          originalLocalDate: sibling.originalLocalDate,
+          scheduledLocalDate: sibling.scheduledLocalDate,
+          status: sibling.status,
+          reason: effect,
+        };
+        if (effect === 'modified') {
+          groups.modified.push(item);
+        } else if (effect === 'preserved_exception') {
+          groups.preservedException.push(item);
+        } else if (effect === 'preserved_history') {
+          groups.preservedHistory.push(item);
+        } else if (effect === 'preserved_terminal') {
+          groups.preservedTerminal.push(item);
+        } else if (effect === 'preserved_cancelled') {
+          groups.preservedCancelled.push(item);
+        } else {
+          groups.unchanged.push(item);
+        }
+      }
+      const noOp = futureContentProjectionUnchanged(revisions, cutoffOccurrenceKey, nextContent);
+      const previewDigest = digestCanonical(
+        futurePreviewCanonicalPayload({
+          studentId: current.id,
+          studentVersion: current.version,
+          planId: row.series.planId,
+          planVersion: row.series.plan.version,
+          seriesId: row.seriesId,
+          seriesVersion: row.series.version,
+          anchorId: row.id,
+          anchorVersion: row.version,
+          cutoffOccurrenceKey,
+          timezone: current.timezone,
+          todayLocalDate: today,
+          contentHead,
+          scheduleHead,
+          proposal: input.proposal,
+          siblings: row.series.occurrences.map((item) => ({
+            id: item.id,
+            occurrenceKey: item.occurrenceKey,
+            scheduledLocalDate: item.scheduledLocalDate,
+            status: item.status,
+            cancelReason: item.cancelReason,
+            version: item.version,
+            contentRevisionNo: item.contentRevisionNo,
+            scheduleRevisionNo: item.scheduleRevisionNo,
+            contentExceptionAdjustmentId: item.contentExceptionAdjustmentId,
+            scheduleExceptionAdjustmentId: item.scheduleExceptionAdjustmentId,
+          })),
+        }),
+      );
+      const preview = {
+        anchor: {
+          id: row.id,
+          occurrenceKey: row.occurrenceKey,
+          originalLocalDate: row.originalLocalDate,
+          scheduledLocalDate: row.scheduledLocalDate,
+          hasContentException: row.contentExceptionAdjustmentId != null,
+          hasScheduleException: row.scheduleExceptionAdjustmentId != null,
+          version: row.version,
+        },
+        cutoffOccurrenceKey,
+        timezone: current.timezone,
+        todayLocalDate: today,
+        versions: {
+          student: current.version,
+          plan: row.series.plan.version,
+          series: row.series.version,
+          occurrence: row.version,
+        },
+        heads: { content: contentHead, schedule: scheduleHead },
+        rule: { before: beforeContent, after: nextContent },
+        effects: groups,
+        conflicts: [],
+        beyondHorizonNote: '窗口外尚未生成的任务将在之后的任务窗口按新规则内容生成。',
+        previewDigest,
+        noOp,
+      };
+      if (!idempotencyKey) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return preview;
+      }
+      const confirmInput = input as FutureChangeConfirmInput;
+      if (confirmInput.previewDigest !== previewDigest) {
+        throw new AppError('TASK_FUTURE_PREVIEW_STALE', '影响预览已过期，请重新预览后再确认', 409);
+      }
+      let adjustmentId: string | null = null;
+      let nextSeriesVersion = row.series.version;
+      let nextContentHead = contentHead;
+      if (!noOp) {
+        const adjustment = await tx.planAdjustment.create({
+          data: {
+            planId: row.series.planId,
+            seriesId: row.seriesId,
+            occurrenceId: row.id,
+            reasonCode: 'SERIES_FUTURE_CONTENT_CHANGED',
+            payloadJson: JSON.stringify({
+              cutoffOccurrenceKey,
+              timezone: current.timezone,
+              todayLocalDate: today,
+              beforeRevision: contentHead,
+              afterRevision: contentHead + 1,
+              proposal: input.proposal,
+              modifiedIds: groups.modified.map((item) => item.id),
+              preservedExceptionIds: groups.preservedException.map((item) => item.id),
+              cancelledIds: [],
+              restoredIds: [],
+              addedIds: [],
+              counts: {
+                modified: groups.modified.length,
+                preservedException: groups.preservedException.length,
+              },
+              reason: input.proposal.reason,
+              actorScope: session.scope,
+              actorAccountId: session.accountId ?? null,
+              actorSessionId: session.id,
+              previewDigest,
+            }),
+          },
+        });
+        adjustmentId = adjustment.id;
+        nextSeriesVersion = row.series.version + 1;
+        nextContentHead = nextSeriesVersion;
+        await tx.taskSeriesRevision.create({
+          data: {
+            taskSeriesId: row.seriesId,
+            revisionNo: nextContentHead,
+            changeKind: 'CONTENT',
+            effectiveFromOccurrenceKey: cutoffOccurrenceKey,
+            name: nextContent.name,
+            subject: nextContent.subject,
+            completionStandard: nextContent.completionStandard,
+            durationMinutes: nextContent.durationMinutes,
+            stepsJson: JSON.stringify(nextContent.steps),
+            sourceAdjustmentId: adjustment.id,
+          },
+        });
+        await tx.taskSeries.update({
+          where: { id: row.seriesId },
+          data: { version: nextSeriesVersion },
+        });
+        for (const sibling of row.series.occurrences) {
+          const inScope =
+            compareLocalDate(sibling.occurrenceKey, cutoffOccurrenceKey) >= 0 &&
+            compareLocalDate(sibling.occurrenceKey, today) >= 0 &&
+            compareLocalDate(sibling.scheduledLocalDate, today) >= 0 &&
+            sibling.status === 'PLANNED' &&
+            sibling.contentExceptionAdjustmentId == null;
+          if (!inScope) {
+            continue;
+          }
+          const snapshotChanged = !occurrenceContentEquals(occurrenceContentFromSnapshots(sibling), nextContent);
+          const pointerChanged = sibling.contentRevisionNo !== nextContentHead;
+          if (!snapshotChanged && !pointerChanged) {
+            continue;
+          }
+          await tx.taskOccurrence.update({
+            where: { id: sibling.id, version: sibling.version },
+            data: {
+              nameSnapshot: nextContent.name,
+              subjectSnapshot: nextContent.subject,
+              completionStandardSnapshot: nextContent.completionStandard,
+              durationMinutesSnapshot: nextContent.durationMinutes,
+              stepsSnapshotJson: JSON.stringify(nextContent.steps),
+              contentRevisionNo: nextContentHead,
+              version: sibling.version + 1,
+            },
+          });
+        }
+      }
+      const result = {
+        series: {
+          id: row.seriesId,
+          version: nextSeriesVersion,
+          previousVersion: row.series.version,
+          contentHead: nextContentHead,
+          scheduleHead,
+        },
+        plan: { id: row.series.planId, version: row.series.plan.version },
+        adjustmentId,
+        effects: groups,
+        noOp,
+      };
+      if (begun) {
+        await this.idempotency.complete(tx, begun.recordId, 'TaskSeries', JSON.stringify(result), 200, now);
+      }
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return result;
+    }, graph);
+  }
+
+  private asRevision(row: {
+    revisionNo: number;
+    changeKind: string;
+    effectiveFromOccurrenceKey: string;
+    name: string | null;
+    subject: string | null;
+    completionStandard: string | null;
+    durationMinutes: number | null;
+    stepsJson: string | null;
+    repeatKind: string | null;
+    weekdaysJson: string | null;
+    endLocalDate: string | null;
+    ongoing: boolean | null;
+  }): SeriesRevisionRecord {
+    return {
+      revisionNo: row.revisionNo,
+      changeKind: row.changeKind as SeriesRevisionRecord['changeKind'],
+      effectiveFromOccurrenceKey: row.effectiveFromOccurrenceKey,
+      name: row.name,
+      subject: row.subject,
+      completionStandard: row.completionStandard,
+      durationMinutes: row.durationMinutes,
+      stepsJson: row.stepsJson,
+      repeatKind: row.repeatKind,
+      weekdaysJson: row.weekdaysJson,
+      endLocalDate: row.endLocalDate,
+      ongoing: row.ongoing,
+    };
+  }
+
   private async getTaskInTx(tx: Tx, studentId: string, occurrenceId: string) {
     const row = await tx.taskOccurrence.findFirst({
       where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
@@ -835,7 +1252,7 @@ export class PlanningService {
       await this.assertPlanWritePrereqs(tx, current);
       const plans = await tx.studyPlan.findMany({
         where: { studentProfileId: studentId },
-        include: { series: { include: { occurrences: true } } },
+        include: { series: { include: { occurrences: true, revisions: true } } },
       });
       const seriesIds = plans.flatMap((plan) => plan.series.map((item) => item.id));
       const occurrenceIds = plans.flatMap((plan) => plan.series.flatMap((item) => item.occurrences.map((row) => row.id)));
@@ -1074,6 +1491,8 @@ export class PlanningService {
         gradeLabelSnapshot: snapshot.gradeLabel,
         termCodeSnapshot: snapshot.termCode,
         catalogEntryKeySnapshot: snapshot.catalogEntryKey,
+        contentRevisionNo: snapshot.contentRevisionNo ?? 1,
+        scheduleRevisionNo: snapshot.scheduleRevisionNo ?? 1,
       })),
       skipDuplicates: true,
     });
@@ -1109,6 +1528,20 @@ export class PlanningService {
         endLocalDate: string | null;
         ongoing: boolean;
         occurrences: Array<{ occurrenceKey: string }>;
+        revisions?: Array<{
+          revisionNo: number;
+          changeKind: string;
+          effectiveFromOccurrenceKey: string;
+          name: string | null;
+          subject: string | null;
+          completionStandard: string | null;
+          durationMinutes: number | null;
+          stepsJson: string | null;
+          repeatKind: string | null;
+          weekdaysJson: string | null;
+          endLocalDate: string | null;
+          ongoing: boolean | null;
+        }>;
       }>;
     }>,
     now: Date,
@@ -1154,9 +1587,12 @@ export class PlanningService {
         continue;
       }
       for (const series of plan.series) {
-        const rule = this.ruleFromSeries(series);
-        const wanted = datesToMaterializeForPlan(plan.status, rule, today);
+        const revisions = (series.revisions ?? []).map((item) => this.asRevision(item));
+        const wanted = revisions.length
+          ? datesToMaterializeFromRevisions(plan.status, revisions, today)
+          : datesToMaterializeForPlan(plan.status, this.ruleFromSeries(series), today);
         if (wanted.length === 0) {
+          const rule = this.ruleFromSeries(series);
           const ended = rule.endLocalDate != null && rule.endLocalDate < today;
           skipped.push({
             reason: ended ? 'SERIES_ENDED' : 'NO_DATES_IN_WINDOW',
@@ -1165,24 +1601,37 @@ export class PlanningService {
           });
           continue;
         }
-        const missing = missingOccurrenceDates(
-          plan.status,
-          rule,
-          today,
-          series.occurrences.map((row) => row.occurrenceKey),
-        );
+        const have = new Set(series.occurrences.map((row) => row.occurrenceKey));
+        const missing = wanted.filter((day) => !have.has(day));
         if (missing.length === 0) {
           skipped.push({ reason: 'ALREADY_EXISTS', planId: plan.id, seriesId: series.id });
           continue;
         }
-        insertedCount += await this.insertOccurrenceDates(tx, series.id, missing, {
-          ...snapshotBase,
-          name: series.name,
-          subject: series.subject,
-          completionStandard: series.completionStandard,
-          durationMinutes: series.durationMinutes,
-          stepsJson: series.stepsJson,
-        });
+        for (const localDate of missing) {
+          const contentRev = revisions.length
+            ? selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], localDate)
+            : null;
+          const scheduleRev = revisions.length
+            ? selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], localDate)
+            : null;
+          const content = contentRev ? contentFromRevision(contentRev) : {
+            name: series.name,
+            subject: series.subject,
+            completionStandard: series.completionStandard,
+            durationMinutes: series.durationMinutes,
+            steps: JSON.parse(series.stepsJson) as string[],
+          };
+          insertedCount += await this.insertOccurrenceDates(tx, series.id, [localDate], {
+            ...snapshotBase,
+            name: content.name,
+            subject: content.subject,
+            completionStandard: content.completionStandard,
+            durationMinutes: content.durationMinutes,
+            stepsJson: JSON.stringify(content.steps),
+            contentRevisionNo: contentRev?.revisionNo ?? 1,
+            scheduleRevisionNo: scheduleRev?.revisionNo ?? 1,
+          });
+        }
       }
     }
     return { from: window.from, to: window.to, insertedCount, skipped };
@@ -1427,9 +1876,37 @@ export class PlanningService {
     gradeLabelSnapshot: string;
     catalogEntryKeySnapshot: string;
     timezoneSnapshot: string;
-    series: { id: string; planId: string; plan: { status: string } };
+    contentExceptionAdjustmentId?: string | null;
+    scheduleExceptionAdjustmentId?: string | null;
+    series: {
+      id: string;
+      planId: string;
+      version: number;
+      plan: { status: string; version: number };
+      revisions?: Array<{
+        revisionNo: number;
+        changeKind: string;
+        effectiveFromOccurrenceKey: string;
+        name: string | null;
+        subject: string | null;
+        completionStandard: string | null;
+        durationMinutes: number | null;
+        stepsJson: string | null;
+        repeatKind: string | null;
+        weekdaysJson: string | null;
+        endLocalDate: string | null;
+        ongoing: boolean | null;
+      }>;
+    };
   }) {
     const planStatus = row.series.plan.status;
+    const ruleRevision = row.series.revisions
+      ? selectEffectiveRevision(
+          row.series.revisions.map((item) => this.asRevision(item)),
+          ['BASELINE', 'CONTENT'],
+          row.occurrenceKey,
+        )
+      : null;
     return {
       id: row.id,
       seriesId: row.series.id,
@@ -1438,8 +1915,12 @@ export class PlanningService {
       originalLocalDate: row.originalLocalDate,
       occurrenceKey: row.occurrenceKey,
       version: row.version,
+      seriesVersion: row.series.version,
+      planVersion: row.series.plan.version,
       status: row.status,
       planStatus,
+      hasContentException: row.contentExceptionAdjustmentId != null,
+      hasScheduleException: row.scheduleExceptionAdjustmentId != null,
       executable: planStatus === 'ACTIVE' && row.status === 'PLANNED',
       name: row.nameSnapshot,
       subject: row.subjectSnapshot,
@@ -1449,6 +1930,7 @@ export class PlanningService {
       gradeLabelSnapshot: row.gradeLabelSnapshot,
       catalogEntryKeySnapshot: row.catalogEntryKeySnapshot,
       timezoneSnapshot: row.timezoneSnapshot,
+      ruleContent: ruleRevision ? contentFromRevision(ruleRevision) : undefined,
     };
   }
 }

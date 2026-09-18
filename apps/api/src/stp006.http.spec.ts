@@ -228,6 +228,31 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
       .send(body);
   }
 
+  async function postFuturePreview(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+  ) {
+    return agent()
+      .post(`/v1/students/${studentId}/tasks/${occurrenceId}/future-change/preview`)
+      .set(writeHeaders(cookies))
+      .send(body);
+  }
+
+  async function postFutureConfirm(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ) {
+    return agent()
+      .post(`/v1/students/${studentId}/tasks/${occurrenceId}/future-change`)
+      .set(writeHeaders(cookies, idempotencyKey))
+      .send(body);
+  }
+
   async function createManualPlan(
     cookies: CookieJar,
     student: { id: string; version: number },
@@ -280,13 +305,6 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
   async function shiftPlanWindowBackOneDay(planId: string) {
     const series = await prisma.taskSeries.findMany({ where: { planId }, orderBy: { id: 'asc' } });
     for (const item of series) {
-      await prisma.taskSeries.update({
-        where: { id: item.id },
-        data: {
-          startLocalDate: addLocalDays(item.startLocalDate, -1),
-          effectiveFromLocalDate: addLocalDays(item.effectiveFromLocalDate, -1),
-        },
-      });
       const rows = await prisma.taskOccurrence.findMany({
         where: { seriesId: item.id },
         orderBy: { occurrenceKey: 'asc' },
@@ -1720,5 +1738,316 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     );
     expect(deniedReplay.status).toBeGreaterThanOrEqual(400);
     expect(deniedReplay.status).not.toBe(200);
+  });
+
+  it('applies FUTURE content from the original key and keeps exceptions, dates and other series', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '未来内容'));
+    const today = shanghaiToday();
+    const created = await createManualPlan(auth.cookies, student, [
+      {
+        name: '主规则',
+        subject: '语文',
+        standard: '读完一页',
+        repeatKind: 'DAILY',
+        startLocalDate: today,
+        ongoing: true,
+      },
+      {
+        name: '另一规则',
+        subject: '数学',
+        standard: '完成练习',
+        repeatKind: 'DAILY',
+        startLocalDate: today,
+        ongoing: true,
+      },
+    ]);
+    const planId = created.id;
+    const rows = await prisma.taskOccurrence.findMany({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { occurrenceKey: 'asc' },
+      include: { series: true },
+    });
+    const seriesId = rows.find((row) => rows.filter((item) => item.seriesId === row.seriesId).length > 3)?.seriesId;
+    const sameSeries = rows.filter((row) => row.seriesId === seriesId).sort((a, b) => a.occurrenceKey.localeCompare(b.occurrenceKey));
+    const otherSeries = rows.find((row) => row.seriesId !== seriesId);
+    expect(sameSeries.length).toBeGreaterThan(3);
+    expect(otherSeries).toBeTruthy();
+    const before = sameSeries[0]!;
+    const anchor = sameSeries[1]!;
+    const later = sameSeries[2]!;
+    const far = sameSeries[3]!;
+    const edited = await patchOccurrence(auth.cookies, student.id, later.id, {
+      name: '单次例外',
+      subject: later.subjectSnapshot,
+      standard: later.completionStandardSnapshot,
+      durationMinutes: later.durationMinutesSnapshot,
+      steps: JSON.parse(later.stepsSnapshotJson),
+      expectedVersion: later.version,
+    });
+    expect(edited.status).toBe(200);
+    const reverted = await patchOccurrence(auth.cookies, student.id, later.id, {
+      name: later.nameSnapshot,
+      subject: later.subjectSnapshot,
+      standard: later.completionStandardSnapshot,
+      durationMinutes: later.durationMinutesSnapshot,
+      steps: JSON.parse(later.stepsSnapshotJson),
+      expectedVersion: edited.body.version,
+    });
+    expect(reverted.status).toBe(200);
+    const farDate = addLocalDays(shanghaiToday(), 20);
+    const moved = await postReschedule(auth.cookies, student.id, far.id, {
+      scheduledLocalDate: farDate,
+      reason: '改期锚点外实例',
+      expectedVersion: far.version,
+    });
+    expect(moved.status).toBe(200);
+    const anchorDate = addLocalDays(shanghaiToday(), 15);
+    const movedAnchor = await postReschedule(auth.cookies, student.id, anchor.id, {
+      scheduledLocalDate: anchorDate,
+      reason: '改期锚点本身',
+      expectedVersion: anchor.version,
+    });
+    expect(movedAnchor.status).toBe(200);
+
+    const freshStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const series = await prisma.taskSeries.findUniqueOrThrow({ where: { id: seriesId! } });
+    const plan = await prisma.studyPlan.findUniqueOrThrow({ where: { id: planId } });
+    const liveAnchor = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: anchor.id } });
+    const versions = {
+      expectedStudentVersion: freshStudent.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: series.version,
+      expectedOccurrenceVersion: liveAnchor.version,
+    };
+    const proposal = {
+      kind: 'CONTENT',
+      name: '未来统一名',
+      subject: '语文',
+      standard: '按新课文完成',
+      durationMinutes: 25,
+      steps: ['先读新课文'],
+      reason: '统一后续内容',
+    };
+    const scheduleRejected = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, {
+      ...versions,
+      proposal: { kind: 'SCHEDULE', repeatKind: 'DAILY', weekdays: null, endLocalDate: null, ongoing: true, reason: '不应开放' },
+    });
+    expect(scheduleRejected.status).toBe(400);
+
+    const preview = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, { ...versions, proposal });
+    expect(preview.status).toBe(200);
+    expect(preview.body.cutoffOccurrenceKey).toBe(liveAnchor.occurrenceKey);
+    expect(preview.body.cutoffOccurrenceKey).not.toBe(liveAnchor.scheduledLocalDate);
+    expect(preview.body.anchor.scheduledLocalDate).toBe(anchorDate);
+    expect(preview.body.effects.modified.some((item: { id: string }) => item.id === liveAnchor.id)).toBe(true);
+    expect(preview.body.effects.preservedException.some((item: { id: string }) => item.id === later.id)).toBe(true);
+    expect(preview.body.effects.unchanged.some((item: { id: string }) => item.id === before.id)).toBe(true);
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: seriesId! } })).toBe(1);
+
+    const stale = await postFutureConfirm(auth.cookies, student.id, liveAnchor.id, {
+      ...versions,
+      proposal,
+      previewDigest: 'stale-digest-value-xx',
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('TASK_FUTURE_PREVIEW_STALE');
+
+    const confirmed = await postFutureConfirm(auth.cookies, student.id, liveAnchor.id, {
+      ...versions,
+      proposal,
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.plan.version).toBe(plan.version);
+    expect(confirmed.body.series.version).toBe(series.version + 1);
+    expect(confirmed.body.adjustmentId).toBeTruthy();
+
+    const afterRows = await prisma.taskOccurrence.findMany({ where: { seriesId } });
+    expect(afterRows.find((row) => row.id === before.id)?.nameSnapshot).toBe(before.nameSnapshot);
+    expect(afterRows.find((row) => row.id === liveAnchor.id)?.nameSnapshot).toBe('未来统一名');
+    expect(afterRows.find((row) => row.id === liveAnchor.id)?.scheduledLocalDate).toBe(anchorDate);
+    expect(afterRows.find((row) => row.id === liveAnchor.id)?.occurrenceKey).toBe(anchor.occurrenceKey);
+    expect(afterRows.find((row) => row.id === later.id)?.nameSnapshot).toBe(later.nameSnapshot);
+    expect(afterRows.find((row) => row.id === later.id)?.contentExceptionAdjustmentId).toBeTruthy();
+    expect(afterRows.find((row) => row.id === far.id)?.scheduledLocalDate).toBe(farDate);
+    expect(afterRows.find((row) => row.id === far.id)?.occurrenceKey).toBe(far.occurrenceKey);
+    expect(afterRows.find((row) => row.id === far.id)?.nameSnapshot).toBe('未来统一名');
+    expect(otherSeries && (await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: otherSeries.id } })).nameSnapshot).toBe(
+      otherSeries?.nameSnapshot,
+    );
+
+    const gap = afterRows.find((row) => row.occurrenceKey > liveAnchor.occurrenceKey && row.id !== later.id && row.id !== far.id);
+    if (gap) {
+      await prisma.taskOccurrence.delete({ where: { id: gap.id } });
+      const horizon = await agent()
+        .post(`/v1/students/${student.id}/task-horizon`)
+        .set(writeHeaders(auth.cookies))
+        .send({});
+      expect(horizon.status).toBe(200);
+      const regenerated = await prisma.taskOccurrence.findFirst({
+        where: { seriesId, occurrenceKey: gap.occurrenceKey },
+      });
+      expect(regenerated?.nameSnapshot).toBe('未来统一名');
+      expect(regenerated?.id).not.toBe(gap.id);
+    }
+
+    const afterHorizon = await prisma.taskOccurrence.findMany({ where: { seriesId } });
+    const secondAnchor = afterHorizon.find(
+      (row) =>
+        row.occurrenceKey > liveAnchor.occurrenceKey &&
+        row.id !== later.id &&
+        row.id !== far.id &&
+        row.contentExceptionAdjustmentId == null &&
+        row.status === 'PLANNED',
+    );
+    if (secondAnchor) {
+      const afterFirst = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: secondAnchor.id } });
+      const afterStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+      const afterSeries = await prisma.taskSeries.findUniqueOrThrow({ where: { id: seriesId! } });
+      const secondProposal = { ...proposal, name: '第二次切点名', reason: '更晚切点' };
+      const secondPreview = await postFuturePreview(auth.cookies, student.id, afterFirst.id, {
+        expectedStudentVersion: afterStudent.version,
+        expectedPlanVersion: plan.version,
+        expectedSeriesVersion: afterSeries.version,
+        expectedOccurrenceVersion: afterFirst.version,
+        proposal: secondProposal,
+      });
+      expect(secondPreview.status).toBe(200);
+      const second = await postFutureConfirm(auth.cookies, student.id, afterFirst.id, {
+        expectedStudentVersion: afterStudent.version,
+        expectedPlanVersion: plan.version,
+        expectedSeriesVersion: afterSeries.version,
+        expectedOccurrenceVersion: afterFirst.version,
+        proposal: secondProposal,
+        previewDigest: secondPreview.body.previewDigest,
+      });
+      expect(second.status).toBe(200);
+      const twice = await prisma.taskOccurrence.findMany({ where: { seriesId } });
+      expect(twice.find((row) => row.id === liveAnchor.id)?.nameSnapshot).toBe('未来统一名');
+      expect(twice.find((row) => row.id === afterFirst.id)?.nameSnapshot).toBe('第二次切点名');
+      expect(twice.find((row) => row.id === later.id)?.nameSnapshot).toBe(later.nameSnapshot);
+      const regenTarget = twice.find(
+        (row) =>
+          row.occurrenceKey > afterFirst.occurrenceKey &&
+          row.id !== later.id &&
+          row.id !== far.id &&
+          row.contentExceptionAdjustmentId == null &&
+          row.status === 'PLANNED',
+      );
+      if (regenTarget) {
+        await prisma.taskOccurrence.delete({ where: { id: regenTarget.id } });
+        const again = await agent()
+          .post(`/v1/students/${student.id}/task-horizon`)
+          .set(writeHeaders(auth.cookies))
+          .send({});
+        expect(again.status).toBe(200);
+        const regeneratedLater = await prisma.taskOccurrence.findFirst({
+          where: { seriesId, occurrenceKey: regenTarget.occurrenceKey },
+        });
+        expect(regeneratedLater?.nameSnapshot).toBe('第二次切点名');
+      }
+    }
+  });
+
+  it('keeps FUTURE preview/cancel/no-op/idempotency and refuses unauthorized replay', async () => {
+    const owner = await signIn();
+    const student = await setGrade(owner.cookies, await createStudent(owner.cookies, '未来幂等'));
+    const created = await previewAndImport(owner.cookies, student, { attested: true });
+    const planId = created.imported.body.id as string;
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const studentRow = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const plan = await prisma.studyPlan.findUniqueOrThrow({ where: { id: planId } });
+    const versions = {
+      expectedStudentVersion: studentRow.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: row.series.version,
+      expectedOccurrenceVersion: row.version,
+    };
+    const sameProposal = {
+      kind: 'CONTENT',
+      name: row.nameSnapshot,
+      subject: row.subjectSnapshot,
+      standard: row.completionStandardSnapshot,
+      durationMinutes: row.durationMinutesSnapshot,
+      steps: JSON.parse(row.stepsSnapshotJson),
+      reason: '无变化',
+    };
+    const preview = await postFuturePreview(owner.cookies, student.id, row.id, { ...versions, proposal: sameProposal });
+    expect(preview.status).toBe(200);
+    expect(preview.body.noOp).toBe(true);
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: row.seriesId } })).toBe(1);
+    const noOp = await postFutureConfirm(owner.cookies, student.id, row.id, {
+      ...versions,
+      proposal: sameProposal,
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(noOp.status).toBe(200);
+    expect(noOp.body.noOp).toBe(true);
+    expect(noOp.body.adjustmentId).toBeNull();
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: row.seriesId } })).toBe(1);
+
+    const changedProposal = { ...sameProposal, name: '第二次修订', reason: '再改一次' };
+    const nextStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const nextSeries = await prisma.taskSeries.findUniqueOrThrow({ where: { id: row.seriesId } });
+    const nextRow = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id } });
+    const nextVersions = {
+      expectedStudentVersion: nextStudent.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: nextSeries.version,
+      expectedOccurrenceVersion: nextRow.version,
+    };
+    const nextPreview = await postFuturePreview(owner.cookies, student.id, row.id, {
+      ...nextVersions,
+      proposal: changedProposal,
+    });
+    expect(nextPreview.status).toBe(200);
+    const key = randomUUID();
+    const first = await postFutureConfirm(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...nextVersions, proposal: changedProposal, previewDigest: nextPreview.body.previewDigest },
+      key,
+    );
+    expect(first.status).toBe(200);
+    const replay = await postFutureConfirm(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...nextVersions, proposal: changedProposal, previewDigest: nextPreview.body.previewDigest },
+      key,
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.body.adjustmentId).toBe(first.body.adjustmentId);
+    expect(await prisma.planAdjustment.count({ where: { seriesId: row.seriesId, reasonCode: 'SERIES_FUTURE_CONTENT_CHANGED' } })).toBe(1);
+    const conflict = await postFutureConfirm(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...nextVersions, proposal: { ...changedProposal, name: '异体' }, previewDigest: nextPreview.body.previewDigest },
+      key,
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
+
+    const consents = await agent().get(`/v1/students/${student.id}/consents`).set('Cookie', owner.cookies.header());
+    const current = consents.body.items.find((item: { current: boolean }) => item.current);
+    await agent()
+      .post(`/v1/students/${student.id}/consents/${current.id}/withdraw`)
+      .set(writeHeaders(owner.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    const denied = await postFutureConfirm(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...nextVersions, proposal: changedProposal, previewDigest: nextPreview.body.previewDigest },
+      key,
+    );
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(denied.status).not.toBe(200);
   });
 });
