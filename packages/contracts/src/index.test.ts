@@ -14,6 +14,8 @@ import {
   futureChangeConfirmSchema,
   futureChangePreviewSchema,
   rescheduleTaskSchema,
+  splitConfirmSchema,
+  splitPreviewSchema,
   taskHorizonSchema,
 } from './index.js';
 
@@ -34,6 +36,7 @@ describe('@studysteps/contracts export boundary', () => {
     expect(ERROR_CODES).toContain('TASK_DATE_CONFLICT');
     expect(ERROR_CODES).toContain('TASK_NOT_ADJUSTABLE');
     expect(ERROR_CODES).toContain('TASK_FUTURE_PREVIEW_STALE');
+    expect(ERROR_CODES).toContain('TASK_SPLIT_PREVIEW_STALE');
   });
 });
 
@@ -286,6 +289,36 @@ describe('request validation', () => {
       futureChangePreviewSchema.safeParse({
         ...preview,
         fromLocalDate: '2026-09-20',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts split preview and confirm and rejects co-creation or one child', () => {
+    const child = {
+      name: '朗读上',
+      subject: '语文',
+      standard: '读完前半',
+      durationMinutes: 10,
+      steps: ['先读'],
+      scheduledLocalDate: '2026-09-18',
+    };
+    const preview = {
+      expectedStudentVersion: 3,
+      expectedPlanVersion: 1,
+      expectedSeriesVersion: 1,
+      expectedOccurrenceVersion: 2,
+      children: [child, { ...child, name: '朗读下' }],
+      reason: '拆成两次完成',
+    };
+    expect(splitPreviewSchema.parse(preview).children).toHaveLength(2);
+    expect(splitConfirmSchema.parse({ ...preview, previewDigest: 'd'.repeat(16) }).reason).toBe('拆成两次完成');
+    expect(splitPreviewSchema.safeParse({ ...preview, children: [child] }).success).toBe(false);
+    expect(splitPreviewSchema.safeParse({ ...preview, coCreationAttested: true }).success).toBe(false);
+    expect(
+      splitConfirmSchema.safeParse({
+        ...preview,
+        previewDigest: 'd'.repeat(16),
+        studentConfirmedAt: '2026-09-18T00:00:00.000Z',
       }).success,
     ).toBe(false);
   });

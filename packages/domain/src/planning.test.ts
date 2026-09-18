@@ -12,6 +12,9 @@ import {
   canAdjustOccurrence,
   canAnchorFutureChange,
   canRescheduleOccurrence,
+  canSplitOccurrence,
+  normalizeSplitChildren,
+  splitChildDateErrors,
   classifyFutureContentEffect,
   classifyFutureScheduleEffect,
   contentFromRevision,
@@ -346,6 +349,58 @@ describe('STP 006 plan status transitions', () => {
         todayLocalDate: '2026-09-18',
       }),
     ).toBe(false);
+    expect(
+      canAnchorFutureChange({
+        planStatus: 'ACTIVE',
+        occurrenceStatus: 'PLANNED',
+        occurrenceKey: '2026-09-20',
+        scheduledLocalDate: '2026-09-20',
+        todayLocalDate: '2026-09-18',
+        sourceOccurrenceId: 'split-child',
+      }),
+    ).toBe(false);
+    expect(
+      canSplitOccurrence({
+        planStatus: 'ACTIVE',
+        occurrenceStatus: 'PLANNED',
+        scheduledLocalDate: '2026-09-18',
+        todayLocalDate: '2026-09-18',
+        sourceOccurrenceId: null,
+      }),
+    ).toBe(true);
+    expect(
+      canSplitOccurrence({
+        planStatus: 'ACTIVE',
+        occurrenceStatus: 'PLANNED',
+        scheduledLocalDate: '2026-09-17',
+        todayLocalDate: '2026-09-18',
+        sourceOccurrenceId: null,
+      }),
+    ).toBe(false);
+    expect(
+      canSplitOccurrence({
+        planStatus: 'ACTIVE',
+        occurrenceStatus: 'PLANNED',
+        scheduledLocalDate: '2026-09-18',
+        todayLocalDate: '2026-09-18',
+        sourceOccurrenceId: 'child-parent',
+      }),
+    ).toBe(false);
+    expect(
+      splitChildDateErrors(
+        normalizeSplitChildren([
+          {
+            name: ' 上 ',
+            subject: '语文',
+            standard: '前半',
+            durationMinutes: 10,
+            steps: [' 先读 '],
+            scheduledLocalDate: '2026-09-17',
+          },
+        ]),
+        '2026-09-18',
+      ),
+    ).toEqual({ 'children.0.scheduledLocalDate': 'past' });
     expect(
       classifyFutureContentEffect({
         occurrenceKey: '2026-09-20',

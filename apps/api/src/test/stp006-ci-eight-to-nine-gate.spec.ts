@@ -43,6 +43,7 @@ describe('STP 006 CI eight-to-nine upgrade fixture gate', () => {
     expect(() => gate.assertAllowed('stp004_identity')).toThrow(/refusing database/);
     expect(() => gate.assertAllowed('stp006_seven_to_eight')).toThrow(/refusing database/);
     expect(() => gate.assertAllowed('stp006_fresh')).toThrow(/refusing database/);
+    expect(() => gate.assertAllowed('stp006_nine_to_ten')).toThrow(/refusing database/);
     expect(() => gate.assertAllowed('studysteps')).toThrow(/refusing database/);
     expect(() => gate.assertAllowed(gate.FIXTURE_DATABASE)).not.toThrow();
     expect(gate.rewriteDb(dummyAdmin, gate.FIXTURE_DATABASE)).toMatch(/\/stp006_eight_to_nine$/);

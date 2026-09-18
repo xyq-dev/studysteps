@@ -2511,4 +2511,371 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     expect(different.status).toBe(409);
     expect(different.body.code).toBe('IDEMPOTENCY_CONFLICT');
   });
+
+  async function postSplitPreview(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+  ) {
+    return agent()
+      .post(`/v1/students/${studentId}/tasks/${occurrenceId}/split/preview`)
+      .set(writeHeaders(cookies))
+      .send(body);
+  }
+
+  async function postSplitConfirm(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ) {
+    return agent()
+      .post(`/v1/students/${studentId}/tasks/${occurrenceId}/split`)
+      .set(writeHeaders(cookies, idempotencyKey))
+      .send(body);
+  }
+
+  function splitChildrenFor(row: { nameSnapshot: string; subjectSnapshot: string; completionStandardSnapshot: string; scheduledLocalDate: string }, extra: Partial<{ date: string; name: string }> = {}) {
+    const date = extra.date ?? row.scheduledLocalDate;
+    return [
+      {
+        name: extra.name ?? `${row.nameSnapshot}上`,
+        subject: row.subjectSnapshot,
+        standard: '完成前半',
+        durationMinutes: 10,
+        steps: ['先做前半'],
+        scheduledLocalDate: date,
+      },
+      {
+        name: `${row.nameSnapshot}下`,
+        subject: row.subjectSnapshot,
+        standard: '完成后半',
+        durationMinutes: 10,
+        steps: ['再做后半'],
+        scheduledLocalDate: date,
+      },
+    ];
+  }
+
+  it('previews split without writing and confirms parent SPLIT with independent ONCE children', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, `拆分${randomUUID().slice(0, 6)}`));
+    const plan = await createManualPlan(auth.cookies, student, [
+      {
+        name: '朗读课文',
+        subject: '语文',
+        standard: '读完整篇',
+        durationMinutes: 20,
+        steps: ['先读'],
+        repeatKind: 'ONCE',
+        startLocalDate: shanghaiToday(),
+        endLocalDate: shanghaiToday(),
+        ongoing: false,
+      },
+    ]);
+    const parent = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const beforeCounts = await prisma.taskOccurrence.count({ where: { series: { planId: plan.id } } });
+    const versions = {
+      expectedStudentVersion: (await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } })).version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: parent.series.version,
+      expectedOccurrenceVersion: parent.version,
+    };
+    const children = splitChildrenFor(parent);
+    const preview = await postSplitPreview(auth.cookies, student.id, parent.id, { ...versions, children, reason: '拆成两次' });
+    expect(preview.status).toBe(200);
+    expect(preview.body.parent.id).toBe(parent.id);
+    expect(preview.body.parent.willCancelReason).toBe('SPLIT');
+    expect(preview.body.children).toHaveLength(2);
+    expect(preview.body.previewDigest).toBeTruthy();
+    expect(await prisma.taskOccurrence.count({ where: { series: { planId: plan.id } } })).toBe(beforeCounts);
+    expect(await prisma.planAdjustment.count({ where: { planId: plan.id, reasonCode: 'TASK_SPLIT' } })).toBe(0);
+
+    const confirmed = await postSplitConfirm(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children,
+      reason: '拆成两次',
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.parent.status).toBe('CANCELLED');
+    expect(confirmed.body.parent.cancelReason).toBe('SPLIT');
+    expect(confirmed.body.parent.id).toBe(parent.id);
+    expect(confirmed.body.parent.occurrenceKey).toBe(parent.occurrenceKey);
+    expect(confirmed.body.children).toHaveLength(2);
+    const storedParent = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } });
+    expect(storedParent.seriesId).toBe(parent.seriesId);
+    expect(storedParent.occurrenceKey).toBe(parent.occurrenceKey);
+    expect(storedParent.nameSnapshot).toBe(parent.nameSnapshot);
+    expect(storedParent.gradeLabelSnapshot).toBe(parent.gradeLabelSnapshot);
+    expect(storedParent.contentExceptionAdjustmentId).toBeNull();
+    const childRows = await prisma.taskOccurrence.findMany({ where: { sourceOccurrenceId: parent.id }, include: { series: { include: { revisions: true } } } });
+    expect(childRows).toHaveLength(2);
+    expect(childRows.every((row) => row.series.planId === plan.id)).toBe(true);
+    expect(childRows.every((row) => row.series.repeatKind === 'ONCE')).toBe(true);
+    expect(childRows.every((row) => row.series.revisions.some((rev) => rev.revisionNo === 1 && rev.changeKind === 'BASELINE'))).toBe(true);
+    expect(childRows.every((row) => row.contentRevisionNo === 1 && row.scheduleRevisionNo === 1)).toBe(true);
+    const listed = await agent().get(`/v1/students/${student.id}/tasks?date=${parent.scheduledLocalDate}`).set('Cookie', auth.cookies.header());
+    expect(listed.status).toBe(200);
+    expect(listed.body.items.some((item: { id: string }) => item.id === parent.id)).toBe(false);
+    expect(listed.body.items.filter((item: { sourceOccurrenceId: string | null }) => item.sourceOccurrenceId === parent.id)).toHaveLength(2);
+    expect(listed.body.items).toHaveLength(2);
+    const byId = await agent().get(`/v1/students/${student.id}/tasks/${parent.id}`).set('Cookie', auth.cookies.header());
+    expect(byId.status).toBe(200);
+    expect(byId.body.cancelReason).toBe('SPLIT');
+    expect(byId.body.executable).toBe(false);
+    expect(byId.body.splitChildren).toHaveLength(2);
+    const audit = await prisma.planAdjustment.findFirstOrThrow({ where: { id: confirmed.body.adjustmentId } });
+    expect(audit.reasonCode).toBe('TASK_SPLIT');
+    const payload = JSON.parse(audit.payloadJson) as { actorAccountId?: string; children?: unknown[] };
+    expect(payload.actorAccountId).toBeTruthy();
+    expect(payload.children).toHaveLength(2);
+    const planAfter = await prisma.studyPlan.findUniqueOrThrow({ where: { id: plan.id } });
+    expect(planAfter.version).toBe(plan.version);
+    expect(planAfter.studentConfirmedAt).toBeNull();
+    const horizon = await postHorizon(auth.cookies, student.id, {});
+    expect(horizon.status).toBe(200);
+    expect(await prisma.taskOccurrence.count({ where: { id: parent.id, status: 'PLANNED' } })).toBe(0);
+    expect(await prisma.taskOccurrence.count({ where: { sourceOccurrenceId: parent.id } })).toBe(2);
+
+    const child = childRows[0]!;
+    const childFuture = await postFuturePreview(auth.cookies, student.id, child.id, {
+      expectedStudentVersion: versions.expectedStudentVersion,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: child.series.version,
+      expectedOccurrenceVersion: child.version,
+      proposal: {
+        kind: 'CONTENT',
+        name: '不该改',
+        subject: '语文',
+        standard: '完成',
+        durationMinutes: 10,
+        steps: [],
+        reason: '子任务未来',
+      },
+    });
+    expect(childFuture.status).toBe(409);
+    expect(childFuture.body.code).toBe('TASK_NOT_ADJUSTABLE');
+    const childSplit = await postSplitPreview(auth.cookies, student.id, child.id, {
+      expectedStudentVersion: versions.expectedStudentVersion,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: child.series.version,
+      expectedOccurrenceVersion: child.version,
+      children,
+      reason: '再拆',
+    });
+    expect(childSplit.status).toBe(409);
+    expect(childSplit.body.code).toBe('TASK_NOT_ADJUSTABLE');
+    const edited = await patchOccurrence(auth.cookies, student.id, child.id, {
+      name: '子任务改名',
+      subject: child.subjectSnapshot,
+      standard: '完成前半',
+      durationMinutes: 10,
+      steps: ['先做前半'],
+      expectedVersion: child.version,
+    });
+    expect(edited.status).toBe(200);
+    expect(edited.body.name).toBe('子任务改名');
+    const moved = await postReschedule(auth.cookies, student.id, child.id, {
+      scheduledLocalDate: shanghaiToday() === child.scheduledLocalDate ? addLocalDays(child.scheduledLocalDate, 1) : shanghaiToday(),
+      reason: '子任务改期',
+      expectedVersion: edited.body.version,
+    });
+    expect(moved.status).toBe(200);
+    expect((await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } })).status).toBe('CANCELLED');
+    expect((await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } })).cancelReason).toBe('SPLIT');
+  });
+
+  it('rejects illegal split counts, past dates, stale preview and concurrent replay rules', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, `拆分拒${randomUUID().slice(0, 6)}`));
+    const plan = await createManualPlan(auth.cookies, student, [
+      {
+        name: '口算',
+        subject: '数学',
+        standard: '做完十题',
+        durationMinutes: 15,
+        steps: [],
+        repeatKind: 'ONCE',
+        startLocalDate: shanghaiToday(),
+        endLocalDate: shanghaiToday(),
+        ongoing: false,
+      },
+    ]);
+    const parent = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const versions = {
+      expectedStudentVersion: (await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } })).version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: parent.series.version,
+      expectedOccurrenceVersion: parent.version,
+    };
+    const oneChild = await postSplitPreview(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent).slice(0, 1),
+      reason: '一条不算拆分',
+    });
+    expect(oneChild.status).toBe(400);
+    const past = await postSplitPreview(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent, { date: '2020-01-01' }),
+      reason: '过去日期',
+    });
+    expect(past.status).toBe(400);
+    const preview = await postSplitPreview(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent),
+      reason: '合法拆分',
+    });
+    expect(preview.status).toBe(200);
+    const stale = await postSplitConfirm(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent),
+      reason: '合法拆分',
+      previewDigest: 'stale-digest-value-xx',
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('TASK_SPLIT_PREVIEW_STALE');
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } })).toMatchObject({
+      status: 'PLANNED',
+      cancelReason: null,
+    });
+    const oldVersion = await postSplitConfirm(auth.cookies, student.id, parent.id, {
+      ...versions,
+      expectedOccurrenceVersion: parent.version + 9,
+      children: splitChildrenFor(parent),
+      reason: '合法拆分',
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(oldVersion.status).toBe(409);
+    expect(oldVersion.body.code).toBe('VERSION_CONFLICT');
+    const key = randomUUID();
+    const first = await postSplitConfirm(
+      auth.cookies,
+      student.id,
+      parent.id,
+      { ...versions, children: splitChildrenFor(parent), reason: '合法拆分', previewDigest: preview.body.previewDigest },
+      key,
+    );
+    expect(first.status).toBe(200);
+    const replay = await postSplitConfirm(
+      auth.cookies,
+      student.id,
+      parent.id,
+      { ...versions, children: splitChildrenFor(parent), reason: '合法拆分', previewDigest: preview.body.previewDigest },
+      key,
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.body.adjustmentId).toBe(first.body.adjustmentId);
+    const different = await postSplitConfirm(
+      auth.cookies,
+      student.id,
+      parent.id,
+      { ...versions, children: splitChildrenFor(parent), reason: '异体拆分', previewDigest: preview.body.previewDigest },
+      key,
+    );
+    expect(different.status).toBe(409);
+    expect(different.body.code).toBe('IDEMPOTENCY_CONFLICT');
+    const again = await postSplitConfirm(auth.cookies, student.id, parent.id, {
+      ...versions,
+      expectedOccurrenceVersion: first.body.parent.version,
+      children: splitChildrenFor(parent),
+      reason: '再次拆分',
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe('TASK_NOT_ADJUSTABLE');
+    expect(await prisma.taskOccurrence.count({ where: { sourceOccurrenceId: parent.id } })).toBe(2);
+  });
+
+  it('keeps SPLIT parents cancelled through pause/resume and future schedule restore', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, `拆分停${randomUUID().slice(0, 6)}`));
+    const imported = await previewAndImport(auth.cookies, student);
+    expect(imported.imported.status).toBe(201);
+    const planId = imported.imported.body.id as string;
+    const parent = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const studentRow = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const versions = {
+      expectedStudentVersion: studentRow.version,
+      expectedPlanVersion: imported.imported.body.version as number,
+      expectedSeriesVersion: parent.series.version,
+      expectedOccurrenceVersion: parent.version,
+    };
+    const preview = await postSplitPreview(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent),
+      reason: '先拆再暂停',
+    });
+    expect(preview.status).toBe(200);
+    const confirmed = await postSplitConfirm(auth.cookies, student.id, parent.id, {
+      ...versions,
+      children: splitChildrenFor(parent),
+      reason: '先拆再暂停',
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(confirmed.status).toBe(200);
+    const paused = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'PAUSE',
+      expectedVersion: imported.imported.body.version,
+    });
+    expect(paused.status).toBe(200);
+    const afterPause = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } });
+    expect(afterPause.cancelReason).toBe('SPLIT');
+    const resumed = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'RESUME',
+      expectedVersion: paused.body.version,
+    });
+    expect(resumed.status).toBe(200);
+    const afterResume = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } });
+    expect(afterResume.status).toBe('CANCELLED');
+    expect(afterResume.cancelReason).toBe('SPLIT');
+    const sibling = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { seriesId: parent.seriesId, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const schedulePreview = await postFuturePreview(auth.cookies, student.id, sibling.id, {
+      expectedStudentVersion: studentRow.version,
+      expectedPlanVersion: resumed.body.version,
+      expectedSeriesVersion: sibling.series.version,
+      expectedOccurrenceVersion: sibling.version,
+      proposal: {
+        kind: 'SCHEDULE',
+        repeatKind: 'DAILY',
+        weekdays: null,
+        endLocalDate: null,
+        ongoing: true,
+        reason: '不复活拆分父',
+      },
+    });
+    if (schedulePreview.status === 200) {
+      const scheduleConfirm = await postFutureConfirm(auth.cookies, student.id, sibling.id, {
+        expectedStudentVersion: studentRow.version,
+        expectedPlanVersion: resumed.body.version,
+        expectedSeriesVersion: sibling.series.version,
+        expectedOccurrenceVersion: sibling.version,
+        proposal: {
+          kind: 'SCHEDULE',
+          repeatKind: 'DAILY',
+          weekdays: null,
+          endLocalDate: null,
+          ongoing: true,
+          reason: '不复活拆分父',
+        },
+        previewDigest: schedulePreview.body.previewDigest,
+      });
+      expect([200, 409]).toContain(scheduleConfirm.status);
+    }
+    expect((await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } })).cancelReason).toBe('SPLIT');
+  });
 });

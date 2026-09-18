@@ -587,6 +587,7 @@ model TaskOccurrence {
   @@unique([seriesId, occurrenceKey])
   @@unique([seriesId, scheduledLocalDate])
   @@index([scheduledLocalDate])
+  @@index([sourceOccurrenceId])
   @@index([seriesId, contentRevisionNo])
   @@index([seriesId, scheduleRevisionNo])
   @@index([contentExceptionAdjustmentId])

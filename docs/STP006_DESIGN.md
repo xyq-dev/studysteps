@@ -4,6 +4,8 @@
 
 工作区事实（2026-09-18 本次及未来定稿核验）：`main` = `origin/main`，HEAD `9703303edbcde6d32940bbc805a83a08c939bb4b`（报告基线 `main@9703303`）。工作区另有 `docs/handoffs/STP004_PG_ISOLATION.md` 的既有本地 PID 变化；该文件不属于本设计，不得纳入后续范围编辑提交。
 
+工作区事实（2026-09-18 单次拆分定稿核验）：`main` = `origin/main`，HEAD `beddf9b42db9573f701d97f5613088770c8aac88`（报告基线 `main@beddf9b`）。006-A／006-B 已落地。`STP004_PG_ISOLATION.md` 的本地 PID 变化仍不属于本设计，不得纳入后续拆分实现提交。
+
 2026-09-17 权限与政策三项已定稿（第 11 节）：监护人协助创建、同意覆盖证据、任务生成窗口。先前「推荐决定」升格为约束。STP 006 **第一批已授权并本地实施**；整个阶段未完成。
 
 ## 1. 范围
@@ -94,7 +96,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 - **14 天闭区间（确认事务与后续 horizon POST 相同）：** 令 `today` = 锁内读取的服务器时间映射到学生时区后的本地日历日。`from = today`（含），`to = today + 13 个日历日`（含），再与规则 `endLocalDate` 取较早者。共最多 14 个本地日；不含 `today - 1`，不含 `today + 14`。`ongoing=true` 且无结束日时只截到 `to`。暂停期间不生成；恢复后从恢复日起向前看，**不补**暂停缺口。
 - **去重键**必须同时包含规则／条目身份和原始本地日期，不能仅靠日期：`UNIQUE (task_series_id, occurrence_key)`，其中 `occurrence_key` = 该 `TaskSeries`（一条规则／模板条目）**最初安排**的本地日 `YYYY-MM-DD`。同一天两条练习必须两条 series，不得靠日期全局唯一。
 - 改期只改 `scheduledLocalDate`；`id`、`originalLocalDate`、`occurrence_key`、`task_series_id` 不变。`TASK_DATE_CONFLICT`（409）只针对**同一 `TaskSeries`** 已有另一实例占用该实际安排日，禁止覆盖或合并这两行。实际安排日不是 `occurrence_key`，也不是全局唯一键；不同规则／不同系列可以同日并存，horizon 仍按原始 key 去重。这是 4.2／4.3「同规则已有安排日」的既定限制，不是任意任务同日禁止。
-- 写入口仅：确认事务、显式 `POST .../task-horizon`、单次改期、future-change，以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态。已取消 key 默认不复活，只有两项明确例外：恢复计划可把安排日 ≥ 今日、因暂停取消且无完成记录的同行从 `CANCELLED/PLAN_PAUSED` 拉回 `PLANNED`；第 15 节排期修订可把重新命中的同行从 `CANCELLED/SERIES_RULE_REMOVED` 拉回 `PLANNED`。二者都不新建第二行，其他取消原因永不复活。
+- 写入口仅：确认事务、显式 `POST .../task-horizon`、单次改期、future-change、第 16 节拆分确认，以及后续批次在同一 POST 上的 Outbox 工人。`GET .../tasks` **零 INSERT／零补齐**。冲突视为已存在，不改写已有行的快照与状态。已取消 key 默认不复活，只有两项明确例外：恢复计划可把安排日 ≥ 今日、因暂停取消且无完成记录的同行从 `CANCELLED/PLAN_PAUSED` 拉回 `PLANNED`；第 15 节排期修订可把重新命中的同行从 `CANCELLED/SERIES_RULE_REMOVED` 拉回 `PLANNED`。二者都不新建第二行，其他取消原因（含 `SPLIT`）永不复活。
 
 ### 4.3 修改／暂停／结束对已生成任务
 
@@ -106,7 +108,7 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 从选中实例起未来 | 保持 series id，按该实例 `occurrence_key`（含）追加分维度修订；只协调允许变化的未来实例，保护显式单次例外 | 不改 | 不改 |
 | 暂停 | 未来 `PLANNED` → `CANCELLED`／`PLAN_PAUSED` | 不改 | 不改 |
 | 归档 | 同暂停，且计划 `ARCHIVED`，不再滚动生成 | 不删行 | 不改 |
-| 拆分 | 原实例 `CANCELLED`／`SPLIT`，新实例 `sourceOccurrenceId` 指向原 `id` | 原完成不得再算一次（STP 007 约束，表结构本任务预留） | 不改 |
+| 拆分 | 见第 16 节。父实例 `status=CANCELLED` 且 `cancel_reason=SPLIT`（`SPLIT` 不是独立 status）；每个子任务是同计划下新建的 `ONCE` `TaskSeries`＋一个实例，`sourceOccurrenceId` 指向父 `id`。不改父 series 规则，不把子任务写进父 series | 父任务不得再计完成或进入分母（STP 007 必须遵守；本阶段只定列表口径） | 父快照不改 |
 
 改期撞上同规则已有安排日：提示两项安排，由用户保留或取消其一，**禁止自动覆盖**。
 
@@ -247,8 +249,8 @@ P0 重复：`ONCE`、`DAILY`、`WEEKLY_DAYS`（ISO 星期 1–7 的非空子集�
 | 批 | 内容 | 退出 |
 | --- | --- | --- |
 | **A 最小闭环（第一批，不扩展）** | 第七条迁移；preview／import 真写入；GET plans／plan／tasks（只读）；学生 S07 入口；S03 确认／取消；S05／S08／S04 只读；确认事务内生成 14 天；`POST .../task-horizon` 端点（供窗口外补齐与 T06-P-UNIQ，无工人）；T06-P-*（含 ORIGIN）、T03 生成、T02-D-OCC、T11-3／CON-3 的**计划写** | 闭环可点；无完成；无新同意文档、无重新同意页 |
-| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（已落地）；单次改期（已落地）；仅本次内容编辑（已落地）；FUTURE 范围编辑按第 15 节再拆 A／B；S12 最小（后延） | 仅本次内容可点；未来规则／拆分／工人未做 |
-| C | 拆分；Outbox 工人调用同一 `task-horizon` POST（不经 GET）；S09 只读细节打磨 | TASKS 所列后台任务入口 |
+| B | S06 手动 `POST /plans` 最小闭环（已落地）；暂停／恢复／归档（已落地）；按需 `task-horizon` POST（已落地）；单次改期（已落地）；仅本次内容编辑（已落地）；FUTURE 范围编辑按第 15 节 A／B（已落地）；S12 未来编辑已随 A／B 落到实例入口 | 仅本次＋未来规则可点；拆分／工人未做 |
+| C | **单次拆分**按第 16 节（**本轮只定稿，未实现**）。Outbox 工人与 S09 细节仍后延，不与拆分绑成同一实现批 | 拆分实现后才能标 C 的拆分退出；工人另开 |
 
 A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不是 P1。
 
@@ -344,7 +346,7 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 第一批功能范围已固定。B04 正式文案／经营主体仍是上线前置，不阻塞隔离开发。生产告知不得用 test-v2 冒充。
 
-后续实现仍开放：第 15 节已定稿的未来规则编辑 A／B、拆分、Outbox 工人。仅本次内容编辑见 §3.8。单次改期见 §3.7。按需 `task-horizon` 见 §3.6。暂停／恢复／归档见 §3.5。打卡、计时、通知、运营发布不在本 STP。
+后续实现仍开放：第 16 节已定稿的单次拆分、Outbox 工人。第 15 节 A／B、仅本次内容、单次改期、按需 `task-horizon`、暂停／恢复／归档已落地。打卡、计时、通知、运营发布不在本 STP。完成过程中“未达标准再拆成后续任务”属 STP 007，不是第 16 节。
 
 ### 3.4 S06 空白创建（第二批最小）
 
@@ -436,8 +438,8 @@ A 未完成不得声称 STP 006 退出门槛已过。B／C 仍属 STP 006，不�
 
 | 项 | 状态 |
 | --- | --- |
-| 本设计 | 11.1–11.3 与第 15 节已定稿；§3.5 状态转换已记录 |
-| Schema／代码／迁移／隔离 test-v2 | 第一批＋S06＋暂停／恢复／归档＋horizon＋单次改期＋仅本次内容已落地；第八条只增加 occurrence version；第 15 节未来范围编辑仍未实现，整个阶段未完成 |
+| 本设计 | 11.1–11.3、第 15 节与第 16 节已定稿；拆分尚未实现 |
+| Schema／代码／迁移／隔离 test-v2 | 第一批＋S06＋暂停／恢复／归档＋horizon＋单次改期＋仅本次内容＋006-A／006-B 已落地；拆分待第十条后实现，整个阶段未完成 |
 | STP 005 | 两页面阻塞已关闭；产品验收未完成（不变） |
 | STP 004 | 进行中（不变） |
 | 打卡／计时／通知／发布 | 不在本任务 |
@@ -619,3 +621,184 @@ confirm 复用 `acquireLocks` 的完整统一顺序，不另造锁序：
 ### 15.10 仍存在的具体边界
 
 架构上无待 Cursor 选择的分叉。唯一已知产品限制是：新排期若撞到同 series 的终态、已取消或其他不可调整实例，系统只能在预览列出并以 `TASK_DATE_CONFLICT` 拒绝；本阶段不新增删除、强制取消或覆盖入口。可调整实例可先用现有单次改期解除冲突。该限制是显式阻塞，不得通过忽略唯一约束、改 occurrence key、自动换日或影响同计划其他规则来绕过。
+
+## 16. 单次任务拆分定稿（2026-09-18）
+
+本节基于 `main@beddf9b42db9573f701d97f5613088770c8aac88` 及当前九条迁移定稿，是后续实现的**唯一方案**。若前文把拆分写成 `CANCELLED`／`SPLIT` 状态或“新实例仍留在原 series”，以本节为准。不改写迁移 1–9 或 `test-v2`。不实现合并、批量拆分、递归任务树、worker／Outbox、打卡、积分、连续天数或计时。
+
+原文有两种“拆分”，不得混用：
+
+| 含义 | 出处 | 归属 |
+| --- | --- | --- |
+| 规划调整：把**尚未开始的一条实例**拆成多条可独立执行的后续实例 | `PROJECT_PLAN` §6.1 S12、§9.2 | **本节／STP 006-C** |
+| 完成过程：未达标准时记录部分进度，或再拆成后续任务 | `PROJECT_PLAN` §6.4、§9.3 | STP 007，本节不做 |
+| 任务卡片上的 `steps` | 单实例内最多 12 条勾选步骤 | 已有字段。编辑步骤列表**不是**拆分，也不算本节已完成 |
+
+### 16.1 最小产品范围
+
+只拆**选中的那一条** `TaskOccurrence`。不修改父 `TaskSeries` 的 CONTENT／SCHEDULE 修订，也不改以后由该规则 horizon 生成的其他日期。一层拆分：子任务不能再拆，父任务也不能再拆。
+
+| 项 | 定稿 |
+| --- | --- |
+| 可拆状态 | 仅 `StudyPlan.status=ACTIVE` 且锚点 `status=PLANNED`。`IN_PROGRESS`／`COMPLETED`／`SKIPPED`／`CANCELLED`（含已 `SPLIT`）→ `409 TASK_NOT_ADJUSTABLE` |
+| 过去任务 | **不允许。** 锁内学生时区今日须满足 `scheduledLocalDate >= today`。`occurrenceKey` 可以早于今日（锚点已改期到未来时仍可拆这条实际未开始的实例） |
+| 子任务数量 | **2–8**。1 条拒绝（不是拆分）；超过 8 条拒绝 |
+| 必填 | 每条子任务完整内容包：`name` 1–64、`subject` 1–32、`standard` 1–240、`scheduledLocalDate`（合法本地日）、`steps` 最多 12 条每条 1–120（可 `[]`）；整次拆分 `reason` 1–120。表单可预填父快照，提交必须是完整包 |
+| 预计时长 | 每子任务 `durationMinutes` 为正整数 ≤ 1440 或 `null`。不要求与父时长之和相等；预览可展示父时长与子时长合计，**不**作为阻塞 |
+| 完成标准 | 每子任务各自必填；不自动把父标准拆成子标准。STP 007 按子任务各自标准打卡 |
+| 子任务日期 | 均 `>= today`。允许与父实际日相同，允许彼此相同（见 16.2）。不允许早于今日，不截断到 14 天窗口或父规则结束日 |
+
+入口在已生成实例上（S09／S05 任务卡 → S12 调整），与“仅本次／本次及未来”并列，文案必须写“拆成多条任务”，不能写成“编辑步骤”。
+
+### 16.2 唯一数据方案：父行保留＋每子任务一条新 ONCE 规则
+
+**不把子任务插入父 `TaskSeries`。** 现网约束同时要求：
+
+- `occurrence_key = original_local_date` 且必须是合法本地日（第七／九条 CHECK）
+- `UNIQUE (series_id, occurrence_key)`
+- `UNIQUE (series_id, scheduled_local_date)`（第九条；**含** `CANCELLED` 行）
+
+若子任务留在父 series：父行仍占用原 key 与原实际日；子任务既不能复用它们，也不能用 `2026-09-18#1` 这类伪造 key。若给子任务另选日期，会占用父规则的 key 空间，horizon／SCHEDULE 恢复会把子任务误当成“那一天的原规则实例”。弱化唯一约束、伪造日期或改写父 `occurrenceKey` 均禁止。
+
+因此子任务必须是**同计划下的新规则**。不同 series 同日本来就允许（“同一天两次练习必须两条规则”）。这不是用换 series id 改写历史，父行仍留在原 series、原 key。
+
+固定落库：
+
+1. **父实例**：保持 `id`、`series_id`、`occurrence_key`、`originalLocalDate`、`scheduledLocalDate`、年级／正文快照、例外指针、来源。`status=CANCELLED`，`cancel_reason=SPLIT`，`version` +1。不物理删除。`executable=false`。
+2. **每个子任务**：新建一条 `TaskSeries`（`repeatKind=ONCE`，`startLocalDate=endLocalDate=该子 scheduledLocalDate`，`ongoing=false`）及其 `BASELINE` revision 1；再插入恰好一行 `TaskOccurrence`：`occurrenceKey=originalLocalDate=scheduledLocalDate=该子日期`，`sourceOccurrenceId=父.id`，正文取提交的子内容包，revision 指针为 1，无例外指针。
+3. **审计**：一条不可变 `PlanAdjustment`，`reason_code=TASK_SPLIT`，`plan_id`／父 `series_id`／父 `occurrence_id`；payload 含规范化子任务列表（名称、科目、标准、时长、步骤、日期）、父 key／实际日、操作者。确认时在进程内生成子 series／occurrence UUID 后**一次写入** payload，不事后 UPDATE。
+4. **计划历史字段**：不改 `origin`、`created_by_*`、`student_confirmed_at`、共同制定字段。请求 schema 拒绝 `coCreationAttested`／`studentConfirmedAt`／`origin`／`createdBy*`。
+
+身份与去重：
+
+| 对象 | 系列归属 | 去重键 | 为何 horizon 不会重生／重复 |
+| --- | --- | --- | --- |
+| 父 | 原 `TaskSeries` 不变 | 原 `(series_id, occurrence_key)` 仍在 | 父 key 已存在则不 INSERT；`cancel_reason=SPLIT` 不是 `SERIES_RULE_REMOVED`，15.4／现网 restore **不得**复活 |
+| 子 | 新 `ONCE` series，`plan_id` 与父相同 | 新 `(child_series_id, child_date)` | 确认事务已插入该 key；之后 horizon 对 ONCE 只找这一天，命中则跳过。禁止对子任务做 FUTURE SCHEDULE，避免把拆分子规则扩成每天／每周 |
+
+`sourceOccurrenceId` 第七条已预留。本阶段仍须第十条补齐归属约束，见 16.7。跨学生／跨计划不得只靠应用层。
+
+### 16.3 父任务展示、统计与 STP 007 边界
+
+`GET .../tasks` 继续排除 `CANCELLED`。拆分成功后，父任务从 S04／S05 日列表消失，同分母不再计入父任务；子任务以独立 `PLANNED` 行出现在各自 `scheduledLocalDate`。这不是隐藏父历史：父行仍在库中，S08 计划详情／S09 若按 id 读取须展示“已拆分”及子任务摘要，不提供对父任务的完成、改期、内容编辑或再次拆分。
+
+`executable` 仍仅 `plan ACTIVE && status PLANNED`。父为 false；子在计划 ACTIVE 时为 true。
+
+S08 规则列表会多出若干 ONCE series。页面**不得**把它们展示成用户新创建的长期规则：凡 series 下存在 `sourceOccurrenceId != null` 的实例，归入“拆分自 [父名称／原安排日]”，日历仍按子任务日期显示。不得为显示方便再复制一套规则。
+
+计数口径（本阶段列表；STP 007 必须沿用）：
+
+- 某日待完成／总数：只计该日 `scheduledLocalDate` 且 status 非 `CANCELLED` 的实例。
+- 父 `SPLIT` 不计待完成、不计已完成、不计分母。
+- 子任务各计 1。完成一条子任务不等于完成父任务；不存在“父进度 = 子完成比例”的聚合完成本阶段也不做。
+- 计划 `occurrenceCount` 若仍含取消行，H5 不得用它当今日进度。
+
+STP 007 接口边界（本轮不实现）：只允许对 `PLANNED`／`IN_PROGRESS` 且 `sourceOccurrenceId` 可空可非空的**可执行**实例写完成／补记／计时；对 `cancel_reason=SPLIT` 的父行任何完成／撤销完成都必须拒绝。不在本节实现积分、连续天数或会话。
+
+### 16.4 快照、权限与撤销
+
+子任务年级快照按 **T02-D-OCC 新行口径**：锁内重读当前合法档案教育后写入；父行快照一字不改。教育不完整或学习访问不允许 → 预览／确认均 `LEARNING_ACCESS_BLOCKED`，不写拆分。时区快照用当前档案时区。正文快照用子任务提交值，不把父例外指针复制到子行。
+
+操作者写入 `TASK_SPLIT` payload 的 `actorAccountId`（Guardian 为当前 Account；学生会话为签发 Account，与现网改期一致）。不写 `studentConfirmedAt`。共同制定约定**不适用于**拆分，与 §3.5／§3.7／§15 编辑相同。
+
+权限：对象级 `TASK_ADJUST`、当前必要同意、合法教育。Guardian 预览与确认都要 5 分钟 step-up，锁后用数据库 `clock_timestamp()` 复验。CSRF／Origin、幂等、统一锁序、成功才 heartbeat，失败不触碰 heartbeat。
+
+**本阶段不支持撤销拆分。** 误操作靠预览／取消避免：取消或返回编辑零业务写；有校验错误不提供“强行拆分”。确认后：
+
+- 子任务可走既有仅本次内容编辑、仅本次改期；不改变父行。
+- 子任务随计划暂停／归档被取消时，父行保持 `SPLIT`，**不**恢复为 `PLANNED`。
+- 不提供删除子任务、合并回父任务或“撤销拆分”入口。
+
+### 16.5 与已有功能的联动（只此表）
+
+| 既有能力 | 定稿 |
+| --- | --- |
+| 父已有内容／日程例外 | 允许拆分。父例外指针与快照留在父行。子任务预填可见父快照，落库用提交包，子行例外指针为空 |
+| 子任务仅本次内容／改期 | **允许**，走现有 PATCH／reschedule；乐观锁为子实例 version。改期仍受该**子 series** 的 `UNIQUE(scheduled_local_date)` 约束（该 series 只有一行，通常不撞自己） |
+| 子任务 FUTURE 内容／排期 | **禁止**，`409 TASK_NOT_ADJUSTABLE`。防止把拆分出来的 ONCE 扩成重复规则或生成无 `sourceOccurrenceId` 的新行 |
+| 子任务再次拆分 | **禁止**（一层） |
+| 暂停 | 子任务若仍 `PLANNED` 且安排日 ≥ 今日 → `CANCELLED/PLAN_PAUSED`。父已是 `SPLIT`，不改写原因 |
+| 恢复 | 只拉回 `PLAN_PAUSED`；`SPLIT` 父行不复活。被暂停的子任务可拉回 |
+| 归档 | 同暂停口径用 `PLAN_ARCHIVED`；已 `SPLIT` 父行不改原因。归档后不可拆 |
+| 原 series CONTENT 未来编辑 | 只协调父 series 上仍合格的 `PLANNED` 行。父已取消，不改正文。子 series 不在影响集 |
+| 原 series SCHEDULE 未来编辑 | 父 `SPLIT` 与 `USER_CANCELLED` 相同：不改存在性、不恢复、不把取消原因改成 `SERIES_RULE_REMOVED`。父 key 仍占位，不得再 INSERT 同一 key |
+| horizon | 不重生父任务；不重复插子任务。不得为“补齐拆分”另写生成器 |
+| 同系列撞日 | 父 series 约束不变。子任务因新 series，**不**与父或其他规则做 `TASK_DATE_CONFLICT` |
+| 不同系列同日 | 允许，包括子与父实际日相同、子与子同一天 |
+
+### 16.6 接口、事务、交互与竞争
+
+只使用学生作用域路径，不另开 `/v1/plans/:planId/...` 竞争方案：
+
+| 方法／路径 | 请求 | 成功响应 |
+| --- | --- | --- |
+| `POST /v1/students/:studentId/tasks/:occurrenceId/split/preview` | `expectedStudentVersion`、`expectedPlanVersion`、`expectedSeriesVersion`、`expectedOccurrenceVersion`、`children`（2–8 条完整包）、`reason` | 200：父任务（id／key／实际日／快照会取消）、将新增的子任务、将离开日列表的父、不阻塞冲突、`previewDigest` |
+| `POST /v1/students/:studentId/tasks/:occurrenceId/split` | preview 原请求＋`previewDigest`；`Idempotency-Key` | 200：父新 version、子 series／occurrence id、审计 id |
+
+校验失败用 `400 VALIDATION_ERROR`（条数、字段长度、子日期非法）。资格失败：`409 TASK_NOT_ADJUSTABLE` 或 `PLAN_STATUS_INVALID`。版本：`409 VERSION_CONFLICT`。预览后父内容／日期／状态／例外／计划状态／本地日界变化而显式版本仍碰巧相同：`409 TASK_SPLIT_PREVIEW_STALE`。同键异体：`409 IDEMPOTENCY_CONFLICT`。猜他人 occurrence：`404` 同形。
+
+乐观锁：确认成功递增**父 occurrence version**；**不**递增 `StudyPlan.version`，**不**递增父 `TaskSeries.version`（规则未改）。计划状态操作仍靠 plan version 与本操作经 plan 行锁串行。
+
+`previewDigest` 至少覆盖：student／plan／父 series／父 occurrence 的 id 与版本、父 key／实际日／状态／取消原因／例外指针、规范化 children＋reason、锁内时区与 today。确认锁内重算，不信任预览列表。
+
+交互：拆分入口 → 填写子任务 → 预览父子变化 → 确认。预览零 INSERT／UPDATE。页面取消不发确认。有错误时不提供覆盖父任务或删除撞日子任务的按钮。提交中禁用按钮；失败保留输入；陈旧预览必须重新预览。成功后重读日程：父消失、子出现，不自动 POST horizon。
+
+事务：父取消、N 条 series＋BASELINE＋occurrence、一条 `TASK_SPLIT`、幂等完成必须同一事务；失败全部回滚，不得留下“父已 SPLIT 但子不全”或“有子而父仍 PLANNED”。重放仍检查当前 `TASK_ADJUST` 与同意。
+
+锁序复用现网，不另造：
+
+`Idempotency → … → DeviceSession → StudyPlan → TaskSeries（已有，id 升序）→ TaskOccurrence（已有，id 升序）`。
+
+新子 series／行在持有父 plan／父 series／父实例锁之后插入。拆分确认还须锁父 series 上的 siblings（与 future-change 相同），以便与同 series 的 FUTURE／horizon／改期串行。
+
+竞争结果：
+
+| 先发生 | 后发生 | 结果 |
+| --- | --- | --- |
+| 拆分确认 | 再次拆同一父 | `TASK_NOT_ADJUSTABLE`；幂等同键同体除外 |
+| 拆分 | 对父做仅本次编辑／改期／FUTURE | 父已非 `PLANNED` → `TASK_NOT_ADJUSTABLE` |
+| 仅本次／改期／FUTURE 先改父 | 拆分 | 版本或 digest 失败；或仍 PLANNED 则按新快照拆 |
+| 拆分 | horizon | 父 key 已在，不 INSERT；子 key 已在，不重复 |
+| horizon／FUTURE 先 | 拆分 | 经 series 锁看到最新状态；父若已被 `SERIES_RULE_REMOVED` 等取消则不可拆 |
+| 暂停／归档先 | 拆分 | `PLAN_STATUS_INVALID` |
+| 拆分先 | 暂停／归档 | 子任务按 §3.5 取消；父保持 `SPLIT` |
+| 同意／会话撤销先 | 确认或重放 | 拒绝；不得把成功体交给失权主体 |
+| 双确认同一父 | 行锁串行；其一成功，另一幂等或不可调 | |
+
+真实并发测试必须用独立连接和 `pg_blocking_pids` 证明等待，不得用 mock 锁。
+
+### 16.7 第十条迁移（本轮不创建、不执行）
+
+九条与 `test-v2` 不改写。`source_occurrence_id` 已存在但**不够**：全局自引用 FK 不能保证同计划，也没有一层限制或不可变。实现拆分前必须加第十条，缺结构时先回报，不得靠应用层顶替，也不得改 1–9。
+
+第十条最小结构：
+
+1. `INDEX task_occurrences_source_occurrence_id_idx (source_occurrence_id)`。
+2. 触发器（AFTER INSERT／UPDATE）：若 `source_occurrence_id` 非空，则父行存在；父 `source_occurrence_id IS NULL`（一层）；父与子的 `task_series.plan_id` 相同（从而同一学生）；禁止自指。
+3. `source_occurrence_id` 只许 `NULL → 非空`，之后不可改、不可清空（对标例外指针）。
+4. CHECK：`cancel_reason IS NULL` 或属于现网已用值并**加上** `SPLIT`（`PLAN_PAUSED`／`PLAN_ARCHIVED`／`SERIES_RULE_REMOVED`／`USER_CANCELLED`／`SPLIT`）。现网该列无 CHECK，本条补齐时不得把历史非法值静默改写；升级前扫描，有脏值则失败。
+5. 不新增第十张业务表，不改 `occurrence_key` 形状，不加跨 series 的日期唯一。
+
+兼容：当前生产／夹具 `source_occurrence_id` 全空，九→十是合法非空升级（新列约束不回填业务行）。历史夹具保持原上界：七→八仍停八，八→九仍停九；新增 `stp006_nine_to_ten` 只验证九→十。回滚：有拆分数据后禁 drop；前滚仅约束／索引。原库与污染库只读。
+
+### 16.8 验收矩阵（实现批，本轮不跑）
+
+| 组 | 必须证明 |
+| --- | --- |
+| HAPPY | 真实预览零写；取消后库不变；确认后父 `CANCELLED/SPLIT` 且身份不变；2–8 子任务各有新 ONCE series；刷新 GET 父不在日列表、子在；再次 horizon 无重复、父不复活 |
+| COUNT | 父离开分母；同日子任务各计 1；步骤列表编辑不是拆分 |
+| SNAPSHOT | 父年级／正文／例外不变；子用锁内当前教育；操作者在 `TASK_SPLIT`；无 `studentConfirmedAt` 伪造 |
+| IDEM／STALE | 同键同体一次；异体 409；重复拆非幂等键 → 不可调；父 version 冲突；陈旧 digest；预览后暂停／撤权拒绝且无部分子行 |
+| LINKAGE | 父带内容／日程例外仍可拆；子可仅本次编辑与改期；子 FUTURE／再拆拒绝；父 series SCHEDULE 不把 SPLIT 改成 `SERIES_RULE_REMOVED` 也不恢复 |
+| RACE | 与 horizon、单次编辑／改期、FUTURE、暂停／归档、同意／会话撤销的独立连接锁等待；失败无部分写入 |
+| CONSTRAINT | 跨计划／跨学生 `source_occurrence_id` 插入被第十条拒绝；子再拆被拒；同 series 塞子任务撞 `UNIQUE(scheduled_local_date)` 的反例证明为何必须新 series |
+| MIGRATION | fresh 十条；合法非空九→十保留；1–9 与 test-v2 未改；旧夹具上界不变 |
+| UI | Chromium：填写、预览、取消、确认、例外父、刷新、再次补齐；无强行覆盖 |
+
+实现批文件入口（本轮不改这些文件）：`packages/domain`、`packages/contracts`（含 `TASK_SPLIT_PREVIEW_STALE`）、`apps/api` planning、`apps/web` 拆分入口、第十条 SQL、九→十夹具与 gate、http／concurrency／e2e。
+
+### 16.9 明确不选的方案
+
+不把子任务留在父 series、不把 SPLIT 做成独立 status、不复制或更换父 series id、不做多级树、不做撤销拆分、不在 GET 自动补齐、不把 `steps` 当子任务。Cursor 实现时不得重新选型。
+
+已知限制（显式阻塞，不是待选架构）：本阶段不能撤销拆分；不能拆过去或非 `PLANNED` 实例；不能对子任务做本次及未来规则编辑。完成态拆分留给 STP 007。

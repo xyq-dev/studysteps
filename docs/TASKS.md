@@ -13,7 +13,7 @@
 | 3 | STP 003 独立仓库与 CI 基础 | M1 基础 | 默认等待 M0；可提前做不依赖业务接口的骨架 | 全新安装及统一检查、测试、构建可运行。工程骨架已在本地验收；M0 未通过，接口未冻结 |
 | 4 | STP 004 档案与授权基础 | M1 | STP 003 已完成；本地决定已写入；B07 仍阻塞最终验收 | 档案隔离、同意、配对和撤销通过。当前进行中，未完成 |
 | 5 | STP 005 学段与模板种子 | 基础内容 | STP 003；与 STP 004 共享的档案字段已稳定 | 学制映射和模板可查询、预览。CI #5 `9118468` success；P05 刷新回填与 A02 只读目录已复测。不得标产品验收。退出门槛 39 条模板（原 36＋初四 3），见设计第 1.1／10 节 |
-| 6 | STP 006 计划与任务生成 | M2 | STP 004、STP 005 | 重复、编辑范围、改期和并发约束通过。当前**第一批＋S06＋暂停／恢复／归档＋按需 horizon＋单次改期＋仅本次内容＋006-A＋006-B 已实施**（整个阶段未完成），见 `docs/STP006_DESIGN.md` 与 `docs/STP006_IMPLEMENTATION_REPORT.md` |
+| 6 | STP 006 计划与任务生成 | M2 | STP 004、STP 005 | 重复、编辑范围、改期和并发约束通过。当前**第一批＋S06＋暂停／恢复／归档＋按需 horizon＋单次改期＋仅本次内容＋006-A＋006-B＋006-C 已实施**；**整个阶段未完成**（worker／Outbox 未做），见 `docs/STP006_DESIGN.md` 与 `docs/STP006_IMPLEMENTATION_REPORT.md` |
 | 7 | STP 007 完成与计时 | M2 | STP 006 的任务实例模型稳定 | 幂等完成、补记、撤销、计时与跨天通过 |
 | 8 | STP 008 报告与家庭协作 | M3 | STP 007 的记录与事件可靠 | 报告可核对，可见范围和建议回应正确 |
 | 9 | STP 009 后台与数据权利 | M4 | STP 004 至 STP 008 的对象和权限稳定 | 模板运营、支持、导出、删除和审计闭环 |
@@ -214,7 +214,11 @@
 
 ## STP 006：计划与任务生成
 
-状态：第一批＋S06＋暂停／恢复／归档＋按需 task-horizon＋单次改期＋仅本次内容＋006-A 本次及未来内容＋006-B 本次及未来重复安排已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
+状态：第一批＋S06＋暂停／恢复／归档＋按需 task-horizon＋单次改期＋仅本次内容＋006-A 本次及未来内容＋006-B 本次及未来重复安排＋006-C 单次拆分已实施（整个阶段未完成）。设计见 `docs/STP006_DESIGN.md`；证据见 `docs/STP006_IMPLEMENTATION_REPORT.md`。
+
+2026-09-18：本批落地 006-C 单次任务拆分。按 §16：父行 `CANCELLED/SPLIT` 留在原 series；每个子任务是同计划新建 ONCE series＋一行实例；第十条补齐 `source_occurrence_id` 同计划／一层／不可变与 `cancel_reason` CHECK。八→九夹具冻结为只打第九条并 `resolve --applied`，避免 `migrate deploy` 追到第十条。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 187、e2e 14）。worker／Outbox、打卡、计时、通知仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。
+
+2026-09-18（设计定稿，随后已实现）：基于 `main@beddf9b` 已把“单次任务拆分”固定为 STP 006-C，唯一方案见 `docs/STP006_DESIGN.md` §16。子任务使用同计划新建 ONCE series 以兼容 `UNIQUE(series_id, scheduled_local_date)`；需要第十条归属约束。
 
 2026-09-18：本批落地 006-B 本次及未来重复安排。既有 future-change 判别联合开放 `kind=SCHEDULE`；确认按 §15.4 B 取消／恢复／推进指针／horizon 内新增；无第十条迁移。本地 lint／typecheck／test／build／prisma:validate／e2e 已通过（api 176、e2e 13）。拆分／horizon 工人仍属后续。STP 004 仍进行中；STP 005 产品验收未完成。
 
@@ -242,7 +246,7 @@
 - `series_id＋occurrence_key` 唯一；确认生成、horizon POST 和并发重试不会重复（GET 不补齐）。
 - 改期保持实例 ID、最初安排日期和发生键；同日冲突只提示，不自动覆盖。
 - “仅本次”和“未来”作用范围按 `STP006_DESIGN.md` §15 正确：切点只取选中实例原始 `occurrenceKey`，实际日期另管历史／撞日，显式单次例外、历史与终态不被覆盖。
-- 暂停、恢复、归档已按 §3.5 落地（保留历史，归档不可恢复）。单次改期已按 §3.7 落地。仅本次内容编辑已按 §3.8 落地。未来规则编辑、拆分仍待后续批次；拆分后的原任务不会再次计为完成。
+- 暂停、恢复、归档已按 §3.5 落地（保留历史，归档不可恢复）。单次改期已按 §3.7 落地。仅本次内容编辑已按 §3.8 落地。未来规则编辑已按 §15 落地。单次拆分已按 §16 落地；拆分后的原任务不会再次计为完成。
 - 并发写入使用版本；冲突返回 409 和可解释差异，不静默覆盖。
 
 ### STP 006-A：本次及未来的内容修改
@@ -310,6 +314,31 @@
 - 与单次改期、内容编辑、horizon、暂停／归档和撤权的双向真实并发不死锁、不静默覆盖；跨本地午夜旧 preview 被拒绝。
 
 退出：006-A 全量回归和本批矩阵通过，才可把“本次及未来重复安排”标为完成。仍不进入拆分、worker／Outbox、STP 007、打卡、计时或通知。
+
+### STP 006-C：单次任务拆分
+
+状态：**已实施，见 `docs/STP006_DESIGN.md` 第 16 节与实施报告第 17 节。** 不得把 worker、STP 007 完成态拆分写成已完成。整个 STP 006 仍未完成。
+
+目标：把选中的一条尚未开始的任务实例拆成 2–8 条可独立执行的后续实例；父行保留为 `CANCELLED/SPLIT`；不修改原重复规则，不生成多级任务树。
+
+固定语义（不得改选型）：
+
+- `steps` 仍是单实例勾选清单，编辑步骤不是拆分。
+- 父实例保持原 `id`／`occurrenceKey`／系列归属／快照／例外；`status=CANCELLED` 且 `cancel_reason=SPLIT`。
+- 每个子任务是同计划下新建的 `ONCE` `TaskSeries`＋一行实例，`sourceOccurrenceId` 指向父 id。这是兼容第九条 `UNIQUE(series_id, scheduled_local_date)` 与 key=原日 CHECK 的唯一方案；禁止把子任务插入父 series、禁止伪造日期或改写父 key。
+- 只拆 `ACTIVE`＋`PLANNED` 且实际安排日 ≥ 锁内今日的实例。子任务 2–8 条，字段长度与仅本次内容相同；时长不要求和父相等。
+- 子任务用当前合法教育快照；父快照不改。列表分母不计父。不支持撤销拆分；子任务后续改内容／改期不恢复父任务。
+- 子任务允许既有仅本次编辑与改期；禁止 FUTURE、禁止再拆。父 series 的 SCHEDULE 不得复活 `SPLIT` 行。horizon 不重生父、不重复子。
+- 共同制定不适用于拆分。权限为 `TASK_ADJUST`、当前同意、Guardian 五分钟 step-up。
+
+已落地：
+
+- **迁移 10：** `source_occurrence_id` 索引、同计划／一层／不可变触发器、`cancel_reason` CHECK 含 `SPLIT`。未改迁移 1–9 与 `test-v2`。历史夹具保持原上界，另建九→十夹具。
+- **API：** `POST /v1/students/:id/tasks/:occurrenceId/split/preview` 与 `/split`；`TASK_SPLIT` 审计；错误码含 `TASK_SPLIT_PREVIEW_STALE`。
+- **事务：** 预览零写；确认原子落库；统一锁序；幂等重放仍验权。
+- **H5：** 实例上“拆成多条任务”→ 填写 → 预览 → 确认；取消零写；无强行覆盖。
+
+验收：§16.8 矩阵已在本批本地验证。仍不进入 worker／Outbox、STP 007、打卡、计时或通知。
 
 ## STP 007：完成与计时
 

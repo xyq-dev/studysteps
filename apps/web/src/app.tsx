@@ -234,7 +234,12 @@ export function App() {
     version: number;
     studentConfirmedAt: string | null;
     lastAdjustment: { reasonCode: string; createdAt: string } | null;
-    series: Array<{ id: string; name: string; occurrenceCount: number }>;
+    series: Array<{
+      id: string;
+      name: string;
+      occurrenceCount: number;
+      splitSourceOccurrenceId?: string | null;
+    }>;
   } | null>(null);
   const [tasks, setTasks] = useState<
     Array<{
@@ -255,6 +260,9 @@ export function App() {
       hasContentException?: boolean;
       hasScheduleException?: boolean;
       occurrenceKey?: string;
+      sourceOccurrenceId?: string | null;
+      canSplit?: boolean;
+      canFutureChange?: boolean;
     }>
   >([]);
   const [planActionPending, setPlanActionPending] = useState(false);
@@ -282,6 +290,27 @@ export function App() {
   const [futureOngoing, setFutureOngoing] = useState(true);
   const [futureEndLocalDate, setFutureEndLocalDate] = useState('');
   const [futureVersions, setFutureVersions] = useState({
+    student: 1,
+    plan: 1,
+    series: 1,
+    occurrence: 1,
+  });
+  const [splitTaskId, setSplitTaskId] = useState<string | null>(null);
+  const [splitChildren, setSplitChildren] = useState<
+    Array<{
+      name: string;
+      subject: string;
+      standard: string;
+      durationMinutes: string;
+      steps: string;
+      scheduledLocalDate: string;
+    }>
+  >([]);
+  const [splitReason, setSplitReason] = useState('拆成两次完成');
+  const [splitPreview, setSplitPreview] = useState<Record<string, unknown> | null>(null);
+  const [splitPending, setSplitPending] = useState(false);
+  const [splitConfirmKey, setSplitConfirmKey] = useState<string | null>(null);
+  const [splitVersions, setSplitVersions] = useState({
     student: 1,
     plan: 1,
     series: 1,
@@ -329,6 +358,12 @@ export function App() {
     setFuturePreview(null);
     setFuturePending(false);
     setFutureConfirmKey(null);
+    setSplitTaskId(null);
+    setSplitChildren([]);
+    setSplitReason('拆成两次完成');
+    setSplitPreview(null);
+    setSplitPending(false);
+    setSplitConfirmKey(null);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -1041,6 +1076,8 @@ export function App() {
     setFutureTaskId(null);
     setFutureMode(null);
     setFuturePreview(null);
+    setSplitTaskId(null);
+    setSplitPreview(null);
     setRescheduleTaskId(task.id);
     setRescheduleDate(addBrowserLocalDays(task.scheduledLocalDate, 1) >= today ? addBrowserLocalDays(task.scheduledLocalDate, 1) : today);
     setRescheduleReason('调到合适的一天');
@@ -1100,6 +1137,8 @@ export function App() {
     setFutureTaskId(null);
     setFutureMode(null);
     setFuturePreview(null);
+    setSplitTaskId(null);
+    setSplitPreview(null);
     setEditTaskId(task.id);
     setEditName(task.name);
     setEditSubject(task.subject ?? '');
@@ -1188,6 +1227,8 @@ export function App() {
     }
     setRescheduleTaskId(null);
     setEditTaskId(null);
+    setSplitTaskId(null);
+    setSplitPreview(null);
     setFuturePreview(null);
     setFutureConfirmKey(null);
     setStatus('正在读取规则内容');
@@ -1229,6 +1270,8 @@ export function App() {
     }
     setRescheduleTaskId(null);
     setEditTaskId(null);
+    setSplitTaskId(null);
+    setSplitPreview(null);
     setFuturePreview(null);
     setFutureConfirmKey(null);
     setStatus('正在读取重复安排');
@@ -1363,6 +1406,199 @@ export function App() {
       }
     } finally {
       setFuturePending(false);
+    }
+  }
+
+  function emptySplitChild(base: {
+    name?: string;
+    subject?: string;
+    completionStandard?: string;
+    durationMinutes?: number | null;
+    steps?: string[];
+    scheduledLocalDate?: string;
+  }) {
+    return {
+      name: base.name ?? '',
+      subject: base.subject ?? '',
+      standard: base.completionStandard ?? '',
+      durationMinutes: base.durationMinutes == null ? '' : String(base.durationMinutes),
+      steps: (base.steps ?? []).join('\n'),
+      scheduledLocalDate: base.scheduledLocalDate ?? new Date().toLocaleDateString('en-CA'),
+    };
+  }
+
+  function parsedSplitChildren() {
+    return splitChildren.map((child) => ({
+      name: child.name,
+      subject: child.subject,
+      standard: child.standard,
+      durationMinutes: child.durationMinutes.trim() === '' ? null : Number(child.durationMinutes),
+      steps: child.steps
+        .split('\n')
+        .map((item) => item.trim())
+        .filter(Boolean),
+      scheduledLocalDate: child.scheduledLocalDate,
+    }));
+  }
+
+  async function openSplit(task: { id: string; executable?: boolean; sourceOccurrenceId?: string | null; canSplit?: boolean }) {
+    if (!activeStudentId || task.executable === false || task.sourceOccurrenceId || task.canSplit === false) {
+      return;
+    }
+    setRescheduleTaskId(null);
+    setEditTaskId(null);
+    setFutureTaskId(null);
+    setFutureMode(null);
+    setSplitPreview(null);
+    setSplitConfirmKey(null);
+    setStatus('正在读取要拆分的任务');
+    try {
+      const [student, detail] = await Promise.all([
+        api(`/v1/students/${activeStudentId}`),
+        api(`/v1/students/${activeStudentId}/tasks/${task.id}`),
+      ]);
+      const base = {
+        name: detail.name as string,
+        subject: detail.subject as string,
+        completionStandard: detail.completionStandard as string,
+        durationMinutes: detail.durationMinutes as number | null,
+        steps: (detail.steps ?? []) as string[],
+        scheduledLocalDate: detail.scheduledLocalDate as string,
+      };
+      setSplitTaskId(task.id);
+      setSplitVersions({
+        student: student.version,
+        plan: detail.planVersion,
+        series: detail.seriesVersion,
+        occurrence: detail.version,
+      });
+      setSplitChildren([emptySplitChild({ ...base, name: `${base.name}（1）` }), emptySplitChild({ ...base, name: `${base.name}（2）` })]);
+      setSplitReason('拆成两次完成');
+      setStatus('填写 2 到 8 条子任务。确认后原来的任务会被这些子任务替代，且不能直接还原。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法开始拆分');
+    }
+  }
+
+  function updateSplitChild(
+    index: number,
+    field: 'name' | 'subject' | 'standard' | 'durationMinutes' | 'steps' | 'scheduledLocalDate',
+    value: string,
+  ) {
+    setSplitPreview(null);
+    setSplitChildren((current) => current.map((child, i) => (i === index ? { ...child, [field]: value } : child)));
+  }
+
+  function addSplitChild() {
+    if (splitChildren.length >= 8) {
+      return;
+    }
+    const last = splitChildren[splitChildren.length - 1];
+    setSplitPreview(null);
+    setSplitChildren([
+      ...splitChildren,
+      emptySplitChild(
+        last
+          ? {
+              name: `${last.name}（新）`,
+              subject: last.subject,
+              completionStandard: last.standard,
+              durationMinutes: last.durationMinutes.trim() === '' ? null : Number(last.durationMinutes),
+              steps: last.steps.split('\n').map((item) => item.trim()).filter(Boolean),
+              scheduledLocalDate: last.scheduledLocalDate,
+            }
+          : {},
+      ),
+    ]);
+  }
+
+  function removeSplitChild(index: number) {
+    if (splitChildren.length <= 2) {
+      return;
+    }
+    setSplitPreview(null);
+    setSplitChildren(splitChildren.filter((_, i) => i !== index));
+  }
+
+  function cancelSplit() {
+    setSplitTaskId(null);
+    setSplitChildren([]);
+    setSplitPreview(null);
+    setSplitPending(false);
+    setSplitConfirmKey(null);
+    setStatus('已取消拆分，没有写入任务。');
+  }
+
+  async function previewSplit() {
+    if (!activeStudentId || !splitTaskId || splitPending) {
+      return;
+    }
+    setSplitPending(true);
+    setStatus('正在预览拆分');
+    try {
+      const preview = await api(`/v1/students/${activeStudentId}/tasks/${splitTaskId}/split/preview`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedStudentVersion: splitVersions.student,
+          expectedPlanVersion: splitVersions.plan,
+          expectedSeriesVersion: splitVersions.series,
+          expectedOccurrenceVersion: splitVersions.occurrence,
+          children: parsedSplitChildren(),
+          reason: splitReason,
+        }),
+      });
+      setSplitPreview(preview);
+      setStatus('预览不会写入。确认后原来的任务会被子任务替代，且不能直接还原。');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法预览拆分');
+    } finally {
+      setSplitPending(false);
+    }
+  }
+
+  async function confirmSplit() {
+    if (!activeStudentId || !splitTaskId || !splitPreview || splitPending) {
+      return;
+    }
+    const key = splitConfirmKey ?? crypto.randomUUID();
+    setSplitConfirmKey(key);
+    setSplitPending(true);
+    setStatus('正在确认拆分');
+    try {
+      const result = await api(`/v1/students/${activeStudentId}/tasks/${splitTaskId}/split`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedStudentVersion: splitVersions.student,
+          expectedPlanVersion: splitVersions.plan,
+          expectedSeriesVersion: splitVersions.series,
+          expectedOccurrenceVersion: splitVersions.occurrence,
+          children: parsedSplitChildren(),
+          reason: splitReason,
+          previewDigest: splitPreview.previewDigest,
+        }),
+        idempotencyKey: key,
+      });
+      const childDates = Array.isArray(result.children)
+        ? result.children.map((item: { scheduledLocalDate?: string }) => item.scheduledLocalDate ?? '')
+        : [];
+      setSplitTaskId(null);
+      setSplitChildren([]);
+      setSplitPreview(null);
+      setSplitConfirmKey(null);
+      await loadTasks(childDates);
+      setStatus('已拆成多条任务。原来的任务不再出现在今日列表中。');
+    } catch (error) {
+      const code = error instanceof ApiRequestError ? error.code : '';
+      if (code === 'TASK_SPLIT_PREVIEW_STALE') {
+        setSplitPreview(null);
+        setStatus('预览已过期，请重新预览后再确认。已保留刚才填写的内容。');
+      } else if (code === 'VERSION_CONFLICT') {
+        setStatus('版本已变化，请重新预览后再确认。已保留刚才填写的内容。');
+      } else {
+        setStatus(error instanceof Error ? error.message : '无法确认拆分');
+      }
+    } finally {
+      setSplitPending(false);
     }
   }
 
@@ -1785,7 +2021,9 @@ export function App() {
               <ul>
                 {planDetail.series.map((item) => (
                   <li key={item.id}>
-                    {item.name} · {item.occurrenceCount} 个实例
+                    {item.splitSourceOccurrenceId
+                      ? `拆分自一次任务 · ${item.name} · ${item.occurrenceCount} 个实例`
+                      : `${item.name} · ${item.occurrenceCount} 个实例`}
                   </li>
                 ))}
               </ul>
@@ -1817,7 +2055,7 @@ export function App() {
                     <button
                       type="button"
                       data-testid={`reschedule-task-${item.id}`}
-                      disabled={reschedulePending || editPending || futurePending}
+                      disabled={reschedulePending || editPending || futurePending || splitPending}
                       onClick={() => openReschedule(item)}
                     >
                       改期
@@ -1825,27 +2063,41 @@ export function App() {
                     <button
                       type="button"
                       data-testid={`edit-task-${item.id}`}
-                      disabled={reschedulePending || editPending || futurePending}
+                      disabled={reschedulePending || editPending || futurePending || splitPending}
                       onClick={() => openEdit(item)}
                     >
                       编辑本次
                     </button>
-                    <button
-                      type="button"
-                      data-testid={`future-edit-task-${item.id}`}
-                      disabled={reschedulePending || editPending || futurePending}
-                      onClick={() => void openFutureEdit(item)}
-                    >
-                      本次及未来
-                    </button>
-                    <button
-                      type="button"
-                      data-testid={`future-schedule-task-${item.id}`}
-                      disabled={reschedulePending || editPending || futurePending}
-                      onClick={() => void openFutureSchedule(item)}
-                    >
-                      调整重复安排
-                    </button>
+                    {item.sourceOccurrenceId || item.canFutureChange === false ? null : (
+                      <>
+                        <button
+                          type="button"
+                          data-testid={`future-edit-task-${item.id}`}
+                          disabled={reschedulePending || editPending || futurePending || splitPending}
+                          onClick={() => void openFutureEdit(item)}
+                        >
+                          本次及未来
+                        </button>
+                        <button
+                          type="button"
+                          data-testid={`future-schedule-task-${item.id}`}
+                          disabled={reschedulePending || editPending || futurePending || splitPending}
+                          onClick={() => void openFutureSchedule(item)}
+                        >
+                          调整重复安排
+                        </button>
+                      </>
+                    )}
+                    {item.sourceOccurrenceId || item.canSplit === false ? null : (
+                      <button
+                        type="button"
+                        data-testid={`split-task-${item.id}`}
+                        disabled={reschedulePending || editPending || futurePending || splitPending}
+                        onClick={() => void openSplit(item)}
+                      >
+                        拆成多条任务
+                      </button>
+                    )}
                   </>
                 ) : null}
               </li>
@@ -2100,6 +2352,107 @@ export function App() {
                     onClick={() => void confirmFutureEdit()}
                   >
                     {futurePending ? '正在确认' : '确认修改'}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {splitTaskId ? (
+            <div data-testid="split-task">
+              <p data-testid="split-task-scope">把这条任务拆成多条独立任务。原来的任务会被替代，确认后不能直接还原。</p>
+              {splitChildren.map((child, index) => (
+                <div key={`split-child-${index}`} data-testid={`split-child-${index}`}>
+                  <label>
+                    子任务名称
+                    <input
+                      data-testid={`split-child-name-${index}`}
+                      value={child.name}
+                      onChange={(event) => updateSplitChild(index, 'name', event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    科目
+                    <input
+                      data-testid={`split-child-subject-${index}`}
+                      value={child.subject}
+                      onChange={(event) => updateSplitChild(index, 'subject', event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    完成标准
+                    <input
+                      data-testid={`split-child-standard-${index}`}
+                      value={child.standard}
+                      onChange={(event) => updateSplitChild(index, 'standard', event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    预计时长（分钟，可空）
+                    <input
+                      data-testid={`split-child-duration-${index}`}
+                      value={child.durationMinutes}
+                      onChange={(event) => updateSplitChild(index, 'durationMinutes', event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    安排日期
+                    <input
+                      data-testid={`split-child-date-${index}`}
+                      type="date"
+                      min={new Date().toLocaleDateString('en-CA')}
+                      value={child.scheduledLocalDate}
+                      onChange={(event) => updateSplitChild(index, 'scheduledLocalDate', event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    步骤（每行一条）
+                    <textarea
+                      data-testid={`split-child-steps-${index}`}
+                      value={child.steps}
+                      onChange={(event) => updateSplitChild(index, 'steps', event.target.value)}
+                    />
+                  </label>
+                  {splitChildren.length > 2 ? (
+                    <button type="button" data-testid={`remove-split-child-${index}`} disabled={splitPending} onClick={() => removeSplitChild(index)}>
+                      删除这条
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+              {splitChildren.length < 8 ? (
+                <button type="button" data-testid="add-split-child" disabled={splitPending} onClick={() => addSplitChild()}>
+                  再加一条
+                </button>
+              ) : null}
+              <label>
+                原因
+                <input data-testid="split-reason" value={splitReason} onChange={(event) => setSplitReason(event.target.value)} />
+              </label>
+              <button type="button" data-testid="preview-split" disabled={splitPending} onClick={() => void previewSplit()}>
+                {splitPending && !splitPreview ? '正在预览' : '预览拆分'}
+              </button>
+              <button type="button" data-testid="cancel-split" disabled={splitPending} onClick={() => cancelSplit()}>
+                取消
+              </button>
+              {splitPreview ? (
+                <div data-testid="split-preview">
+                  <p data-testid="split-preview-parent">
+                    原任务 {String((splitPreview.parent as { name?: string; scheduledLocalDate?: string } | undefined)?.name ?? '')}（
+                    {String((splitPreview.parent as { scheduledLocalDate?: string } | undefined)?.scheduledLocalDate ?? '')}
+                    ）将被子任务替代
+                  </p>
+                  <ul data-testid="split-preview-children">
+                    {(Array.isArray(splitPreview.children) ? splitPreview.children : []).map(
+                      (child: { name?: string; scheduledLocalDate?: string }, index: number) => (
+                        <li key={`preview-child-${index}`}>
+                          {child.name} · {child.scheduledLocalDate}
+                        </li>
+                      ),
+                    )}
+                  </ul>
+                  <p data-testid="split-preview-irreversible">{String(splitPreview.irreversibleNote ?? '拆分后不能直接还原成原来的一条任务。')}</p>
+                  <button type="button" data-testid="confirm-split" disabled={splitPending} onClick={() => void confirmSplit()}>
+                    {splitPending ? '正在确认' : '确认拆分'}
                   </button>
                 </div>
               ) : null}

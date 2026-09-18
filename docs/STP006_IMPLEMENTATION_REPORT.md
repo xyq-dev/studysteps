@@ -363,3 +363,52 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 未执行：拆分、worker／Outbox、打卡、计时、通知、运营发布、远端 E2E。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。
 
+## 17. 本批：006-C 单次任务拆分（2026-09-18）
+
+实施前 HEAD：`beddf9b42db9573f701d97f5613088770c8aac88`。保留 `docs/handoffs/STP004_PG_ISOLATION.md` 的本地 PID 变化，不纳入提交。
+
+原因：按 §16 把尚未开始的一条实例拆成 2–8 条可独立执行的后续实例。子任务不能留在父 series（第九条 `UNIQUE(series_id, scheduled_local_date)` 含取消行，且 key 必须是合法本地日），因此每个子任务是同计划下新建的 `ONCE` series＋一行实例；父行留在原 series，变为 `CANCELLED` 且 `cancel_reason=SPLIT`。
+
+父子与统计：
+
+- 父 `id`／`occurrenceKey`／快照／例外／来源不变；`executable=false`。`GET .../tasks` 排除 `CANCELLED`，父离开日列表分母。
+- 子任务各计 1；`sourceOccurrenceId` 指向父。子任务允许仅本次编辑与改期；FUTURE 与再次拆分在 preview／confirm／直接 API 均拒绝。
+- 子年级快照取锁内当前合法教育。`TASK_SPLIT` 记录真实操作者，不写 `studentConfirmedAt`。共同制定不适用于拆分。
+- 子 ONCE series 走现有 INSERT 触发器生成 `BASELINE` revision 1，occurrence 指针为 1。
+- horizon 不重生父、不重复子；父 series 的 CONTENT／SCHEDULE 不覆盖子 series；`SPLIT` 父不得被改成其他取消原因或恢复。
+
+第十条迁移：`20260918180000_stp006_split_parentage`。预检非法 `cancel_reason` 后加 CHECK（含 `SPLIT`）、`source_occurrence_id` 索引、不可变触发器、同计划／一层／禁止自指的延迟约束。未改写 1–9 与 `test-v2`。八→九改为只 SQL 第九条并 `resolve --applied`，避免 `migrate deploy` 追到第十条。新增 `stp006_nine_to_ten` 合法非空升级：业务 digest 保留后，真实违规写入被拒。原库只读。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 合法拆分、数量与过去／非法状态拒绝 | 通过 | HTTP：预览零写；1 条子任务 400；过去日期 400；确认后父 `SPLIT`、2 个 ONCE 子任务 |
+| 父身份与快照保留；子归属、年级快照和审计 | 通过 | HTTP：父 id／key／名称／年级不变；子 `plan_id` 相同且有 BASELINE；`TASK_SPLIT` 含操作者 |
+| 父从分母移除，子各计 1；刷新不重复 | 通过 | GET 日列表不含父、含子 2 条；再次 horizon 子仍为 2，父不复活 |
+| 幂等、异体冲突、旧 version、陈旧预览 | 通过 | 同键同体 200；异体 `IDEMPOTENCY_CONFLICT`；旧 version `VERSION_CONFLICT`；错误 digest `TASK_SPLIT_PREVIEW_STALE` |
+| 子任务直接 FUTURE／再拆拒绝 | 通过 | HTTP 409 `TASK_NOT_ADJUSTABLE`；H5 子任务无 FUTURE／拆分按钮 |
+| 编辑／改期／暂停恢复后 SPLIT 父不复活 | 通过 | 子可 PATCH／reschedule；pause／resume 后父仍 `SPLIT`；SCHEDULE 不改 SPLIT 原因 |
+| 跨计划／自引用／多层／指针改写拒绝 | 通过 | 第十条夹具与 `stp006.db.spec.ts` 真实违规写入 |
+| 约束失败全部回滚 | 通过 | db 事务：父改 SPLIT 后跨计划子插入失败，父仍 `PLANNED` |
+| 拆分与单次编辑的锁等待；重复拆分不生成两组子任务 | 通过 | 独立连接 + `pg_blocking_pids`；二次拆分 409，子任务仍为 2 |
+| Chromium 预览取消、确认、刷新、子编辑／改期、入口限制 | 通过 | `stp006-split-walkthrough.spec.ts`；整包 e2e 14 passed |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 14、domain 36、ui／admin／web 各 1、api **187 passed / 0 skipped / 0 failed** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| `node scripts/stp006-fresh.mjs` | 0 | `stp006_fresh` applied=10 |
+| `node scripts/stp006-eight-to-nine.mjs` | 0 | 仍停在九条；未追到第十条 |
+| `node scripts/stp006-nine-to-ten.mjs` | 0 | 业务 digest 保留；归属约束反例拒绝 |
+| Playwright `apps/web` e2e | 0 | **14 passed**（含 split walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright；日志 403 时不编造远端测试数量 |
+
+未执行：撤销拆分、多级拆分、worker／Outbox、打卡、计时、通知、运营发布、远端 E2E。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。
+
+

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { Prisma, type DeviceSession } from '@prisma/client';
 import {
@@ -14,6 +15,7 @@ import {
   datesToMaterializeForPlan,
   datesToMaterializeFromRevisions,
   canAnchorFutureChange,
+  canSplitOccurrence,
   classifyFutureContentEffect,
   classifyFutureScheduleEffect,
   compareLocalDate,
@@ -41,6 +43,9 @@ import {
   scheduleFromRevision,
   scheduleRevisionFromProposal,
   selectEffectiveRevision,
+  normalizeSplitChildren,
+  splitChildDateErrors,
+  splitPreviewCanonicalPayload,
   type OccurrenceSchedule,
   type SeriesRevisionRecord,
   type SeriesRule,
@@ -55,6 +60,8 @@ import type {
   PreviewTemplateInput,
   EditOccurrenceInput,
   RescheduleTaskInput,
+  SplitConfirmInput,
+  SplitPreviewInput,
   TaskHorizonInput,
 } from '@studysteps/contracts';
 import { AppError } from '../common/app-error';
@@ -499,13 +506,13 @@ export class PlanningService {
         date: query.date ?? today,
         from,
         to,
-        items: rows.map((row) => this.occurrenceView(row)),
+        items: rows.map((row) => this.occurrenceView(row, today)),
       };
     });
   }
 
   async getTask(session: DeviceSession, studentId: string, occurrenceId: string) {
-    return this.readAuthorized(session, studentId, 'TASK_READ', async (tx) => {
+    return this.readAuthorized(session, studentId, 'TASK_READ', async (tx, student, now) => {
       const row = await tx.taskOccurrence.findFirst({
         where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
         include: { series: { include: { plan: true, revisions: true } } },
@@ -513,7 +520,20 @@ export class PlanningService {
       if (!row) {
         throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
       }
-      return this.occurrenceView(row);
+      const today = localDateInTimeZone(now, student.timezone);
+      const view = this.occurrenceView(row, today);
+      if (row.cancelReason !== 'SPLIT') {
+        return view;
+      }
+      const children = await tx.taskOccurrence.findMany({
+        where: { sourceOccurrenceId: row.id },
+        include: { series: { include: { plan: true } } },
+        orderBy: [{ scheduledLocalDate: 'asc' }, { createdAt: 'asc' }],
+      });
+      return {
+        ...view,
+        splitChildren: children.map((child) => this.occurrenceView(child, today)),
+      };
     });
   }
 
@@ -810,6 +830,329 @@ export class PlanningService {
     return this.runFutureChange(session, studentId, occurrenceId, input, idempotencyKey);
   }
 
+  async previewSplit(session: DeviceSession, studentId: string, occurrenceId: string, input: SplitPreviewInput) {
+    return this.runSplit(session, studentId, occurrenceId, input, null);
+  }
+
+  async confirmSplit(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: SplitConfirmInput,
+    idempotencyKey: string,
+  ) {
+    return this.runSplit(session, studentId, occurrenceId, input, idempotencyKey);
+  }
+
+  private async runSplit(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: SplitPreviewInput | SplitConfirmInput,
+    idempotencyKey: string | null,
+  ) {
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'TASK_ADJUST');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = idempotencyKey
+      ? this.idempotency.requestDigest({
+          operation: 'tasks.split',
+          studentId,
+          occurrenceId,
+          input,
+        })
+      : null;
+    const existingIdem =
+      idempotencyKey && requestDigest
+        ? await this.idempotency.peekId(this.prisma, actor, 'tasks.split', idempotencyKey)
+        : null;
+    const target = await this.prisma.taskOccurrence.findFirst({
+      where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+      include: { series: { include: { plan: true, occurrences: { select: { id: true } } } } },
+    });
+    if (!target) {
+      throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+    }
+    const siblingIds = target.series.occurrences.map((row) => row.id);
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [target.series.planId],
+      taskSeriesIds: [target.seriesId],
+      taskOccurrenceIds: siblingIds,
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'TASK_ADJUST',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      let begun: Awaited<ReturnType<IdempotencyService['begin']>> | null = null;
+      if (idempotencyKey && requestDigest) {
+        begun = await this.idempotency.begin(tx, actor, 'tasks.split', idempotencyKey, requestDigest, now);
+        if (begun.kind === 'REPLAY' && begun.resourceId) {
+          await this.identity.touchLastSeenLocked(tx, currentSession, now);
+          return JSON.parse(begun.resourceId) as Record<string, unknown>;
+        }
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const row = await tx.taskOccurrence.findFirst({
+        where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+        include: { series: { include: { plan: true, occurrences: true } } },
+      });
+      if (!row) {
+        throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+      }
+      if (
+        !lockIdsContain(locked, {
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        })
+      ) {
+        throw new IncompleteLockSetError({
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        });
+      }
+      if (current.version !== input.expectedStudentVersion) {
+        throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
+      }
+      if (row.series.plan.version !== input.expectedPlanVersion) {
+        throw new AppError('VERSION_CONFLICT', '计划版本已变化', 409);
+      }
+      if (row.series.version !== input.expectedSeriesVersion) {
+        throw new AppError('VERSION_CONFLICT', '规则版本已变化', 409);
+      }
+      if (row.version !== input.expectedOccurrenceVersion) {
+        throw new AppError('VERSION_CONFLICT', '任务版本已变化', 409);
+      }
+      if (row.series.plan.status !== 'ACTIVE') {
+        throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许拆分', 409);
+      }
+      const today = localDateInTimeZone(now, current.timezone);
+      if (
+        !canSplitOccurrence({
+          planStatus: row.series.plan.status,
+          occurrenceStatus: row.status,
+          scheduledLocalDate: row.scheduledLocalDate,
+          todayLocalDate: today,
+          sourceOccurrenceId: row.sourceOccurrenceId,
+        })
+      ) {
+        throw new AppError('TASK_NOT_ADJUSTABLE', '当前任务不能拆分', 409);
+      }
+      const children = normalizeSplitChildren(input.children);
+      const dateErrors = splitChildDateErrors(children, today);
+      if (Object.keys(dateErrors).length > 0) {
+        throw new AppError('VALIDATION_ERROR', '子任务日期不合法', 400, dateErrors);
+      }
+      if (
+        !current.stageCode ||
+        !current.schoolSystemCode ||
+        !current.gradeCode ||
+        !current.gradeLabel ||
+        !current.termCode ||
+        !current.gradeConfigId ||
+        !current.gradeConfigVersionId
+      ) {
+        throw new AppError('LEARNING_ACCESS_BLOCKED', '尚未配置教育资料，不能拆分任务', 403);
+      }
+      const gradeVersion = await tx.gradeConfigVersion.findUnique({
+        where: { id: current.gradeConfigVersionId },
+      });
+      if (!gradeVersion) {
+        throw new AppError('LEARNING_ACCESS_BLOCKED', '尚未配置教育资料，不能拆分任务', 403);
+      }
+      const previewDigest = digestCanonical(
+        splitPreviewCanonicalPayload({
+          studentId: current.id,
+          studentVersion: current.version,
+          planId: row.series.planId,
+          planVersion: row.series.plan.version,
+          seriesId: row.seriesId,
+          seriesVersion: row.series.version,
+          occurrenceId: row.id,
+          occurrenceVersion: row.version,
+          occurrenceKey: row.occurrenceKey,
+          scheduledLocalDate: row.scheduledLocalDate,
+          status: row.status,
+          cancelReason: row.cancelReason,
+          contentExceptionAdjustmentId: row.contentExceptionAdjustmentId,
+          scheduleExceptionAdjustmentId: row.scheduleExceptionAdjustmentId,
+          nameSnapshot: row.nameSnapshot,
+          subjectSnapshot: row.subjectSnapshot,
+          completionStandardSnapshot: row.completionStandardSnapshot,
+          durationMinutesSnapshot: row.durationMinutesSnapshot,
+          stepsSnapshotJson: row.stepsSnapshotJson,
+          timezone: current.timezone,
+          todayLocalDate: today,
+          children,
+          reason: input.reason,
+        }),
+      );
+      const parentView = {
+        id: row.id,
+        occurrenceKey: row.occurrenceKey,
+        originalLocalDate: row.originalLocalDate,
+        scheduledLocalDate: row.scheduledLocalDate,
+        name: row.nameSnapshot,
+        subject: row.subjectSnapshot,
+        completionStandard: row.completionStandardSnapshot,
+        durationMinutes: row.durationMinutesSnapshot,
+        steps: JSON.parse(row.stepsSnapshotJson) as string[],
+        hasContentException: row.contentExceptionAdjustmentId != null,
+        hasScheduleException: row.scheduleExceptionAdjustmentId != null,
+        willLeaveDayList: true,
+        willCancelReason: 'SPLIT' as const,
+      };
+      const preview = {
+        parent: parentView,
+        children,
+        leavingDayList: [{ id: row.id, scheduledLocalDate: row.scheduledLocalDate }],
+        versions: {
+          student: current.version,
+          plan: row.series.plan.version,
+          series: row.series.version,
+          occurrence: row.version,
+        },
+        timezone: current.timezone,
+        todayLocalDate: today,
+        parentDurationMinutes: row.durationMinutesSnapshot,
+        childrenDurationTotal: children.reduce((sum, child) => sum + (child.durationMinutes ?? 0), 0),
+        irreversibleNote: '拆分后不能直接还原成原来的一条任务。',
+        previewDigest,
+      };
+      if (!idempotencyKey) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return preview;
+      }
+      const confirmInput = input as SplitConfirmInput;
+      if (confirmInput.previewDigest !== previewDigest) {
+        throw new AppError('TASK_SPLIT_PREVIEW_STALE', '拆分预览已过期，请重新预览后再确认', 409);
+      }
+      const prepared = children.map((child) => ({
+        ...child,
+        seriesId: randomUUID(),
+        occurrenceId: randomUUID(),
+      }));
+      const adjustmentId = randomUUID();
+      await tx.taskOccurrence.update({
+        where: { id: row.id, version: row.version },
+        data: {
+          status: 'CANCELLED',
+          cancelReason: 'SPLIT',
+          version: row.version + 1,
+        },
+      });
+      for (const child of prepared) {
+        await tx.taskSeries.create({
+          data: {
+            id: child.seriesId,
+            planId: row.series.planId,
+            name: child.name,
+            subject: child.subject,
+            completionStandard: child.standard,
+            durationMinutes: child.durationMinutes,
+            stepsJson: JSON.stringify(child.steps),
+            repeatKind: 'ONCE',
+            weekdaysJson: null,
+            startLocalDate: child.scheduledLocalDate,
+            endLocalDate: child.scheduledLocalDate,
+            ongoing: false,
+            effectiveFromLocalDate: child.scheduledLocalDate,
+            effectiveToLocalDate: child.scheduledLocalDate,
+          },
+        });
+        await tx.taskOccurrence.create({
+          data: {
+            id: child.occurrenceId,
+            seriesId: child.seriesId,
+            occurrenceKey: child.scheduledLocalDate,
+            originalLocalDate: child.scheduledLocalDate,
+            scheduledLocalDate: child.scheduledLocalDate,
+            timezoneSnapshot: current.timezone,
+            status: 'PLANNED',
+            nameSnapshot: child.name,
+            subjectSnapshot: child.subject,
+            completionStandardSnapshot: child.standard,
+            durationMinutesSnapshot: child.durationMinutes,
+            stepsSnapshotJson: JSON.stringify(child.steps),
+            gradeConfigId: current.gradeConfigId,
+            gradeConfigVersionId: current.gradeConfigVersionId,
+            stageCodeSnapshot: current.stageCode,
+            schoolSystemCodeSnapshot: current.schoolSystemCode,
+            gradeCodeSnapshot: current.gradeCode,
+            gradeLabelSnapshot: current.gradeLabel,
+            termCodeSnapshot: current.termCode,
+            catalogEntryKeySnapshot: gradeVersion.catalogEntryKey ?? '',
+            sourceOccurrenceId: row.id,
+            contentRevisionNo: 1,
+            scheduleRevisionNo: 1,
+          },
+        });
+      }
+      await tx.planAdjustment.create({
+        data: {
+          id: adjustmentId,
+          planId: row.series.planId,
+          seriesId: row.seriesId,
+          occurrenceId: row.id,
+          reasonCode: 'TASK_SPLIT',
+          payloadJson: JSON.stringify({
+            parentId: row.id,
+            parentOccurrenceKey: row.occurrenceKey,
+            parentScheduledLocalDate: row.scheduledLocalDate,
+            children: prepared.map((child) => ({
+              seriesId: child.seriesId,
+              occurrenceId: child.occurrenceId,
+              name: child.name,
+              subject: child.subject,
+              standard: child.standard,
+              durationMinutes: child.durationMinutes,
+              steps: child.steps,
+              scheduledLocalDate: child.scheduledLocalDate,
+            })),
+            reason: input.reason,
+            actorScope: session.scope,
+            actorAccountId: session.accountId ?? null,
+            actorSessionId: session.id,
+            previewDigest,
+          }),
+        },
+      });
+      const result = {
+        parent: await this.getTaskInTx(tx, studentId, row.id),
+        children: await Promise.all(prepared.map((child) => this.getTaskInTx(tx, studentId, child.occurrenceId))),
+        adjustmentId,
+        previewDigest,
+      };
+      if (begun) {
+        await this.idempotency.complete(tx, begun.recordId, 'TaskOccurrence', JSON.stringify(result), 200, now);
+      }
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return result;
+    }, graph);
+  }
+
   private async runFutureChange(
     session: DeviceSession,
     studentId: string,
@@ -924,6 +1267,7 @@ export class PlanningService {
           occurrenceKey: row.occurrenceKey,
           scheduledLocalDate: row.scheduledLocalDate,
           todayLocalDate: today,
+          sourceOccurrenceId: row.sourceOccurrenceId,
         })
       ) {
         throw new AppError('TASK_NOT_ADJUSTABLE', '当前任务不能作为本次及未来的锚点', 409);
@@ -2214,26 +2558,32 @@ export class PlanningService {
             payload: JSON.parse(plan.adjustments[0].payloadJson) as Record<string, unknown>,
           }
         : null,
-      series: plan.series.map((item) => ({
-        id: item.id,
-        name: item.name,
-        subject: item.subject,
-        completionStandard: item.completionStandard,
-        repeatKind: item.repeatKind,
-        startLocalDate: item.startLocalDate,
-        endLocalDate: item.endLocalDate,
-        ongoing: item.ongoing,
-        occurrenceCount: item.occurrences.length,
-      })),
+      series: plan.series.map((item) => {
+        const splitSource = item.occurrences.find((row) => row.sourceOccurrenceId)?.sourceOccurrenceId ?? null;
+        return {
+          id: item.id,
+          name: item.name,
+          subject: item.subject,
+          completionStandard: item.completionStandard,
+          repeatKind: item.repeatKind,
+          startLocalDate: item.startLocalDate,
+          endLocalDate: item.endLocalDate,
+          ongoing: item.ongoing,
+          occurrenceCount: item.occurrences.length,
+          splitSourceOccurrenceId: splitSource,
+        };
+      }),
     };
   }
 
-  private occurrenceView(row: {
+  private occurrenceView(
+    row: {
     id: string;
     scheduledLocalDate: string;
     originalLocalDate: string;
     occurrenceKey: string;
     status: string;
+    cancelReason?: string | null;
     version: number;
     nameSnapshot: string;
     subjectSnapshot: string;
@@ -2243,6 +2593,7 @@ export class PlanningService {
     gradeLabelSnapshot: string;
     catalogEntryKeySnapshot: string;
     timezoneSnapshot: string;
+    sourceOccurrenceId?: string | null;
     contentExceptionAdjustmentId?: string | null;
     scheduleExceptionAdjustmentId?: string | null;
     series: {
@@ -2265,7 +2616,9 @@ export class PlanningService {
         ongoing: boolean | null;
       }>;
     };
-  }) {
+  },
+    todayLocalDate?: string,
+  ) {
     const planStatus = row.series.plan.status;
     const mappedRevisions = row.series.revisions
       ? row.series.revisions.map((item) => this.asRevision(item))
@@ -2276,6 +2629,26 @@ export class PlanningService {
     const scheduleRevision = mappedRevisions.length
       ? selectEffectiveRevision(mappedRevisions, ['BASELINE', 'SCHEDULE'], row.occurrenceKey)
       : null;
+    const sourceOccurrenceId = row.sourceOccurrenceId ?? null;
+    const canSplit =
+      todayLocalDate != null &&
+      canSplitOccurrence({
+        planStatus,
+        occurrenceStatus: row.status,
+        scheduledLocalDate: row.scheduledLocalDate,
+        todayLocalDate,
+        sourceOccurrenceId,
+      });
+    const canFutureChange =
+      todayLocalDate != null &&
+      canAnchorFutureChange({
+        planStatus,
+        occurrenceStatus: row.status,
+        occurrenceKey: row.occurrenceKey,
+        scheduledLocalDate: row.scheduledLocalDate,
+        todayLocalDate,
+        sourceOccurrenceId,
+      });
     return {
       id: row.id,
       seriesId: row.series.id,
@@ -2287,10 +2660,14 @@ export class PlanningService {
       seriesVersion: row.series.version,
       planVersion: row.series.plan.version,
       status: row.status,
+      cancelReason: row.cancelReason ?? null,
+      sourceOccurrenceId,
       planStatus,
       hasContentException: row.contentExceptionAdjustmentId != null,
       hasScheduleException: row.scheduleExceptionAdjustmentId != null,
       executable: planStatus === 'ACTIVE' && row.status === 'PLANNED',
+      canSplit,
+      canFutureChange,
       name: row.nameSnapshot,
       subject: row.subjectSnapshot,
       completionStandard: row.completionStandardSnapshot,

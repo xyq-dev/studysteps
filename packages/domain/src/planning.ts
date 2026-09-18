@@ -422,13 +422,121 @@ export function canAnchorFutureChange(input: {
   occurrenceKey: string;
   scheduledLocalDate: string;
   todayLocalDate: string;
+  sourceOccurrenceId?: string | null;
 }): boolean {
   return (
     input.planStatus === 'ACTIVE' &&
     input.occurrenceStatus === 'PLANNED' &&
+    input.sourceOccurrenceId == null &&
     compareLocalDate(input.occurrenceKey, input.todayLocalDate) >= 0 &&
     compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0
   );
+}
+
+export const OCCURRENCE_CANCEL_REASONS = [
+  'PLAN_PAUSED',
+  'PLAN_ARCHIVED',
+  'SERIES_RULE_REMOVED',
+  'USER_CANCELLED',
+  'SPLIT',
+] as const;
+export type OccurrenceCancelReason = (typeof OCCURRENCE_CANCEL_REASONS)[number];
+
+export type SplitChildDraft = {
+  name: string;
+  subject: string;
+  standard: string;
+  durationMinutes: number | null;
+  steps: string[];
+  scheduledLocalDate: string;
+};
+
+export function canSplitOccurrence(input: {
+  planStatus: string;
+  occurrenceStatus: string;
+  scheduledLocalDate: string;
+  todayLocalDate: string;
+  sourceOccurrenceId: string | null;
+}): boolean {
+  return (
+    input.planStatus === 'ACTIVE' &&
+    input.occurrenceStatus === 'PLANNED' &&
+    input.sourceOccurrenceId == null &&
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) >= 0
+  );
+}
+
+export function normalizeSplitChildren(children: SplitChildDraft[]): SplitChildDraft[] {
+  return children.map((child) => ({
+    name: child.name.trim(),
+    subject: child.subject.trim(),
+    standard: child.standard.trim(),
+    durationMinutes: child.durationMinutes,
+    steps: child.steps.map((step) => step.trim()).filter(Boolean),
+    scheduledLocalDate: child.scheduledLocalDate,
+  }));
+}
+
+export function splitChildDateErrors(children: SplitChildDraft[], todayLocalDate: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  children.forEach((child, index) => {
+    if (compareLocalDate(child.scheduledLocalDate, todayLocalDate) < 0) {
+      fields[`children.${index}.scheduledLocalDate`] = 'past';
+    }
+  });
+  return fields;
+}
+
+export function splitPreviewCanonicalPayload(input: {
+  studentId: string;
+  studentVersion: number;
+  planId: string;
+  planVersion: number;
+  seriesId: string;
+  seriesVersion: number;
+  occurrenceId: string;
+  occurrenceVersion: number;
+  occurrenceKey: string;
+  scheduledLocalDate: string;
+  status: string;
+  cancelReason: string | null;
+  contentExceptionAdjustmentId: string | null;
+  scheduleExceptionAdjustmentId: string | null;
+  nameSnapshot: string;
+  subjectSnapshot: string;
+  completionStandardSnapshot: string;
+  durationMinutesSnapshot: number | null;
+  stepsSnapshotJson: string;
+  timezone: string;
+  todayLocalDate: string;
+  children: SplitChildDraft[];
+  reason: string;
+}) {
+  return {
+    studentId: input.studentId,
+    studentVersion: input.studentVersion,
+    planId: input.planId,
+    planVersion: input.planVersion,
+    seriesId: input.seriesId,
+    seriesVersion: input.seriesVersion,
+    occurrenceId: input.occurrenceId,
+    occurrenceVersion: input.occurrenceVersion,
+    occurrenceKey: input.occurrenceKey,
+    scheduledLocalDate: input.scheduledLocalDate,
+    status: input.status,
+    cancelReason: input.cancelReason,
+    contentExceptionAdjustmentId: input.contentExceptionAdjustmentId,
+    scheduleExceptionAdjustmentId: input.scheduleExceptionAdjustmentId,
+    nameSnapshot: input.nameSnapshot,
+    subjectSnapshot: input.subjectSnapshot,
+    completionStandardSnapshot: input.completionStandardSnapshot,
+    durationMinutesSnapshot: input.durationMinutesSnapshot,
+    stepsSnapshotJson: input.stepsSnapshotJson,
+    timezone: input.timezone,
+    todayLocalDate: input.todayLocalDate,
+    children: input.children,
+    reason: input.reason,
+  };
 }
 
 export type FutureContentEffect =

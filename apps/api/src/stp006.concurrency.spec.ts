@@ -1370,4 +1370,115 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await pauseHolder.end();
     await pauseObserver.end();
   });
+
+  it('split waits on single edit and a second split does not create another child set', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '拆分竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const student = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.studentId } });
+    const versions = {
+      expectedStudentVersion: student.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: row.series.version,
+      expectedOccurrenceVersion: row.version,
+    };
+    const children = [
+      {
+        name: `${row.nameSnapshot}上`,
+        subject: row.subjectSnapshot,
+        standard: '前半',
+        durationMinutes: 10,
+        steps: ['先做'],
+        scheduledLocalDate: row.scheduledLocalDate,
+      },
+      {
+        name: `${row.nameSnapshot}下`,
+        subject: row.subjectSnapshot,
+        standard: '后半',
+        durationMinutes: 10,
+        steps: ['再做'],
+        scheduledLocalDate: row.scheduledLocalDate,
+      },
+    ];
+    const preview = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/split/preview`)
+      .set(writeHeaders(cookies))
+      .send({ ...versions, children, reason: '并发拆分' });
+    expect(preview.status).toBe(200);
+
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const editPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/tasks/${row.id}`)
+        .set(writeHeaders(cookies))
+        .send({
+          name: '单次先写',
+          subject: row.subjectSnapshot,
+          standard: row.completionStandardSnapshot,
+          durationMinutes: 10,
+          steps: ['先做'],
+          expectedVersion: row.version,
+        }),
+    );
+    const editor = await waitForWaiterOnHolder(observer, holderPid, 'single edit waits on pairing');
+    const splitPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/tasks/${row.id}/split`)
+        .set(writeHeaders(cookies))
+        .send({ ...versions, children, reason: '并发拆分', previewDigest: preview.body.previewDigest }),
+    );
+    const splitWaiter = await waitForWaiterOnHolder(observer, editor.waiter_pid, 'split waits on edit');
+    expect(splitWaiter.holder_pid).toBe(editor.waiter_pid);
+    await holder.query('ROLLBACK');
+    const edited = await editPromise;
+    const split = await splitPromise;
+    expect(edited.status).toBe(200);
+    expect(split.status).toBe(409);
+    expect(['VERSION_CONFLICT', 'TASK_SPLIT_PREVIEW_STALE']).toContain(split.body.code);
+    expect(await prisma.taskOccurrence.count({ where: { sourceOccurrenceId: row.id } })).toBe(0);
+    expect((await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id } })).status).toBe('PLANNED');
+    await holder.end();
+    await observer.end();
+
+    const nextStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.studentId } });
+    const nextRow = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id }, include: { series: true } });
+    const nextVersions = {
+      expectedStudentVersion: nextStudent.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: nextRow.series.version,
+      expectedOccurrenceVersion: nextRow.version,
+    };
+    const nextPreview = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/split/preview`)
+      .set(writeHeaders(cookies))
+      .send({ ...nextVersions, children, reason: '双拆' });
+    expect(nextPreview.status).toBe(200);
+    const first = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/split`)
+      .set(writeHeaders(cookies))
+      .send({ ...nextVersions, children, reason: '双拆', previewDigest: nextPreview.body.previewDigest });
+    expect(first.status).toBe(200);
+    const second = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/split`)
+      .set(writeHeaders(cookies, randomUUID()))
+      .send({
+        ...nextVersions,
+        expectedOccurrenceVersion: first.body.parent.version,
+        children,
+        reason: '双拆',
+        previewDigest: nextPreview.body.previewDigest,
+      });
+    expect(second.status).toBe(409);
+    expect(['TASK_NOT_ADJUSTABLE', 'VERSION_CONFLICT', 'TASK_SPLIT_PREVIEW_STALE']).toContain(second.body.code);
+    expect(await prisma.taskOccurrence.count({ where: { sourceOccurrenceId: row.id } })).toBe(2);
+  });
 });

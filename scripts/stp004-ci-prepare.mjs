@@ -21,6 +21,10 @@ import {
   FIXTURE_DATABASE as EIGHT_TO_NINE_DATABASE,
   recordEightToNineFixtureUrl,
 } from './stp006-eight-to-nine.mjs';
+import {
+  FIXTURE_DATABASE as NINE_TO_TEN_DATABASE,
+  recordNineToTenFixtureUrl,
+} from './stp006-nine-to-ten.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -301,6 +305,52 @@ if (process.env.STP006_EIGHT_TO_NINE_DATABASE_URL !== eightToNineUrl) {
   throw new Error('STP006_EIGHT_TO_NINE_DATABASE_URL was not applied in the current prepare step');
 }
 
+const nineToTen = spawnSync(process.execPath, [join(root, 'scripts/stp006-nine-to-ten.mjs')], {
+  cwd: root,
+  env: { ...process.env },
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(nineToTen.stdout || '');
+process.stderr.write(nineToTen.stderr || '');
+if (nineToTen.status !== 0) {
+  process.exit(nineToTen.status ?? 1);
+}
+
+const nineToTenUrl = rewriteDb(adminUrl, NINE_TO_TEN_DATABASE);
+const nineToTenDbClient = new pg.Client({ connectionString: nineToTenUrl, connectionTimeoutMillis: 8000 });
+await nineToTenDbClient.connect();
+const nineToTenDb = await nineToTenDbClient.query('SELECT current_database() AS name');
+if (nineToTenDb.rows[0]?.name !== NINE_TO_TEN_DATABASE) {
+  await nineToTenDbClient.end();
+  throw new Error('nine-to-ten fixture connected to the wrong database');
+}
+const tenBaseline = await nineToTenDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '九到十基线'`,
+);
+const tenApplied = await nineToTenDbClient.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const tenCheck = await nineToTenDbClient.query(`
+  SELECT conname FROM pg_constraint WHERE conname = 'task_occurrences_cancel_reason_check'
+`);
+await nineToTenDbClient.end();
+if (tenBaseline.rows[0]?.n !== 1) {
+  throw new Error('nine-to-ten baseline student missing');
+}
+if (tenApplied.rows[0]?.n !== 10) {
+  throw new Error('nine-to-ten fixture did not apply ten migrations');
+}
+if (tenCheck.rowCount !== 1) {
+  throw new Error('nine-to-ten fixture missing cancel_reason check');
+}
+recordNineToTenFixtureUrl(nineToTenUrl, process.env);
+if (process.env.STP006_NINE_TO_TEN_DATABASE_URL !== nineToTenUrl) {
+  throw new Error('STP006_NINE_TO_TEN_DATABASE_URL was not applied in the current prepare step');
+}
+
 const sixToSevenStill = new pg.Client({ connectionString: sixToSevenUrl, connectionTimeoutMillis: 8000 });
 await sixToSevenStill.connect();
 const sixToSevenCount = await sixToSevenStill.query(`
@@ -338,6 +388,24 @@ if (sevenToEightRevision.rows[0]?.revisions) {
   throw new Error('seven-to-eight fixture must not receive revision tables');
 }
 
+const eightToNineStill = new pg.Client({ connectionString: eightToNineUrl, connectionTimeoutMillis: 8000 });
+await eightToNineStill.connect();
+const eightToNineCount = await eightToNineStill.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const eightToNineCheck = await eightToNineStill.query(`
+  SELECT conname FROM pg_constraint WHERE conname = 'task_occurrences_cancel_reason_check'
+`);
+await eightToNineStill.end();
+if (eightToNineCount.rows[0]?.n !== 9) {
+  throw new Error('eight-to-nine fixture must stay at nine migrations');
+}
+if (eightToNineCheck.rowCount !== 0) {
+  throw new Error('eight-to-nine fixture must not receive tenth cancel_reason check');
+}
+
 process.stdout.write(
-  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}; eightToNine=${EIGHT_TO_NINE_DATABASE}\n`,
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}; eightToNine=${EIGHT_TO_NINE_DATABASE}; nineToTen=${NINE_TO_TEN_DATABASE}\n`,
 );

@@ -169,3 +169,36 @@ export type FutureScheduleProposal = z.infer<typeof futureScheduleProposalSchema
 export type FutureChangeProposal = z.infer<typeof futureChangeProposalSchema>;
 export type FutureChangePreviewInput = z.infer<typeof futureChangePreviewBaseSchema>;
 export type FutureChangeConfirmInput = FutureChangePreviewInput & { previewDigest: string };
+
+export const splitChildSchema = z
+  .object({
+    name: z.string().min(1).max(64),
+    subject: z.string().min(1).max(32),
+    standard: z.string().min(1).max(240),
+    durationMinutes: z.number().int().positive().max(24 * 60).nullable(),
+    steps: z.array(z.string().min(1).max(120)).max(12),
+    scheduledLocalDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  })
+  .strict();
+
+const splitPreviewBaseSchema = z
+  .object({
+    expectedStudentVersion: z.number().int().positive(),
+    expectedPlanVersion: z.number().int().positive(),
+    expectedSeriesVersion: z.number().int().positive(),
+    expectedOccurrenceVersion: z.number().int().positive(),
+    children: z.array(splitChildSchema).min(2).max(8),
+    reason: z.string().min(1).max(120),
+  })
+  .strict();
+
+export const splitPreviewSchema = splitPreviewBaseSchema;
+export const splitConfirmSchema = splitPreviewBaseSchema
+  .extend({
+    previewDigest: z.string().min(16).max(128),
+  })
+  .strict();
+
+export type SplitChildInput = z.infer<typeof splitChildSchema>;
+export type SplitPreviewInput = z.infer<typeof splitPreviewSchema>;
+export type SplitConfirmInput = z.infer<typeof splitConfirmSchema>;

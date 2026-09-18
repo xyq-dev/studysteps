@@ -9,6 +9,8 @@ import {
   futureChangeConfirmSchema,
   futureChangePreviewSchema,
   rescheduleTaskSchema,
+  splitConfirmSchema,
+  splitPreviewSchema,
   taskHorizonSchema,
 } from '@studysteps/contracts';
 import type { Request, Response } from 'express';
@@ -193,6 +195,40 @@ export class PlanningController {
       studentId,
       occurrenceId,
       futureChangeConfirmSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
+  }
+
+  @Post('students/:studentId/tasks/:occurrenceId/split/preview')
+  @HttpCode(200)
+  async previewSplit(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.previewSplit(session, studentId, occurrenceId, splitPreviewSchema.parse(body ?? {}));
+  }
+
+  @Post('students/:studentId/tasks/:occurrenceId/split')
+  @HttpCode(200)
+  async confirmSplit(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.confirmSplit(
+      session,
+      studentId,
+      occurrenceId,
+      splitConfirmSchema.parse(body ?? {}),
       this.idempotency.readKey(request.headers['idempotency-key']),
     );
   }

@@ -38,13 +38,13 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
     await prisma.$disconnect();
   });
 
-  it('applies nine migrations and does not publish policy in the structure migration', async () => {
+  it('applies ten migrations and does not publish policy in the structure migration', async () => {
     const applied = await prisma.$queryRaw<Array<{ n: number }>>`
       SELECT COUNT(*)::int AS n
         FROM _prisma_migrations
        WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    expect(applied[0]?.n).toBe(9);
+    expect(applied[0]?.n).toBe(10);
     const seventh = await prisma.$queryRaw<Array<{ migration_name: string }>>`
       SELECT migration_name FROM _prisma_migrations
        WHERE migration_name = '20260917120000_stp006_study_plans_occurrences'
@@ -65,6 +65,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
        WHERE migration_name = '20260918120000_stp006_series_revisions'
     `;
     expect(ninth).toHaveLength(1);
+    const tenth = await prisma.$queryRaw<Array<{ migration_name: string }>>`
+      SELECT migration_name FROM _prisma_migrations
+       WHERE migration_name = '20260918180000_stp006_split_parentage'
+    `;
+    expect(tenth).toHaveLength(1);
   });
 
   it('keeps test-v1 body/scope and publishes informal test-v2 separately', async () => {
@@ -158,5 +163,200 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
       }),
     ).rejects.toThrow();
     await expect(prisma.taskSeries.update({ where: { id: series.id }, data: { name: '不该改' } })).rejects.toThrow();
+  });
+
+  it('rejects illegal split parentage and keeps a failed constraint write rolled back', async () => {
+    const account = await prisma.account.create({ data: {} });
+    const student = await prisma.studentProfile.create({
+      data: {
+        nickname: `归属${randomUUID().slice(0, 8)}`,
+        avatarPresetId: 'avatar-03',
+        ageBand: 'UNDER_14',
+        ageConfirmationSource: 'GUARDIAN_DECLARATION',
+        ageConfirmedAt: new Date(),
+        ageConfirmedByAccountId: account.id,
+        timezone: 'Asia/Shanghai',
+        createdByAccountId: account.id,
+      },
+    });
+    const other = await prisma.studentProfile.create({
+      data: {
+        nickname: `外档${randomUUID().slice(0, 8)}`,
+        avatarPresetId: 'avatar-03',
+        ageBand: 'UNDER_14',
+        ageConfirmationSource: 'GUARDIAN_DECLARATION',
+        ageConfirmedAt: new Date(),
+        ageConfirmedByAccountId: account.id,
+        timezone: 'Asia/Shanghai',
+        createdByAccountId: account.id,
+      },
+    });
+    const plan = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: student.id,
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Asia/Shanghai',
+      },
+    });
+    const foreignPlan = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: other.id,
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Asia/Shanghai',
+      },
+    });
+    const series = await prisma.taskSeries.create({
+      data: {
+        planId: plan.id,
+        name: '父任务',
+        subject: '语文',
+        completionStandard: '完成',
+        repeatKind: 'ONCE',
+        startLocalDate: '2026-09-18',
+        endLocalDate: '2026-09-18',
+        ongoing: false,
+        effectiveFromLocalDate: '2026-09-18',
+        effectiveToLocalDate: '2026-09-18',
+      },
+    });
+    const childSeries = await prisma.taskSeries.create({
+      data: {
+        planId: plan.id,
+        name: '子任务',
+        subject: '语文',
+        completionStandard: '完成',
+        repeatKind: 'ONCE',
+        startLocalDate: '2026-09-18',
+        endLocalDate: '2026-09-18',
+        ongoing: false,
+        effectiveFromLocalDate: '2026-09-18',
+        effectiveToLocalDate: '2026-09-18',
+      },
+    });
+    const foreignSeries = await prisma.taskSeries.create({
+      data: {
+        planId: foreignPlan.id,
+        name: '外计划',
+        subject: '英语',
+        completionStandard: '完成',
+        repeatKind: 'ONCE',
+        startLocalDate: '2026-09-18',
+        endLocalDate: '2026-09-18',
+        ongoing: false,
+        effectiveFromLocalDate: '2026-09-18',
+        effectiveToLocalDate: '2026-09-18',
+      },
+    });
+    const grade = await prisma.gradeConfig.findFirstOrThrow({
+      where: { schoolSystemCode: 'SIX_THREE', stageCode: 'PRIMARY', gradeCode: 'G1' },
+    });
+    const snapshot = {
+      timezoneSnapshot: 'Asia/Shanghai',
+      status: 'PLANNED',
+      nameSnapshot: '父任务',
+      subjectSnapshot: '语文',
+      completionStandardSnapshot: '完成',
+      stepsSnapshotJson: '[]',
+      gradeConfigId: grade.id,
+      gradeConfigVersionId: grade.currentVersionId!,
+      stageCodeSnapshot: 'PRIMARY',
+      schoolSystemCodeSnapshot: 'SIX_THREE',
+      gradeCodeSnapshot: 'G1',
+      gradeLabelSnapshot: '一年级',
+      termCodeSnapshot: 'FULL_YEAR',
+      catalogEntryKeySnapshot: 'PRIMARY_G1',
+    };
+    const parent = await prisma.taskOccurrence.create({
+      data: {
+        ...snapshot,
+        seriesId: series.id,
+        occurrenceKey: '2026-09-18',
+        originalLocalDate: '2026-09-18',
+        scheduledLocalDate: '2026-09-18',
+      },
+    });
+    const foreign = await prisma.taskOccurrence.create({
+      data: {
+        ...snapshot,
+        seriesId: foreignSeries.id,
+        nameSnapshot: '外计划',
+        subjectSnapshot: '英语',
+        occurrenceKey: '2026-09-18',
+        originalLocalDate: '2026-09-18',
+        scheduledLocalDate: '2026-09-18',
+      },
+    });
+    await expect(
+      prisma.taskOccurrence.create({
+        data: {
+          ...snapshot,
+          seriesId: childSeries.id,
+          occurrenceKey: '2026-09-18',
+          originalLocalDate: '2026-09-18',
+          scheduledLocalDate: '2026-09-18',
+          sourceOccurrenceId: foreign.id,
+        },
+      }),
+    ).rejects.toThrow();
+    expect(
+      await prisma.taskOccurrence.count({
+        where: { seriesId: childSeries.id },
+      }),
+    ).toBe(0);
+    await expect(
+      prisma.taskOccurrence.update({
+        where: { id: parent.id },
+        data: { sourceOccurrenceId: parent.id },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      prisma.taskOccurrence.update({
+        where: { id: parent.id },
+        data: { cancelReason: 'BOGUS' },
+      }),
+    ).rejects.toThrow();
+    const child = await prisma.taskOccurrence.create({
+      data: {
+        ...snapshot,
+        seriesId: childSeries.id,
+        nameSnapshot: '子任务',
+        occurrenceKey: '2026-09-18',
+        originalLocalDate: '2026-09-18',
+        scheduledLocalDate: '2026-09-18',
+        sourceOccurrenceId: parent.id,
+      },
+    });
+    await expect(
+      prisma.taskOccurrence.update({
+        where: { id: child.id },
+        data: { sourceOccurrenceId: foreign.id },
+      }),
+    ).rejects.toThrow();
+    expect((await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: child.id } })).sourceOccurrenceId).toBe(
+      parent.id,
+    );
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await tx.taskOccurrence.update({
+          where: { id: parent.id },
+          data: { status: 'CANCELLED', cancelReason: 'SPLIT', version: { increment: 1 } },
+        });
+        await tx.taskOccurrence.create({
+          data: {
+            ...snapshot,
+            seriesId: foreignSeries.id,
+            occurrenceKey: '2026-09-19',
+            originalLocalDate: '2026-09-19',
+            scheduledLocalDate: '2026-09-19',
+            sourceOccurrenceId: parent.id,
+          },
+        });
+      }),
+    ).rejects.toThrow();
+    const afterFail = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: parent.id } });
+    expect(afterFail.status).toBe('PLANNED');
+    expect(afterFail.cancelReason).toBeNull();
   });
 });
