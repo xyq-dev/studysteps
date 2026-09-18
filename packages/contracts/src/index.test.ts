@@ -219,7 +219,7 @@ describe('request validation', () => {
     expect(taskHorizonSchema.safeParse({ studentId: 'other' }).success).toBe(false);
   });
 
-  it('accepts FUTURE content preview/confirm and rejects schedule or history fields', () => {
+  it('accepts FUTURE content or schedule preview/confirm and rejects mixed or history fields', () => {
     const proposal = {
       kind: 'CONTENT',
       name: '朗读',
@@ -243,10 +243,36 @@ describe('request validation', () => {
         previewDigest: 'd'.repeat(16),
       }).previewDigest,
     ).toHaveLength(16);
+    const schedule = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [1, 3, 5],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '改成指定日',
+    };
+    expect(
+      futureChangePreviewSchema.parse({
+        ...preview,
+        proposal: schedule,
+      }).proposal,
+    ).toEqual(schedule);
     expect(
       futureChangePreviewSchema.safeParse({
         ...preview,
         proposal: { ...proposal, kind: 'SCHEDULE', repeatKind: 'DAILY' },
+      }).success,
+    ).toBe(false);
+    expect(
+      futureChangePreviewSchema.safeParse({
+        ...preview,
+        proposal: { ...schedule, weekdays: null },
+      }).success,
+    ).toBe(false);
+    expect(
+      futureChangePreviewSchema.safeParse({
+        ...preview,
+        proposal: { ...schedule, repeatKind: 'DAILY', weekdays: [1] },
       }).success,
     ).toBe(false);
     expect(

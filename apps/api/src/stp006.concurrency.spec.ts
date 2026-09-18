@@ -14,6 +14,7 @@ import {
   loadStp004Env,
   shouldSkipStp004Isolation,
 } from './test/load-stp004-env';
+import { isoWeekdayFromLocalDate } from '@studysteps/domain';
 import { backendPid, waitForWaiterOnHolder } from './test/lock-barrier';
 
 const ORIGIN = 'http://127.0.0.1:5173';
@@ -1212,5 +1213,161 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     })).toBe(0);
     await stepHolder.end();
     await stepObserver.end();
+  });
+
+  it('future schedule waits on horizon and pause-first writes nothing', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '排期竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const student = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.studentId } });
+    const weekday = isoWeekdayFromLocalDate(row.occurrenceKey);
+    const versions = {
+      expectedStudentVersion: student.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: row.series.version,
+      expectedOccurrenceVersion: row.version,
+    };
+    const proposal = {
+      kind: 'SCHEDULE',
+      repeatKind: 'WEEKLY_DAYS',
+      weekdays: [weekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '并发排期',
+    };
+    const preview = await agent()
+      .post(`/v1/students/${ready.studentId}/tasks/${row.id}/future-change/preview`)
+      .set(writeHeaders(cookies))
+      .send({ ...versions, proposal });
+    expect(preview.status).toBe(200);
+
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM study_plans WHERE id = $1 FOR UPDATE', [plan.id]);
+    const holderPid = await backendPid(holder);
+    const horizonPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/task-horizon`)
+        .set(writeHeaders(cookies))
+        .send({}),
+    );
+    const horizonWaiter = await waitForWaiterOnHolder(observer, holderPid, 'horizon waits on plan');
+    const schedulePromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/tasks/${row.id}/future-change`)
+        .set(writeHeaders(cookies))
+        .send({ ...versions, proposal, previewDigest: preview.body.previewDigest }),
+    );
+    const scheduleWaiter = await waitForWaiterOnHolder(observer, horizonWaiter.waiter_pid, 'schedule waits on horizon');
+    expect(scheduleWaiter.holder_pid).toBe(horizonWaiter.waiter_pid);
+    await holder.query('ROLLBACK');
+    const horizon = await horizonPromise;
+    const scheduled = await schedulePromise;
+    expect(horizon.status).toBe(200);
+    expect([200, 409]).toContain(scheduled.status);
+    if (scheduled.status === 200) {
+      expect(scheduled.body.series.version).toBe(row.series.version + 1);
+      expect(
+        await prisma.planAdjustment.count({
+          where: { seriesId: row.seriesId, reasonCode: 'SERIES_FUTURE_SCHEDULE_CHANGED' },
+        }),
+      ).toBe(1);
+    } else {
+      expect(['VERSION_CONFLICT', 'TASK_FUTURE_PREVIEW_STALE']).toContain(scheduled.body.code);
+      expect(
+        await prisma.planAdjustment.count({
+          where: { seriesId: row.seriesId, reasonCode: 'SERIES_FUTURE_SCHEDULE_CHANGED' },
+        }),
+      ).toBe(0);
+    }
+    const grouped = await prisma.taskOccurrence.groupBy({
+      by: ['seriesId', 'occurrenceKey'],
+      where: { seriesId: row.seriesId },
+      _count: { _all: true },
+    });
+    expect(grouped.every((item) => item._count._all === 1)).toBe(true);
+    await holder.end();
+    await observer.end();
+
+    const pauseReady = await readyStudent(cookies, '排期暂停竞争');
+    const pausePlan = await importReadyPlan(cookies, pauseReady);
+    const pauseRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: pausePlan.id }, status: 'PLANNED' },
+      include: { series: true },
+    });
+    const pauseStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: pauseReady.studentId } });
+    const pauseWeekday = isoWeekdayFromLocalDate(pauseRow.occurrenceKey);
+    const pauseProposal = {
+      kind: 'SCHEDULE',
+      repeatKind: 'WEEKLY_DAYS',
+      weekdays: [pauseWeekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '暂停竞争',
+    };
+    const pausePreview = await agent()
+      .post(`/v1/students/${pauseReady.studentId}/tasks/${pauseRow.id}/future-change/preview`)
+      .set(writeHeaders(cookies))
+      .send({
+        expectedStudentVersion: pauseStudent.version,
+        expectedPlanVersion: pausePlan.version,
+        expectedSeriesVersion: pauseRow.series.version,
+        expectedOccurrenceVersion: pauseRow.version,
+        proposal: pauseProposal,
+      });
+    expect(pausePreview.status).toBe(200);
+    const pauseHolder = new pg.Client({ connectionString });
+    const pauseObserver = await observerClient();
+    await pauseHolder.connect();
+    await pauseHolder.query('BEGIN');
+    await pauseHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [pauseReady.pairingId]);
+    const pauseHolderPid = await backendPid(pauseHolder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${pauseReady.studentId}/plans/${pausePlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: pausePlan.version }),
+    );
+    const pauseWaiter = await waitForWaiterOnHolder(pauseObserver, pauseHolderPid, 'pause waits on pairing');
+    const scheduleAfterPausePromise = dispatch(
+      agent()
+        .post(`/v1/students/${pauseReady.studentId}/tasks/${pauseRow.id}/future-change`)
+        .set(writeHeaders(cookies))
+        .send({
+          expectedStudentVersion: pauseStudent.version,
+          expectedPlanVersion: pausePlan.version,
+          expectedSeriesVersion: pauseRow.series.version,
+          expectedOccurrenceVersion: pauseRow.version,
+          proposal: pauseProposal,
+          previewDigest: pausePreview.body.previewDigest,
+        }),
+    );
+    const scheduleAfterPauseWaiter = await waitForWaiterOnHolder(
+      pauseObserver,
+      pauseWaiter.waiter_pid,
+      'schedule waits on pause',
+    );
+    expect(scheduleAfterPauseWaiter.holder_pid).toBe(pauseWaiter.waiter_pid);
+    await pauseHolder.query('ROLLBACK');
+    const paused = await pausePromise;
+    const scheduleAfterPause = await scheduleAfterPausePromise;
+    expect(paused.status).toBe(200);
+    expect(paused.body.status).toBe('PAUSED');
+    expect(scheduleAfterPause.status).toBe(409);
+    expect(['PLAN_STATUS_INVALID', 'VERSION_CONFLICT', 'TASK_NOT_ADJUSTABLE']).toContain(scheduleAfterPause.body.code);
+    expect(
+      await prisma.planAdjustment.count({
+        where: { seriesId: pauseRow.seriesId, reasonCode: 'SERIES_FUTURE_SCHEDULE_CHANGED' },
+      }),
+    ).toBe(0);
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: pauseRow.seriesId } })).toBe(1);
+    await pauseHolder.end();
+    await pauseObserver.end();
   });
 });

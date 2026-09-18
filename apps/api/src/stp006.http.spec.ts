@@ -1829,11 +1829,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
       steps: ['先读新课文'],
       reason: '统一后续内容',
     };
-    const scheduleRejected = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, {
+    const mixedRejected = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, {
       ...versions,
-      proposal: { kind: 'SCHEDULE', repeatKind: 'DAILY', weekdays: null, endLocalDate: null, ongoing: true, reason: '不应开放' },
+      proposal: { kind: 'SCHEDULE', name: '混填', reason: '缺字段' },
     });
-    expect(scheduleRejected.status).toBe(400);
+    expect(mixedRejected.status).toBe(400);
 
     const preview = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, { ...versions, proposal });
     expect(preview.status).toBe(200);
@@ -2049,5 +2049,466 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     );
     expect(denied.status).toBeGreaterThanOrEqual(400);
     expect(denied.status).not.toBe(200);
+  });
+
+  it('applies FUTURE schedule from the original key, restores removals, and keeps exceptions plus other series', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '未来排期'));
+    const today = shanghaiToday();
+    const created = await createManualPlan(auth.cookies, student, [
+      {
+        name: '主规则',
+        subject: '语文',
+        standard: '读完一页',
+        repeatKind: 'DAILY',
+        startLocalDate: today,
+        ongoing: true,
+      },
+      {
+        name: '另一规则',
+        subject: '数学',
+        standard: '完成练习',
+        repeatKind: 'DAILY',
+        startLocalDate: today,
+        ongoing: true,
+      },
+    ]);
+    const planId = created.id;
+    const rows = await prisma.taskOccurrence.findMany({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { occurrenceKey: 'asc' },
+      include: { series: true },
+    });
+    const seriesId = rows.find((row) => rows.filter((item) => item.seriesId === row.seriesId).length > 3)?.seriesId;
+    const sameSeries = rows.filter((row) => row.seriesId === seriesId).sort((a, b) => a.occurrenceKey.localeCompare(b.occurrenceKey));
+    const otherSeries = rows.find((row) => row.seriesId !== seriesId);
+    expect(sameSeries.length).toBeGreaterThan(3);
+    expect(otherSeries).toBeTruthy();
+    const before = sameSeries[0]!;
+    const anchor = sameSeries[1]!;
+    const later = sameSeries[2]!;
+    const far = sameSeries[3]!;
+    const laterDate = addLocalDays(shanghaiToday(), 20);
+    const moved = await postReschedule(auth.cookies, student.id, later.id, {
+      scheduledLocalDate: laterDate,
+      reason: '排期例外',
+      expectedVersion: later.version,
+    });
+    expect(moved.status).toBe(200);
+    const edited = await patchOccurrence(auth.cookies, student.id, far.id, {
+      name: '内容例外名',
+      subject: far.subjectSnapshot,
+      standard: far.completionStandardSnapshot,
+      durationMinutes: far.durationMinutesSnapshot,
+      steps: JSON.parse(far.stepsSnapshotJson),
+      expectedVersion: far.version,
+    });
+    expect(edited.status).toBe(200);
+
+    const weekday = isoWeekdayFromLocalDate(anchor.occurrenceKey);
+    const studentRow = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const series = await prisma.taskSeries.findUniqueOrThrow({ where: { id: seriesId! } });
+    const plan = await prisma.studyPlan.findUniqueOrThrow({ where: { id: planId } });
+    const liveAnchor = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: anchor.id } });
+    const versions = {
+      expectedStudentVersion: studentRow.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: series.version,
+      expectedOccurrenceVersion: liveAnchor.version,
+    };
+    const weeklyProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [weekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '改成每周一天',
+    };
+    const preview = await postFuturePreview(auth.cookies, student.id, liveAnchor.id, { ...versions, proposal: weeklyProposal });
+    expect(preview.status).toBe(200);
+    expect(preview.body.cutoffOccurrenceKey).toBe(liveAnchor.occurrenceKey);
+    expect(preview.body.effects.cancelled.length).toBeGreaterThan(0);
+    expect(preview.body.effects.preservedException.some((item: { id: string }) => item.id === later.id)).toBe(true);
+    expect(preview.body.effects.unchanged.some((item: { id: string }) => item.id === before.id)).toBe(true);
+    expect(preview.body.conflicts).toEqual([]);
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: seriesId! } })).toBe(1);
+
+    const confirmed = await postFutureConfirm(auth.cookies, student.id, liveAnchor.id, {
+      ...versions,
+      proposal: weeklyProposal,
+      previewDigest: preview.body.previewDigest,
+    });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.plan.version).toBe(plan.version);
+    expect(confirmed.body.series.version).toBe(series.version + 1);
+    expect(confirmed.body.adjustmentId).toBeTruthy();
+    expect(
+      await prisma.planAdjustment.count({ where: { seriesId: seriesId!, reasonCode: 'SERIES_FUTURE_SCHEDULE_CHANGED' } }),
+    ).toBe(1);
+    expect(await prisma.planAdjustment.count({ where: { seriesId: seriesId!, reasonCode: 'TASK_RESCHEDULED' } })).toBe(1);
+
+    const afterRows = await prisma.taskOccurrence.findMany({ where: { seriesId } });
+    expect(afterRows.find((row) => row.id === before.id)?.status).toBe('PLANNED');
+    expect(afterRows.find((row) => row.id === liveAnchor.id)?.status).toBe('PLANNED');
+    expect(afterRows.find((row) => row.id === liveAnchor.id)?.scheduleRevisionNo).toBe(confirmed.body.series.version);
+    expect(afterRows.find((row) => row.id === later.id)?.status).toBe('PLANNED');
+    expect(afterRows.find((row) => row.id === later.id)?.scheduledLocalDate).toBe(laterDate);
+    expect(afterRows.find((row) => row.id === later.id)?.occurrenceKey).toBe(later.occurrenceKey);
+    expect(afterRows.find((row) => row.id === far.id)?.nameSnapshot).toBe('内容例外名');
+    const cancelled = afterRows.filter(
+      (row) =>
+        row.occurrenceKey > liveAnchor.occurrenceKey &&
+        row.id !== later.id &&
+        row.status === 'CANCELLED' &&
+        row.cancelReason === 'SERIES_RULE_REMOVED',
+    );
+    expect(cancelled.length).toBeGreaterThan(0);
+    expect(cancelled.every((row) => row.id === afterRows.find((item) => item.occurrenceKey === row.occurrenceKey)?.id)).toBe(
+      true,
+    );
+    expect(otherSeries && (await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: otherSeries.id } })).status).toBe(
+      'PLANNED',
+    );
+
+    const restoredTarget =
+      cancelled.find((row) => isoWeekdayFromLocalDate(row.occurrenceKey) !== isoWeekdayFromLocalDate(laterDate)) ??
+      cancelled[0]!;
+    const restoreWeekday = isoWeekdayFromLocalDate(restoredTarget.occurrenceKey);
+    const restoredStudent = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const restoredSeries = await prisma.taskSeries.findUniqueOrThrow({ where: { id: seriesId! } });
+    const restoredAnchor = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: liveAnchor.id } });
+    const restoreProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [...new Set([weekday, restoreWeekday])],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '把旧日再纳入',
+    };
+    const restorePreview = await postFuturePreview(auth.cookies, student.id, restoredAnchor.id, {
+      expectedStudentVersion: restoredStudent.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: restoredSeries.version,
+      expectedOccurrenceVersion: restoredAnchor.version,
+      proposal: restoreProposal,
+    });
+    expect(restorePreview.status).toBe(200);
+    expect(restorePreview.body.effects.restored.some((item: { id: string }) => item.id === restoredTarget.id)).toBe(true);
+    const restored = await postFutureConfirm(auth.cookies, student.id, restoredAnchor.id, {
+      expectedStudentVersion: restoredStudent.version,
+      expectedPlanVersion: plan.version,
+      expectedSeriesVersion: restoredSeries.version,
+      expectedOccurrenceVersion: restoredAnchor.version,
+      proposal: restoreProposal,
+      previewDigest: restorePreview.body.previewDigest,
+    });
+    expect(restored.status).toBe(200);
+    const revived = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: restoredTarget.id } });
+    expect(revived).toMatchObject({
+      status: 'PLANNED',
+      cancelReason: null,
+      occurrenceKey: restoredTarget.occurrenceKey,
+      scheduledLocalDate: restoredTarget.scheduledLocalDate,
+      gradeLabelSnapshot: restoredTarget.gradeLabelSnapshot,
+    });
+
+    await prisma.taskOccurrence.update({
+      where: { id: revived.id },
+      data: { status: 'CANCELLED', cancelReason: 'USER_CANCELLED' },
+    });
+    const userCancelHorizon = await agent()
+      .post(`/v1/students/${student.id}/task-horizon`)
+      .set(writeHeaders(auth.cookies))
+      .send({});
+    expect(userCancelHorizon.status).toBe(200);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: revived.id } })).toMatchObject({
+      status: 'CANCELLED',
+      cancelReason: 'USER_CANCELLED',
+    });
+  });
+
+  it('keeps CONTENT and SCHEDULE axes independent and rejects same-series collisions without partial writes', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '双轴排期'));
+    const today = shanghaiToday();
+    const created = await createManualPlan(auth.cookies, student, [
+      {
+        name: '主规则',
+        subject: '语文',
+        standard: '读完一页',
+        repeatKind: 'DAILY',
+        startLocalDate: today,
+        ongoing: true,
+      },
+    ]);
+    const planId = created.id;
+    const rows = await prisma.taskOccurrence.findMany({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { occurrenceKey: 'asc' },
+    });
+    expect(rows.length).toBeGreaterThan(3);
+    const anchor = rows[0]!;
+    const later = rows[1]!;
+    const versions = async (occurrenceId: string) => {
+      const studentRow = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+      const row = await prisma.taskOccurrence.findUniqueOrThrow({
+        where: { id: occurrenceId },
+        include: { series: { include: { plan: true } } },
+      });
+      return {
+        expectedStudentVersion: studentRow.version,
+        expectedPlanVersion: row.series.plan.version,
+        expectedSeriesVersion: row.series.version,
+        expectedOccurrenceVersion: row.version,
+        seriesId: row.seriesId,
+        seriesVersion: row.series.version,
+        lock: {
+          expectedStudentVersion: studentRow.version,
+          expectedPlanVersion: row.series.plan.version,
+          expectedSeriesVersion: row.series.version,
+          expectedOccurrenceVersion: row.version,
+        },
+      };
+    };
+
+    const contentProposal = {
+      kind: 'CONTENT' as const,
+      name: '先改内容',
+      subject: '语文',
+      standard: '按新课文完成',
+      durationMinutes: 25,
+      steps: ['先读新课文'],
+      reason: '内容轴',
+    };
+    const contentVersions = await versions(anchor.id);
+    const contentPreview = await postFuturePreview(auth.cookies, student.id, anchor.id, {
+      ...contentVersions.lock,
+      proposal: contentProposal,
+    });
+    expect(contentPreview.status).toBe(200);
+    const contentConfirm = await postFutureConfirm(auth.cookies, student.id, anchor.id, {
+      ...contentVersions.lock,
+      proposal: contentProposal,
+      previewDigest: contentPreview.body.previewDigest,
+    });
+    expect(contentConfirm.status).toBe(200);
+
+    const weekday = isoWeekdayFromLocalDate(anchor.occurrenceKey);
+    const scheduleProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [weekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '排期轴',
+    };
+    const scheduleVersions = await versions(anchor.id);
+    const schedulePreview = await postFuturePreview(auth.cookies, student.id, anchor.id, {
+      ...scheduleVersions.lock,
+      proposal: scheduleProposal,
+    });
+    expect(schedulePreview.status).toBe(200);
+    const scheduleConfirm = await postFutureConfirm(auth.cookies, student.id, anchor.id, {
+      ...scheduleVersions.lock,
+      proposal: scheduleProposal,
+      previewDigest: schedulePreview.body.previewDigest,
+    });
+    expect(scheduleConfirm.status).toBe(200);
+    const afterSchedule = await prisma.taskOccurrence.findMany({ where: { seriesId: contentVersions.seriesId } });
+    expect(afterSchedule.find((row) => row.id === anchor.id)?.nameSnapshot).toBe('先改内容');
+    expect(afterSchedule.find((row) => row.id === later.id)?.nameSnapshot).toBe('先改内容');
+    const cancelledAfterWeekly = afterSchedule.filter((row) => row.status === 'CANCELLED');
+    expect(cancelledAfterWeekly.length).toBeGreaterThan(0);
+
+    const secondContent = { ...contentProposal, name: '再改内容', reason: '排期后再改内容' };
+    const secondVersions = await versions(anchor.id);
+    const secondPreview = await postFuturePreview(auth.cookies, student.id, anchor.id, {
+      ...secondVersions.lock,
+      proposal: secondContent,
+    });
+    expect(secondPreview.status).toBe(200);
+    const secondConfirm = await postFutureConfirm(auth.cookies, student.id, anchor.id, {
+      ...secondVersions.lock,
+      proposal: secondContent,
+      previewDigest: secondPreview.body.previewDigest,
+    });
+    expect(secondConfirm.status).toBe(200);
+    const afterContent = await prisma.taskOccurrence.findMany({ where: { seriesId: contentVersions.seriesId } });
+    expect(afterContent.find((row) => row.id === anchor.id)?.nameSnapshot).toBe('再改内容');
+    expect(afterContent.find((row) => row.id === later.id && later.status === 'PLANNED')?.status ?? afterContent.find((row) => row.id === later.id)?.status).toBeDefined();
+    expect(afterContent.find((row) => row.id === later.id)?.status).toBe(
+      afterSchedule.find((row) => row.id === later.id)?.status,
+    );
+    expect(afterContent.find((row) => row.id === later.id)?.scheduledLocalDate).toBe(
+      afterSchedule.find((row) => row.id === later.id)?.scheduledLocalDate,
+    );
+
+    const occupant = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: anchor.id } });
+    const farDate = addLocalDays(shanghaiToday(), 20);
+    const moved = await postReschedule(auth.cookies, student.id, occupant.id, {
+      scheduledLocalDate: farDate,
+      reason: '占住窗口外日期',
+      expectedVersion: occupant.version,
+    });
+    expect(moved.status).toBe(200);
+    const collideProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'DAILY' as const,
+      weekdays: null,
+      endLocalDate: null,
+      ongoing: true,
+      reason: '会撞日',
+    };
+    const collideVersions = await versions(occupant.id);
+    const collidePreview = await postFuturePreview(auth.cookies, student.id, occupant.id, {
+      ...collideVersions.lock,
+      proposal: collideProposal,
+    });
+    expect(collidePreview.status).toBe(200);
+    expect(collidePreview.body.conflicts.length).toBeGreaterThan(0);
+    const beforeCount = await prisma.taskSeriesRevision.count({ where: { taskSeriesId: contentVersions.seriesId } });
+    const collideConfirm = await postFutureConfirm(auth.cookies, student.id, occupant.id, {
+      ...collideVersions.lock,
+      proposal: collideProposal,
+      previewDigest: collidePreview.body.previewDigest,
+    });
+    expect(collideConfirm.status).toBe(409);
+    expect(collideConfirm.body.code).toBe('TASK_DATE_CONFLICT');
+    expect(await prisma.taskSeriesRevision.count({ where: { taskSeriesId: contentVersions.seriesId } })).toBe(beforeCount);
+    expect(await prisma.taskSeries.findUniqueOrThrow({ where: { id: contentVersions.seriesId } })).toMatchObject({
+      version: collideVersions.seriesVersion,
+    });
+    const returned = await postReschedule(auth.cookies, student.id, occupant.id, {
+      scheduledLocalDate: occupant.occurrenceKey,
+      reason: '改回原日以便继续',
+      expectedVersion: (await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: occupant.id } })).version,
+    });
+    expect(returned.status).toBe(200);
+
+    const staleVersions = await versions(occupant.id);
+    const stale = await postFutureConfirm(auth.cookies, student.id, occupant.id, {
+      ...staleVersions.lock,
+      proposal: collideProposal,
+      previewDigest: 'stale-digest-value-xx',
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('TASK_FUTURE_PREVIEW_STALE');
+
+    const noOpProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [weekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '无变化',
+    };
+    const noOpVersions = await versions(occupant.id);
+    const noOpPreview = await postFuturePreview(auth.cookies, student.id, occupant.id, {
+      ...noOpVersions.lock,
+      proposal: noOpProposal,
+    });
+    expect(noOpPreview.status).toBe(200);
+    expect(noOpPreview.body.noOp).toBe(true);
+    const noOp = await postFutureConfirm(auth.cookies, student.id, occupant.id, {
+      ...noOpVersions.lock,
+      proposal: noOpProposal,
+      previewDigest: noOpPreview.body.previewDigest,
+    });
+    expect(noOp.status).toBe(200);
+    expect(noOp.body.noOp).toBe(true);
+    expect(noOp.body.adjustmentId).toBeNull();
+
+    const addProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'DAILY' as const,
+      weekdays: null,
+      endLocalDate: null,
+      ongoing: true,
+      reason: '补回每天',
+    };
+    const addVersions = await versions(occupant.id);
+    const addPreview = await postFuturePreview(auth.cookies, student.id, occupant.id, {
+      ...addVersions.lock,
+      proposal: addProposal,
+    });
+    expect(addPreview.status).toBe(200);
+    const addConfirm = await postFutureConfirm(auth.cookies, student.id, occupant.id, {
+      ...addVersions.lock,
+      proposal: addProposal,
+      previewDigest: addPreview.body.previewDigest,
+    });
+    expect(addConfirm.status).toBe(200);
+    const gap = await prisma.taskOccurrence.findFirst({
+      where: {
+        seriesId: contentVersions.seriesId,
+        status: 'PLANNED',
+        occurrenceKey: { gt: occupant.occurrenceKey },
+        scheduleExceptionAdjustmentId: null,
+      },
+      orderBy: { occurrenceKey: 'asc' },
+    });
+    if (gap) {
+      const oldGrade = gap.gradeLabelSnapshot;
+      await prisma.taskOccurrence.delete({ where: { id: gap.id } });
+      const horizon = await agent()
+        .post(`/v1/students/${student.id}/task-horizon`)
+        .set(writeHeaders(auth.cookies))
+        .send({});
+      expect(horizon.status).toBe(200);
+      const regenerated = await prisma.taskOccurrence.findFirst({
+        where: { seriesId: contentVersions.seriesId, occurrenceKey: gap.occurrenceKey },
+      });
+      expect(regenerated?.id).not.toBe(gap.id);
+      expect(regenerated?.nameSnapshot).toBe('再改内容');
+      expect(regenerated?.gradeLabelSnapshot).toBe(oldGrade);
+      const leftover = await prisma.taskOccurrence.findUnique({ where: { id: gap.id } });
+      expect(leftover).toBeNull();
+    }
+
+    const key = randomUUID();
+    const idemVersions = await versions(occupant.id);
+    const idemProposal = {
+      kind: 'SCHEDULE' as const,
+      repeatKind: 'WEEKLY_DAYS' as const,
+      weekdays: [weekday],
+      endLocalDate: null,
+      ongoing: true,
+      reason: '幂等排期',
+    };
+    const idemPreview = await postFuturePreview(auth.cookies, student.id, occupant.id, {
+      ...idemVersions.lock,
+      proposal: idemProposal,
+    });
+    expect(idemPreview.status).toBe(200);
+    const first = await postFutureConfirm(
+      auth.cookies,
+      student.id,
+      occupant.id,
+      { ...idemVersions.lock, proposal: idemProposal, previewDigest: idemPreview.body.previewDigest },
+      key,
+    );
+    expect(first.status).toBe(200);
+    const replay = await postFutureConfirm(
+      auth.cookies,
+      student.id,
+      occupant.id,
+      { ...idemVersions.lock, proposal: idemProposal, previewDigest: idemPreview.body.previewDigest },
+      key,
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.body.adjustmentId).toBe(first.body.adjustmentId);
+    const different = await postFutureConfirm(
+      auth.cookies,
+      student.id,
+      occupant.id,
+      {
+        ...idemVersions.lock,
+        proposal: { ...idemProposal, reason: '异体' },
+        previewDigest: idemPreview.body.previewDigest,
+      },
+      key,
+    );
+    expect(different.status).toBe(409);
+    expect(different.body.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 });

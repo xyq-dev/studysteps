@@ -496,6 +496,255 @@ export function futureContentProjectionUnchanged(
   return true;
 }
 
+export type OccurrenceSchedule = {
+  repeatKind: RepeatKind;
+  weekdays: IsoWeekday[] | null;
+  endLocalDate: string | null;
+  ongoing: boolean;
+};
+
+export function normalizeWeekdays(weekdays: IsoWeekday[] | null): IsoWeekday[] | null {
+  if (!weekdays) {
+    return null;
+  }
+  return [...new Set(weekdays)].sort((left, right) => left - right) as IsoWeekday[];
+}
+
+export function scheduleFromRevision(revision: SeriesRevisionRecord): OccurrenceSchedule | null {
+  if (!revision.repeatKind) {
+    return null;
+  }
+  return {
+    repeatKind: revision.repeatKind as RepeatKind,
+    weekdays: revision.weekdaysJson ? (JSON.parse(revision.weekdaysJson) as IsoWeekday[]) : null,
+    endLocalDate: revision.endLocalDate,
+    ongoing: revision.ongoing ?? true,
+  };
+}
+
+export function occurrenceScheduleEquals(left: OccurrenceSchedule, right: OccurrenceSchedule): boolean {
+  return (
+    left.repeatKind === right.repeatKind &&
+    left.ongoing === right.ongoing &&
+    left.endLocalDate === right.endLocalDate &&
+    JSON.stringify(normalizeWeekdays(left.weekdays)) === JSON.stringify(normalizeWeekdays(right.weekdays))
+  );
+}
+
+export function futureScheduleShapeErrors(
+  proposal: OccurrenceSchedule,
+  cutoffOccurrenceKey: string,
+): Record<string, string> {
+  const fields: Record<string, string> = {};
+  if (proposal.repeatKind === 'WEEKLY_DAYS') {
+    const weekdays = normalizeWeekdays(proposal.weekdays);
+    if (!weekdays || weekdays.length === 0) {
+      fields.weekdays = 'required';
+    }
+  } else if (proposal.weekdays != null) {
+    fields.weekdays = 'forbidden';
+  }
+  if (proposal.ongoing) {
+    if (proposal.endLocalDate != null) {
+      fields.endLocalDate = 'forbidden';
+    }
+  } else if (!proposal.endLocalDate || !isLocalDate(proposal.endLocalDate)) {
+    fields.endLocalDate = 'required';
+  } else if (compareLocalDate(proposal.endLocalDate, cutoffOccurrenceKey) < 0) {
+    fields.endLocalDate = 'beforeCutoff';
+  }
+  return fields;
+}
+
+export function scheduleRevisionFromProposal(
+  revisionNo: number,
+  cutoffOccurrenceKey: string,
+  proposal: OccurrenceSchedule,
+): SeriesRevisionRecord {
+  const weekdays = proposal.repeatKind === 'WEEKLY_DAYS' ? normalizeWeekdays(proposal.weekdays) : null;
+  return {
+    revisionNo,
+    changeKind: 'SCHEDULE',
+    effectiveFromOccurrenceKey: cutoffOccurrenceKey,
+    name: null,
+    subject: null,
+    completionStandard: null,
+    durationMinutes: null,
+    stepsJson: null,
+    repeatKind: proposal.repeatKind,
+    weekdaysJson: weekdays ? JSON.stringify(weekdays) : null,
+    endLocalDate: proposal.ongoing ? null : proposal.endLocalDate,
+    ongoing: proposal.ongoing,
+  };
+}
+
+export function futureScheduleProjectionUnchanged(
+  revisions: SeriesRevisionRecord[],
+  cutoffOccurrenceKey: string,
+  proposal: OccurrenceSchedule,
+): boolean {
+  const points = new Set<string>([cutoffOccurrenceKey]);
+  for (const row of revisions) {
+    if (
+      (row.changeKind === 'BASELINE' || row.changeKind === 'SCHEDULE') &&
+      compareLocalDate(row.effectiveFromOccurrenceKey, cutoffOccurrenceKey) >= 0
+    ) {
+      points.add(row.effectiveFromOccurrenceKey);
+    }
+  }
+  for (const key of points) {
+    const current = selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], key);
+    const schedule = current ? scheduleFromRevision(current) : null;
+    if (!schedule || !occurrenceScheduleEquals(schedule, proposal)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export type FutureScheduleEffect =
+  | 'modified'
+  | 'preserved_exception'
+  | 'preserved_history'
+  | 'preserved_terminal'
+  | 'preserved_cancelled'
+  | 'cancelled'
+  | 'restored'
+  | 'unchanged';
+
+export function classifyFutureScheduleEffect(input: {
+  occurrenceKey: string;
+  scheduledLocalDate: string;
+  status: string;
+  cancelReason: string | null;
+  cutoffOccurrenceKey: string;
+  todayLocalDate: string;
+  hasScheduleException: boolean;
+  hitsNextSchedule: boolean;
+  scheduleRevisionNo: number;
+  nextScheduleRevisionNo: number;
+  applyScheduleRevision: boolean;
+}): FutureScheduleEffect {
+  if (compareLocalDate(input.occurrenceKey, input.cutoffOccurrenceKey) < 0) {
+    return 'unchanged';
+  }
+  if (
+    compareLocalDate(input.occurrenceKey, input.todayLocalDate) < 0 ||
+    compareLocalDate(input.scheduledLocalDate, input.todayLocalDate) < 0
+  ) {
+    return 'preserved_history';
+  }
+  if (input.status === 'IN_PROGRESS' || input.status === 'COMPLETED' || input.status === 'SKIPPED') {
+    return 'preserved_terminal';
+  }
+  if (input.status === 'CANCELLED') {
+    if (
+      input.applyScheduleRevision &&
+      input.cancelReason === 'SERIES_RULE_REMOVED' &&
+      input.hitsNextSchedule &&
+      !input.hasScheduleException
+    ) {
+      return 'restored';
+    }
+    return 'preserved_cancelled';
+  }
+  if (input.status === 'PLANNED' && input.hasScheduleException) {
+    return 'preserved_exception';
+  }
+  if (input.status === 'PLANNED' && !input.hitsNextSchedule) {
+    return input.applyScheduleRevision ? 'cancelled' : 'unchanged';
+  }
+  if (
+    input.status === 'PLANNED' &&
+    input.hitsNextSchedule &&
+    input.applyScheduleRevision &&
+    input.scheduleRevisionNo !== input.nextScheduleRevisionNo
+  ) {
+    return 'modified';
+  }
+  return 'unchanged';
+}
+
+export type FutureScheduleConflict = {
+  scheduledLocalDate: string;
+  occupyingId: string;
+  occupyingOccurrenceKey: string;
+  occupyingStatus: string;
+  occupyingCancelReason: string | null;
+  reason: 'DATE_OCCUPIED';
+};
+
+export function futureScheduleAddedDates(input: {
+  revisions: Iterable<SeriesRevisionRecord>;
+  existingKeys: Iterable<string>;
+  cutoffOccurrenceKey: string;
+  todayLocalDate: string;
+}): string[] {
+  const have = new Set(input.existingKeys);
+  const window = horizonWindow(input.todayLocalDate, null);
+  const from =
+    compareLocalDate(input.cutoffOccurrenceKey, window.from) > 0 ? input.cutoffOccurrenceKey : window.from;
+  const dates: string[] = [];
+  let cursor = from;
+  while (compareLocalDate(cursor, window.to) <= 0) {
+    if (!have.has(cursor) && keyHitsEffectiveSchedule(input.revisions, cursor)) {
+      dates.push(cursor);
+    }
+    cursor = addLocalDays(cursor, 1);
+  }
+  return dates;
+}
+
+export function futureScheduleInsertConflicts(input: {
+  siblings: Array<{
+    id: string;
+    occurrenceKey: string;
+    scheduledLocalDate: string;
+    status: string;
+    cancelReason: string | null;
+  }>;
+  insertDates: Iterable<string>;
+}): FutureScheduleConflict[] {
+  const insert = new Set(input.insertDates);
+  const conflicts: FutureScheduleConflict[] = [];
+  for (const sibling of input.siblings) {
+    if (!insert.has(sibling.scheduledLocalDate)) {
+      continue;
+    }
+    conflicts.push({
+      scheduledLocalDate: sibling.scheduledLocalDate,
+      occupyingId: sibling.id,
+      occupyingOccurrenceKey: sibling.occurrenceKey,
+      occupyingStatus: sibling.status,
+      occupyingCancelReason: sibling.cancelReason,
+      reason: 'DATE_OCCUPIED',
+    });
+  }
+  return conflicts;
+}
+
+export function futureScheduleConflictCandidateDates(input: {
+  revisions: Iterable<SeriesRevisionRecord>;
+  existingKeys: Iterable<string>;
+  siblingScheduledDates: Iterable<string>;
+  cutoffOccurrenceKey: string;
+  todayLocalDate: string;
+}): string[] {
+  const added = futureScheduleAddedDates(input);
+  const have = new Set(input.existingKeys);
+  const dates = new Set(added);
+  for (const scheduled of input.siblingScheduledDates) {
+    if (
+      compareLocalDate(scheduled, input.cutoffOccurrenceKey) >= 0 &&
+      !have.has(scheduled) &&
+      keyHitsEffectiveSchedule(input.revisions, scheduled)
+    ) {
+      dates.add(scheduled);
+    }
+  }
+  return [...dates].sort();
+}
+
 export function futurePreviewCanonicalPayload(input: {
   studentId: string;
   studentVersion: number;

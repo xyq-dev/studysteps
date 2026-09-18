@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import type { DeviceSession, Prisma } from '@prisma/client';
+import { Prisma, type DeviceSession } from '@prisma/client';
 import {
   canImportTemplates,
   consentCoversPlanWrites,
@@ -15,11 +15,17 @@ import {
   datesToMaterializeFromRevisions,
   canAnchorFutureChange,
   classifyFutureContentEffect,
+  classifyFutureScheduleEffect,
   compareLocalDate,
   contentFromRevision,
   futureContentProjectionUnchanged,
   futurePreviewCanonicalPayload,
-  selectEffectiveRevision,
+  futureScheduleAddedDates,
+  futureScheduleConflictCandidateDates,
+  futureScheduleInsertConflicts,
+  futureScheduleProjectionUnchanged,
+  futureScheduleShapeErrors,
+  keyHitsEffectiveSchedule,
   occurrenceCancellableOnPlanHalt,
   occurrenceRestorableOnResume,
   planAllowsOccurrenceGeneration,
@@ -32,6 +38,10 @@ import {
   occurrenceContentFromSnapshots,
   rescheduleTargetAllowed,
   scheduledDateConflicts,
+  scheduleFromRevision,
+  scheduleRevisionFromProposal,
+  selectEffectiveRevision,
+  type OccurrenceSchedule,
   type SeriesRevisionRecord,
   type SeriesRule,
 } from '@studysteps/domain';
@@ -807,9 +817,6 @@ export class PlanningService {
     input: FutureChangePreviewInput | FutureChangeConfirmInput,
     idempotencyKey: string | null,
   ) {
-    if (input.proposal.kind !== 'CONTENT') {
-      throw new AppError('VALIDATION_ERROR', '本批只开放内容修改', 400, { kind: 'unsupported' });
-    }
     if (session.scope === 'GUARDIAN') {
       this.identity.requireStepUp(session);
     }
@@ -923,18 +930,6 @@ export class PlanningService {
       }
       const revisions = row.series.revisions.map((item) => this.asRevision(item));
       const cutoffOccurrenceKey = row.occurrenceKey;
-      const nextContent = {
-        name: input.proposal.name,
-        subject: input.proposal.subject,
-        completionStandard: input.proposal.standard,
-        durationMinutes: input.proposal.durationMinutes,
-        steps: input.proposal.steps,
-      };
-      const currentRule = selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], cutoffOccurrenceKey);
-      if (!currentRule) {
-        throw new AppError('VALIDATION_ERROR', '规则修订缺失', 400);
-      }
-      const beforeContent = contentFromRevision(currentRule);
       const contentHead = revisions
         .filter((item) => item.changeKind === 'BASELINE' || item.changeKind === 'CONTENT')
         .reduce((max, item) => Math.max(max, item.revisionNo), 1);
@@ -952,25 +947,7 @@ export class PlanningService {
         restored: [] as Array<Record<string, unknown>>,
         added: [] as Array<Record<string, unknown>>,
       };
-      for (const sibling of row.series.occurrences) {
-        const effect = classifyFutureContentEffect({
-          occurrenceKey: sibling.occurrenceKey,
-          scheduledLocalDate: sibling.scheduledLocalDate,
-          status: sibling.status,
-          cutoffOccurrenceKey,
-          todayLocalDate: today,
-          hasContentException: sibling.contentExceptionAdjustmentId != null,
-          currentContent: occurrenceContentFromSnapshots(sibling),
-          nextContent,
-        });
-        const item = {
-          id: sibling.id,
-          occurrenceKey: sibling.occurrenceKey,
-          originalLocalDate: sibling.originalLocalDate,
-          scheduledLocalDate: sibling.scheduledLocalDate,
-          status: sibling.status,
-          reason: effect,
-        };
+      const pushEffect = (effect: string, item: Record<string, unknown>) => {
         if (effect === 'modified') {
           groups.modified.push(item);
         } else if (effect === 'preserved_exception') {
@@ -981,11 +958,149 @@ export class PlanningService {
           groups.preservedTerminal.push(item);
         } else if (effect === 'preserved_cancelled') {
           groups.preservedCancelled.push(item);
+        } else if (effect === 'cancelled') {
+          groups.cancelled.push(item);
+        } else if (effect === 'restored') {
+          groups.restored.push(item);
         } else {
           groups.unchanged.push(item);
         }
+      };
+      let noOp = false;
+      let beforeRule: unknown;
+      let afterRule: unknown;
+      let nextContent:
+        | {
+            name: string;
+            subject: string;
+            completionStandard: string;
+            durationMinutes: number | null;
+            steps: string[];
+          }
+        | null = null;
+      let nextSchedule: OccurrenceSchedule | null = null;
+      let projectionRevisions = revisions;
+      let conflicts: ReturnType<typeof futureScheduleInsertConflicts> = [];
+      if (input.proposal.kind === 'CONTENT') {
+        nextContent = {
+          name: input.proposal.name,
+          subject: input.proposal.subject,
+          completionStandard: input.proposal.standard,
+          durationMinutes: input.proposal.durationMinutes,
+          steps: input.proposal.steps,
+        };
+        const currentRule = selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], cutoffOccurrenceKey);
+        if (!currentRule) {
+          throw new AppError('VALIDATION_ERROR', '规则修订缺失', 400);
+        }
+        beforeRule = contentFromRevision(currentRule);
+        afterRule = nextContent;
+        noOp = futureContentProjectionUnchanged(revisions, cutoffOccurrenceKey, nextContent);
+        for (const sibling of row.series.occurrences) {
+          const effect = classifyFutureContentEffect({
+            occurrenceKey: sibling.occurrenceKey,
+            scheduledLocalDate: sibling.scheduledLocalDate,
+            status: sibling.status,
+            cutoffOccurrenceKey,
+            todayLocalDate: today,
+            hasContentException: sibling.contentExceptionAdjustmentId != null,
+            currentContent: occurrenceContentFromSnapshots(sibling),
+            nextContent,
+          });
+          pushEffect(effect, {
+            id: sibling.id,
+            occurrenceKey: sibling.occurrenceKey,
+            originalLocalDate: sibling.originalLocalDate,
+            scheduledLocalDate: sibling.scheduledLocalDate,
+            status: sibling.status,
+            reason: effect,
+          });
+        }
+      } else {
+        nextSchedule = {
+          repeatKind: input.proposal.repeatKind,
+          weekdays: input.proposal.weekdays,
+          endLocalDate: input.proposal.endLocalDate,
+          ongoing: input.proposal.ongoing,
+        };
+        const shape = futureScheduleShapeErrors(nextSchedule, cutoffOccurrenceKey);
+        if (Object.keys(shape).length > 0) {
+          throw new AppError('VALIDATION_ERROR', '重复安排不合法', 400, shape);
+        }
+        const currentRule = selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], cutoffOccurrenceKey);
+        if (!currentRule) {
+          throw new AppError('VALIDATION_ERROR', '规则修订缺失', 400);
+        }
+        beforeRule = scheduleFromRevision(currentRule);
+        afterRule = nextSchedule;
+        noOp = futureScheduleProjectionUnchanged(revisions, cutoffOccurrenceKey, nextSchedule);
+        const nextRevisionNo = noOp ? row.series.version : row.series.version + 1;
+        projectionRevisions = noOp
+          ? revisions
+          : [...revisions, scheduleRevisionFromProposal(nextRevisionNo, cutoffOccurrenceKey, nextSchedule)];
+        for (const sibling of row.series.occurrences) {
+          const effect = classifyFutureScheduleEffect({
+            occurrenceKey: sibling.occurrenceKey,
+            scheduledLocalDate: sibling.scheduledLocalDate,
+            status: sibling.status,
+            cancelReason: sibling.cancelReason,
+            cutoffOccurrenceKey,
+            todayLocalDate: today,
+            hasScheduleException: sibling.scheduleExceptionAdjustmentId != null,
+            hitsNextSchedule: keyHitsEffectiveSchedule(projectionRevisions, sibling.occurrenceKey),
+            scheduleRevisionNo: sibling.scheduleRevisionNo,
+            nextScheduleRevisionNo: nextRevisionNo,
+            applyScheduleRevision: !noOp,
+          });
+          pushEffect(effect, {
+            id: sibling.id,
+            occurrenceKey: sibling.occurrenceKey,
+            originalLocalDate: sibling.originalLocalDate,
+            scheduledLocalDate: sibling.scheduledLocalDate,
+            status: sibling.status,
+            cancelReason: sibling.cancelReason,
+            reason: effect,
+          });
+        }
+        if (!noOp) {
+          const addedDates = futureScheduleAddedDates({
+            revisions: projectionRevisions,
+            existingKeys: row.series.occurrences.map((item) => item.occurrenceKey),
+            cutoffOccurrenceKey,
+            todayLocalDate: today,
+          });
+          const conflictDates = futureScheduleConflictCandidateDates({
+            revisions: projectionRevisions,
+            existingKeys: row.series.occurrences.map((item) => item.occurrenceKey),
+            siblingScheduledDates: row.series.occurrences.map((item) => item.scheduledLocalDate),
+            cutoffOccurrenceKey,
+            todayLocalDate: today,
+          });
+          conflicts = futureScheduleInsertConflicts({
+            siblings: row.series.occurrences.map((item) => ({
+              id: item.id,
+              occurrenceKey: item.occurrenceKey,
+              scheduledLocalDate: item.scheduledLocalDate,
+              status: item.status,
+              cancelReason: item.cancelReason,
+            })),
+            insertDates: conflictDates,
+          });
+          const blocked = new Set(conflicts.map((item) => item.scheduledLocalDate));
+          for (const localDate of addedDates) {
+            if (blocked.has(localDate)) {
+              continue;
+            }
+            groups.added.push({
+              occurrenceKey: localDate,
+              originalLocalDate: localDate,
+              scheduledLocalDate: localDate,
+              status: 'PLANNED',
+              reason: 'added',
+            });
+          }
+        }
       }
-      const noOp = futureContentProjectionUnchanged(revisions, cutoffOccurrenceKey, nextContent);
       const previewDigest = digestCanonical(
         futurePreviewCanonicalPayload({
           studentId: current.id,
@@ -1017,6 +1132,7 @@ export class PlanningService {
         }),
       );
       const preview = {
+        kind: input.proposal.kind,
         anchor: {
           id: row.id,
           occurrenceKey: row.occurrenceKey,
@@ -1036,10 +1152,13 @@ export class PlanningService {
           occurrence: row.version,
         },
         heads: { content: contentHead, schedule: scheduleHead },
-        rule: { before: beforeContent, after: nextContent },
+        rule: { before: beforeRule, after: afterRule },
         effects: groups,
-        conflicts: [],
-        beyondHorizonNote: '窗口外尚未生成的任务将在之后的任务窗口按新规则内容生成。',
+        conflicts,
+        beyondHorizonNote:
+          input.proposal.kind === 'SCHEDULE'
+            ? '窗口外尚未生成的任务将在之后的任务窗口按新的重复安排生成。'
+            : '窗口外尚未生成的任务将在之后的任务窗口按新规则内容生成。',
         previewDigest,
         noOp,
       };
@@ -1051,10 +1170,17 @@ export class PlanningService {
       if (confirmInput.previewDigest !== previewDigest) {
         throw new AppError('TASK_FUTURE_PREVIEW_STALE', '影响预览已过期，请重新预览后再确认', 409);
       }
+      if (conflicts.length > 0) {
+        throw new AppError('TASK_DATE_CONFLICT', '新的重复安排与同一规则已有实例撞日，不能覆盖', 409, {
+          scheduledLocalDate: 'conflict',
+          dates: [...new Set(conflicts.map((item) => item.scheduledLocalDate))].join(','),
+        });
+      }
       let adjustmentId: string | null = null;
       let nextSeriesVersion = row.series.version;
       let nextContentHead = contentHead;
-      if (!noOp) {
+      let nextScheduleHead = scheduleHead;
+      if (!noOp && input.proposal.kind === 'CONTENT' && nextContent) {
         const adjustment = await tx.planAdjustment.create({
           data: {
             planId: row.series.planId,
@@ -1066,7 +1192,7 @@ export class PlanningService {
               timezone: current.timezone,
               todayLocalDate: today,
               beforeRevision: contentHead,
-              afterRevision: contentHead + 1,
+              afterRevision: row.series.version + 1,
               proposal: input.proposal,
               modifiedIds: groups.modified.map((item) => item.id),
               preservedExceptionIds: groups.preservedException.map((item) => item.id),
@@ -1134,6 +1260,185 @@ export class PlanningService {
             },
           });
         }
+      } else if (!noOp && input.proposal.kind === 'SCHEDULE' && nextSchedule) {
+        nextSeriesVersion = row.series.version + 1;
+        nextScheduleHead = nextSeriesVersion;
+        const adjustment = await tx.planAdjustment.create({
+          data: {
+            planId: row.series.planId,
+            seriesId: row.seriesId,
+            occurrenceId: row.id,
+            reasonCode: 'SERIES_FUTURE_SCHEDULE_CHANGED',
+            payloadJson: JSON.stringify({
+              cutoffOccurrenceKey,
+              timezone: current.timezone,
+              todayLocalDate: today,
+              beforeRevision: scheduleHead,
+              afterRevision: nextScheduleHead,
+              proposal: input.proposal,
+              modifiedIds: groups.modified.map((item) => item.id),
+              preservedExceptionIds: groups.preservedException.map((item) => item.id),
+              cancelledIds: groups.cancelled.map((item) => item.id),
+              restoredIds: groups.restored.map((item) => item.id),
+              addedKeys: groups.added.map((item) => item.occurrenceKey),
+              counts: {
+                modified: groups.modified.length,
+                preservedException: groups.preservedException.length,
+                cancelled: groups.cancelled.length,
+                restored: groups.restored.length,
+                added: groups.added.length,
+              },
+              reason: input.proposal.reason,
+              actorScope: session.scope,
+              actorAccountId: session.accountId ?? null,
+              actorSessionId: session.id,
+              previewDigest,
+            }),
+          },
+        });
+        adjustmentId = adjustment.id;
+        const proposed = scheduleRevisionFromProposal(nextScheduleHead, cutoffOccurrenceKey, nextSchedule);
+        await tx.taskSeriesRevision.create({
+          data: {
+            taskSeriesId: row.seriesId,
+            revisionNo: proposed.revisionNo,
+            changeKind: 'SCHEDULE',
+            effectiveFromOccurrenceKey: cutoffOccurrenceKey,
+            repeatKind: proposed.repeatKind,
+            weekdaysJson: proposed.weekdaysJson,
+            endLocalDate: proposed.endLocalDate,
+            ongoing: proposed.ongoing,
+            sourceAdjustmentId: adjustment.id,
+          },
+        });
+        await tx.taskSeries.update({
+          where: { id: row.seriesId },
+          data: { version: nextSeriesVersion },
+        });
+        const liveRevisions = [...revisions, proposed];
+        for (const sibling of row.series.occurrences) {
+          const effect = classifyFutureScheduleEffect({
+            occurrenceKey: sibling.occurrenceKey,
+            scheduledLocalDate: sibling.scheduledLocalDate,
+            status: sibling.status,
+            cancelReason: sibling.cancelReason,
+            cutoffOccurrenceKey,
+            todayLocalDate: today,
+            hasScheduleException: sibling.scheduleExceptionAdjustmentId != null,
+            hitsNextSchedule: keyHitsEffectiveSchedule(liveRevisions, sibling.occurrenceKey),
+            scheduleRevisionNo: sibling.scheduleRevisionNo,
+            nextScheduleRevisionNo: nextScheduleHead,
+            applyScheduleRevision: true,
+          });
+          if (effect === 'cancelled') {
+            await tx.taskOccurrence.update({
+              where: { id: sibling.id, version: sibling.version },
+              data: {
+                status: 'CANCELLED',
+                cancelReason: 'SERIES_RULE_REMOVED',
+                version: sibling.version + 1,
+              },
+            });
+            continue;
+          }
+          if (effect === 'restored') {
+            const contentRev = selectEffectiveRevision(liveRevisions, ['BASELINE', 'CONTENT'], sibling.occurrenceKey);
+            const content = contentRev ? contentFromRevision(contentRev) : occurrenceContentFromSnapshots(sibling);
+            await tx.taskOccurrence.update({
+              where: { id: sibling.id, version: sibling.version },
+              data: {
+                status: 'PLANNED',
+                cancelReason: null,
+                scheduleRevisionNo: nextScheduleHead,
+                version: sibling.version + 1,
+                ...(sibling.contentExceptionAdjustmentId
+                  ? {}
+                  : {
+                      nameSnapshot: content.name,
+                      subjectSnapshot: content.subject,
+                      completionStandardSnapshot: content.completionStandard,
+                      durationMinutesSnapshot: content.durationMinutes,
+                      stepsSnapshotJson: JSON.stringify(content.steps),
+                      contentRevisionNo: contentRev?.revisionNo ?? sibling.contentRevisionNo,
+                    }),
+              },
+            });
+            continue;
+          }
+          if (effect === 'modified') {
+            await tx.taskOccurrence.update({
+              where: { id: sibling.id, version: sibling.version },
+              data: {
+                scheduleRevisionNo: nextScheduleHead,
+                version: sibling.version + 1,
+              },
+            });
+          }
+        }
+        if (
+          !current.stageCode ||
+          !current.schoolSystemCode ||
+          !current.gradeCode ||
+          !current.gradeLabel ||
+          !current.termCode ||
+          !current.gradeConfigId ||
+          !current.gradeConfigVersionId
+        ) {
+          throw new AppError('LEARNING_ACCESS_BLOCKED', '尚未配置教育资料，不能生成任务', 403);
+        }
+        const gradeVersion = await tx.gradeConfigVersion.findUnique({
+          where: { id: current.gradeConfigVersionId },
+        });
+        for (const item of groups.added) {
+          const localDate = String(item.occurrenceKey ?? '');
+          const contentRev = selectEffectiveRevision(liveRevisions, ['BASELINE', 'CONTENT'], localDate);
+          const scheduleRev = selectEffectiveRevision(liveRevisions, ['BASELINE', 'SCHEDULE'], localDate);
+          const content = contentRev
+            ? contentFromRevision(contentRev)
+            : {
+                name: row.series.name,
+                subject: row.series.subject,
+                completionStandard: row.series.completionStandard,
+                durationMinutes: row.series.durationMinutes,
+                steps: JSON.parse(row.series.stepsJson) as string[],
+              };
+          try {
+            const created = await tx.taskOccurrence.create({
+              data: {
+                seriesId: row.seriesId,
+                occurrenceKey: localDate,
+                originalLocalDate: localDate,
+                scheduledLocalDate: localDate,
+                timezoneSnapshot: current.timezone,
+                status: 'PLANNED',
+                nameSnapshot: content.name,
+                subjectSnapshot: content.subject,
+                completionStandardSnapshot: content.completionStandard,
+                durationMinutesSnapshot: content.durationMinutes,
+                stepsSnapshotJson: JSON.stringify(content.steps),
+                gradeConfigId: current.gradeConfigId,
+                gradeConfigVersionId: current.gradeConfigVersionId,
+                stageCodeSnapshot: current.stageCode,
+                schoolSystemCodeSnapshot: current.schoolSystemCode,
+                gradeCodeSnapshot: current.gradeCode,
+                gradeLabelSnapshot: current.gradeLabel,
+                termCodeSnapshot: current.termCode,
+                catalogEntryKeySnapshot: gradeVersion?.catalogEntryKey ?? '',
+                contentRevisionNo: contentRev?.revisionNo ?? 1,
+                scheduleRevisionNo: scheduleRev?.revisionNo ?? nextScheduleHead,
+              },
+            });
+            item.id = created.id;
+          } catch (error) {
+            if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+              throw new AppError('TASK_DATE_CONFLICT', '新的重复安排与同一规则已有实例撞日，不能覆盖', 409, {
+                scheduledLocalDate: 'conflict',
+                dates: localDate,
+              });
+            }
+            throw error;
+          }
+        }
       }
       const result = {
         series: {
@@ -1141,11 +1446,12 @@ export class PlanningService {
           version: nextSeriesVersion,
           previousVersion: row.series.version,
           contentHead: nextContentHead,
-          scheduleHead,
+          scheduleHead: nextScheduleHead,
         },
         plan: { id: row.series.planId, version: row.series.plan.version },
         adjustmentId,
         effects: groups,
+        conflicts,
         noOp,
       };
       if (begun) {
@@ -1527,7 +1833,23 @@ export class PlanningService {
         startLocalDate: string;
         endLocalDate: string | null;
         ongoing: boolean;
-        occurrences: Array<{ occurrenceKey: string }>;
+        occurrences: Array<{
+          id: string;
+          occurrenceKey: string;
+          scheduledLocalDate: string;
+          status: string;
+          cancelReason: string | null;
+          version: number;
+          contentRevisionNo: number;
+          scheduleRevisionNo: number;
+          contentExceptionAdjustmentId: string | null;
+          scheduleExceptionAdjustmentId: string | null;
+          nameSnapshot: string;
+          subjectSnapshot: string;
+          completionStandardSnapshot: string;
+          durationMinutesSnapshot: number | null;
+          stepsSnapshotJson: string;
+        }>;
         revisions?: Array<{
           revisionNo: number;
           changeKind: string;
@@ -1601,11 +1923,56 @@ export class PlanningService {
           });
           continue;
         }
-        const have = new Set(series.occurrences.map((row) => row.occurrenceKey));
-        const missing = wanted.filter((day) => !have.has(day));
-        if (missing.length === 0) {
+        const existingByKey = new Map(series.occurrences.map((row) => [row.occurrenceKey, row]));
+        const missing = wanted.filter((day) => !existingByKey.has(day));
+        const restorable = wanted
+          .map((day) => existingByKey.get(day))
+          .filter(
+            (row): row is NonNullable<typeof row> =>
+              !!row &&
+              row.status === 'CANCELLED' &&
+              row.cancelReason === 'SERIES_RULE_REMOVED' &&
+              row.scheduleExceptionAdjustmentId == null,
+          );
+        if (missing.length === 0 && restorable.length === 0) {
           skipped.push({ reason: 'ALREADY_EXISTS', planId: plan.id, seriesId: series.id });
           continue;
+        }
+        for (const existing of restorable) {
+          const contentRev = revisions.length
+            ? selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], existing.occurrenceKey)
+            : null;
+          const scheduleRev = revisions.length
+            ? selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], existing.occurrenceKey)
+            : null;
+          const content = contentRev
+            ? contentFromRevision(contentRev)
+            : {
+                name: existing.nameSnapshot,
+                subject: existing.subjectSnapshot,
+                completionStandard: existing.completionStandardSnapshot,
+                durationMinutes: existing.durationMinutesSnapshot,
+                steps: JSON.parse(existing.stepsSnapshotJson) as string[],
+              };
+          await tx.taskOccurrence.update({
+            where: { id: existing.id, version: existing.version },
+            data: {
+              status: 'PLANNED',
+              cancelReason: null,
+              scheduleRevisionNo: scheduleRev?.revisionNo ?? existing.scheduleRevisionNo,
+              version: existing.version + 1,
+              ...(existing.contentExceptionAdjustmentId
+                ? {}
+                : {
+                    nameSnapshot: content.name,
+                    subjectSnapshot: content.subject,
+                    completionStandardSnapshot: content.completionStandard,
+                    durationMinutesSnapshot: content.durationMinutes,
+                    stepsSnapshotJson: JSON.stringify(content.steps),
+                    contentRevisionNo: contentRev?.revisionNo ?? existing.contentRevisionNo,
+                  }),
+            },
+          });
         }
         for (const localDate of missing) {
           const contentRev = revisions.length
@@ -1900,12 +2267,14 @@ export class PlanningService {
     };
   }) {
     const planStatus = row.series.plan.status;
-    const ruleRevision = row.series.revisions
-      ? selectEffectiveRevision(
-          row.series.revisions.map((item) => this.asRevision(item)),
-          ['BASELINE', 'CONTENT'],
-          row.occurrenceKey,
-        )
+    const mappedRevisions = row.series.revisions
+      ? row.series.revisions.map((item) => this.asRevision(item))
+      : [];
+    const ruleRevision = mappedRevisions.length
+      ? selectEffectiveRevision(mappedRevisions, ['BASELINE', 'CONTENT'], row.occurrenceKey)
+      : null;
+    const scheduleRevision = mappedRevisions.length
+      ? selectEffectiveRevision(mappedRevisions, ['BASELINE', 'SCHEDULE'], row.occurrenceKey)
       : null;
     return {
       id: row.id,
@@ -1931,6 +2300,7 @@ export class PlanningService {
       catalogEntryKeySnapshot: row.catalogEntryKeySnapshot,
       timezoneSnapshot: row.timezoneSnapshot,
       ruleContent: ruleRevision ? contentFromRevision(ruleRevision) : undefined,
+      ruleSchedule: scheduleRevision ? scheduleFromRevision(scheduleRevision) : undefined,
     };
   }
 }

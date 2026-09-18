@@ -316,3 +316,50 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 未执行：006-B SCHEDULE 调整、拆分、worker／Outbox、打卡、计时、通知、运营发布。结构测试不等于 006-B 验收。CI 未配置 Playwright，不宣称远端 E2E。
 
+## 16. 本批：006-B 本次及未来重复安排调整（2026-09-18）
+
+实施前 HEAD：`f6f86525c7628ac1c6a61490cda52a714a157d6c`。保留 `docs/handoffs/STP004_PG_ISOLATION.md` 的本地 PID 变化，不纳入提交。无第十条迁移。
+
+原因：按 §15 在既有 future-change 路径开放 `kind=SCHEDULE`，协调已生成未来实例，并让 revision-aware horizon 在窗口外按新排期补齐。CONTENT 轴、单次例外指针和历史身份保持不变。
+
+排期与例外：
+
+- 切点仍是锚点原始 `occurrenceKey`（含）。`scheduledLocalDate` 只用于日历、历史资格和撞日。
+- 无 schedule exception 的未来 `PLANNED` 若不再命中 → `CANCELLED/SERIES_RULE_REMOVED`，保留 id／key／原日／快照。
+- 再命中同一 `SERIES_RULE_REMOVED` 行则恢复为 `PLANNED`；`USER_CANCELLED` 等其他原因不复活。
+- schedule exception 保护实际日期和存在性，即使新规则不再命中原始 key；content exception 保护正文，不阻止排期协调。
+- 批量结果写 `SERIES_FUTURE_SCHEDULE_CHANGED`，不伪装成 `TASK_RESCHEDULED`。
+- 同 series 任意状态占用目标日 → 预览列出，确认 `409 TASK_DATE_CONFLICT`；不覆盖、不换日、不删终态。合法写入先协调已有行再插入 horizon 新日，避免中间顺序被当成业务撞日。
+- 新增日只在锁内 `[today, today+13]` 插入；窗口外由之后 horizon 按有效 CONTENT／SCHEDULE 生成。GET 不补齐。
+
+模型：第九条双轴结构足够完成本批。未改已发布 1–9 与 `test-v2`。未发现必须新增第十条的缺口。adjustment 不可变，因此 audit payload 记录 `addedKeys` 与计数；新行 id 出现在确认响应 `effects.added`，不回写 audit。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 真实 SCHEDULE 接口，切点前及其他系列不变 | 通过 | `stp006.http.spec.ts` FUTURE schedule：切点前实例保持 PLANNED；其他 series 不被取消 |
+| 锚点改期、日程例外与内容例外分别处理 | 通过 | HTTP：改期行保留实际日与 key；内容例外名保留；schedule exception 不被取消 |
+| 新增／移除／再纳入旧日 | 通过 | 每周一天取消同行；再纳入指定星期恢复同一 id／key／年级快照 |
+| 同系列不可调整撞日拒绝，无部分更新 | 通过 | 占用窗口外日期后改回每天：预览列出 conflicts，确认 409，revision／series version 不变 |
+| 连续 SCHEDULE 与 CONTENT↔SCHEDULE 双轴独立 | 通过 | 先 CONTENT 再 SCHEDULE 名称保留；再 CONTENT 日期／取消状态不变 |
+| 调整后多次 horizon，无重复、无错误恢复 | 通过 | 删缺口后再 POST：新行用有效 CONTENT，旧教育快照不改；USER_CANCELLED 不复活 |
+| 陈旧 digest、无变化、幂等异体 | 通过 | `TASK_FUTURE_PREVIEW_STALE`；no-op 无 adjustment；同键同体 200、异体 409 |
+| 与 horizon／暂停的真实锁等待 | 通过 | 独立连接 + `pg_blocking_pids`；pause-first 后 SCHEDULE 409 且无 SCHEDULE revision |
+| Chromium 预览、取消、确认、例外、撞日、刷新、再次补齐 | 通过 | `stp006-future-schedule-walkthrough.spec.ts`；整包 e2e 13 passed |
+| 006-A 回归 | 通过 | 原 CONTENT HTTP／concurrency／content walkthrough 仍通过 |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 13、domain 36、ui／admin／web 各 1、api **176 passed / 0 skipped / 0 failed** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `apps/web` e2e | 0 | **13 passed**（含 FUTURE schedule walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright；日志 403 时不编造远端测试数量 |
+
+未执行：拆分、worker／Outbox、打卡、计时、通知、运营发布、远端 E2E。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。
+

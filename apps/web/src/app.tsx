@@ -253,6 +253,7 @@ export function App() {
       planStatus?: string;
       executable?: boolean;
       hasContentException?: boolean;
+      hasScheduleException?: boolean;
       occurrenceKey?: string;
     }>
   >([]);
@@ -271,10 +272,15 @@ export function App() {
   const [editSteps, setEditSteps] = useState('');
   const [editPending, setEditPending] = useState(false);
   const [futureTaskId, setFutureTaskId] = useState<string | null>(null);
+  const [futureMode, setFutureMode] = useState<'CONTENT' | 'SCHEDULE' | null>(null);
   const [futurePreview, setFuturePreview] = useState<Record<string, unknown> | null>(null);
   const [futurePending, setFuturePending] = useState(false);
   const [futureConfirmKey, setFutureConfirmKey] = useState<string | null>(null);
   const [futureReason, setFutureReason] = useState('统一后续内容');
+  const [futureRepeatKind, setFutureRepeatKind] = useState<'ONCE' | 'DAILY' | 'WEEKLY_DAYS'>('DAILY');
+  const [futureWeekdays, setFutureWeekdays] = useState<number[]>([1, 2, 3, 4, 5]);
+  const [futureOngoing, setFutureOngoing] = useState(true);
+  const [futureEndLocalDate, setFutureEndLocalDate] = useState('');
   const [futureVersions, setFutureVersions] = useState({
     student: 1,
     plan: 1,
@@ -319,6 +325,7 @@ export function App() {
     setEditSteps('');
     setEditPending(false);
     setFutureTaskId(null);
+    setFutureMode(null);
     setFuturePreview(null);
     setFuturePending(false);
     setFutureConfirmKey(null);
@@ -1031,6 +1038,9 @@ export function App() {
     }
     const today = new Date().toLocaleDateString('en-CA');
     setEditTaskId(null);
+    setFutureTaskId(null);
+    setFutureMode(null);
+    setFuturePreview(null);
     setRescheduleTaskId(task.id);
     setRescheduleDate(addBrowserLocalDays(task.scheduledLocalDate, 1) >= today ? addBrowserLocalDays(task.scheduledLocalDate, 1) : today);
     setRescheduleReason('调到合适的一天');
@@ -1088,6 +1098,7 @@ export function App() {
     }
     setRescheduleTaskId(null);
     setFutureTaskId(null);
+    setFutureMode(null);
     setFuturePreview(null);
     setEditTaskId(task.id);
     setEditName(task.name);
@@ -1147,6 +1158,16 @@ export function App() {
   }
 
   function futureProposal() {
+    if (futureMode === 'SCHEDULE') {
+      return {
+        kind: 'SCHEDULE' as const,
+        repeatKind: futureRepeatKind,
+        weekdays: futureRepeatKind === 'WEEKLY_DAYS' ? futureWeekdays : null,
+        endLocalDate: futureOngoing ? null : futureEndLocalDate || null,
+        ongoing: futureOngoing,
+        reason: futureReason,
+      };
+    }
     return {
       kind: 'CONTENT' as const,
       name: editName,
@@ -1183,6 +1204,7 @@ export function App() {
         steps: detail.steps ?? [],
       };
       setFutureTaskId(task.id);
+      setFutureMode('CONTENT');
       setFutureVersions({
         student: student.version,
         plan: detail.planVersion,
@@ -1201,11 +1223,55 @@ export function App() {
     }
   }
 
+  async function openFutureSchedule(task: { id: string; executable?: boolean }) {
+    if (!activeStudentId || task.executable === false) {
+      return;
+    }
+    setRescheduleTaskId(null);
+    setEditTaskId(null);
+    setFuturePreview(null);
+    setFutureConfirmKey(null);
+    setStatus('正在读取重复安排');
+    try {
+      const [student, detail] = await Promise.all([
+        api(`/v1/students/${activeStudentId}`),
+        api(`/v1/students/${activeStudentId}/tasks/${task.id}`),
+      ]);
+      const schedule = detail.ruleSchedule ?? {
+        repeatKind: 'DAILY',
+        weekdays: null,
+        endLocalDate: null,
+        ongoing: true,
+      };
+      setFutureTaskId(task.id);
+      setFutureMode('SCHEDULE');
+      setFutureVersions({
+        student: student.version,
+        plan: detail.planVersion,
+        series: detail.seriesVersion,
+        occurrence: detail.version,
+      });
+      setFutureRepeatKind(schedule.repeatKind === 'ONCE' || schedule.repeatKind === 'WEEKLY_DAYS' ? schedule.repeatKind : 'DAILY');
+      setFutureWeekdays(Array.isArray(schedule.weekdays) && schedule.weekdays.length > 0 ? schedule.weekdays : [1, 2, 3, 4, 5]);
+      setFutureOngoing(schedule.ongoing !== false);
+      setFutureEndLocalDate(schedule.endLocalDate ?? '');
+      setFutureReason('调整后续重复安排');
+      setStatus(
+        detail.hasScheduleException
+          ? '该实例有单次改期例外，本次及未来不会改它的实际日期或存在性。'
+          : '已载入规则重复安排，仅影响本次及未来。',
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '无法开始重复安排调整');
+    }
+  }
+
   function cancelFutureEdit() {
     if (futurePending) {
       return;
     }
     setFutureTaskId(null);
+    setFutureMode(null);
     setFuturePreview(null);
     setFutureConfirmKey(null);
   }
@@ -1247,6 +1313,11 @@ export function App() {
     if (!activeStudentId || !futureTaskId || !futurePreview || futurePending) {
       return;
     }
+    const conflicts = Array.isArray(futurePreview.conflicts) ? futurePreview.conflicts : [];
+    if (conflicts.length > 0) {
+      setStatus('存在撞日，不能强行覆盖。请先改期冲突实例或调整重复安排后重新预览。');
+      return;
+    }
     const key = futureConfirmKey ?? crypto.randomUUID();
     setFutureConfirmKey(key);
     setFuturePending(true);
@@ -1268,17 +1339,25 @@ export function App() {
         },
       );
       const cutoff = String(futurePreview.cutoffOccurrenceKey ?? '');
+      const wasSchedule = futureMode === 'SCHEDULE';
       setFutureTaskId(null);
+      setFutureMode(null);
       setFuturePreview(null);
       setFutureConfirmKey(null);
       await loadTasks([cutoff]);
-      setStatus('已修改本次及未来的任务内容。单次例外仍保留。');
+      setStatus(
+        wasSchedule
+          ? '已调整本次及未来的重复安排。单次例外仍保留。'
+          : '已修改本次及未来的任务内容。单次例外仍保留。',
+      );
     } catch (error) {
       const code = error instanceof ApiRequestError ? error.code : '';
       if (code === 'TASK_FUTURE_PREVIEW_STALE') {
         setStatus('预览已过期，请重新预览后再确认，不会自动覆盖。');
       } else if (code === 'VERSION_CONFLICT') {
         setStatus('版本已变化，请重新预览后再确认，不会自动覆盖。');
+      } else if (code === 'TASK_DATE_CONFLICT') {
+        setStatus('新的重复安排与同一规则已有实例撞日，不能覆盖。请重新预览。');
       } else {
         setStatus(error instanceof Error ? error.message : '无法确认本次及未来');
       }
@@ -1759,6 +1838,14 @@ export function App() {
                     >
                       本次及未来
                     </button>
+                    <button
+                      type="button"
+                      data-testid={`future-schedule-task-${item.id}`}
+                      disabled={reschedulePending || editPending || futurePending}
+                      onClick={() => void openFutureSchedule(item)}
+                    >
+                      调整重复安排
+                    </button>
                   </>
                 ) : null}
               </li>
@@ -1826,7 +1913,7 @@ export function App() {
               </button>
             </div>
           ) : null}
-          {futureTaskId ? (
+          {futureTaskId && futureMode === 'CONTENT' ? (
             <div data-testid="future-edit">
               <p data-testid="future-edit-scope">本次及未来只改同一规则。切点是选中任务的原始日期，不含其他规则。</p>
               {tasks.find((item) => item.id === futureTaskId)?.hasContentException ||
@@ -1885,6 +1972,131 @@ export function App() {
                     type="button"
                     data-testid="confirm-future-edit"
                     disabled={futurePending}
+                    onClick={() => void confirmFutureEdit()}
+                  >
+                    {futurePending ? '正在确认' : '确认修改'}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {futureTaskId && futureMode === 'SCHEDULE' ? (
+            <div data-testid="future-schedule">
+              <p data-testid="future-schedule-scope">调整重复安排只改同一规则。切点是选中任务的原始日期，不含其他规则。</p>
+              {tasks.find((item) => item.id === futureTaskId)?.hasScheduleException ||
+              (futurePreview &&
+                futureEffectItems(futurePreview, 'preservedException').some((item) => item.id === futureTaskId)) ? (
+                <p data-testid="future-schedule-anchor-exception">选中任务有单次改期例外，确认后该实例仍保留原安排日。</p>
+              ) : null}
+              <label>
+                重复
+                <select
+                  data-testid="future-schedule-repeat-kind"
+                  value={futureRepeatKind}
+                  onChange={(event) =>
+                    setFutureRepeatKind(event.target.value as 'ONCE' | 'DAILY' | 'WEEKLY_DAYS')
+                  }
+                >
+                  <option value="ONCE">单次</option>
+                  <option value="DAILY">每天</option>
+                  <option value="WEEKLY_DAYS">每周指定日</option>
+                </select>
+              </label>
+              {futureRepeatKind === 'WEEKLY_DAYS' ? (
+                <fieldset data-testid="future-schedule-weekdays">
+                  <legend>星期</legend>
+                  {[1, 2, 3, 4, 5, 6, 7].map((day) => (
+                    <label key={day}>
+                      <input
+                        data-testid={`future-schedule-weekday-${day}`}
+                        type="checkbox"
+                        checked={futureWeekdays.includes(day)}
+                        onChange={() =>
+                          setFutureWeekdays((current) =>
+                            current.includes(day) ? current.filter((item) => item !== day) : [...current, day].sort((left, right) => left - right),
+                          )
+                        }
+                      />
+                      {['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'][day]}
+                    </label>
+                  ))}
+                </fieldset>
+              ) : null}
+              <label>
+                <input
+                  data-testid="future-schedule-ongoing"
+                  type="checkbox"
+                  checked={futureOngoing}
+                  onChange={(event) => setFutureOngoing(event.target.checked)}
+                />
+                持续
+              </label>
+              {futureOngoing ? null : (
+                <label>
+                  结束日
+                  <input
+                    data-testid="future-schedule-end"
+                    type="date"
+                    value={futureEndLocalDate}
+                    onChange={(event) => setFutureEndLocalDate(event.target.value)}
+                  />
+                </label>
+              )}
+              <label>
+                原因
+                <input data-testid="future-schedule-reason" value={futureReason} onChange={(event) => setFutureReason(event.target.value)} />
+              </label>
+              <button type="button" data-testid="preview-future-schedule" disabled={futurePending} onClick={() => void previewFutureEdit()}>
+                {futurePending && !futurePreview ? '正在预览' : '预览影响'}
+              </button>
+              <button type="button" data-testid="cancel-future-schedule" disabled={futurePending} onClick={() => cancelFutureEdit()}>
+                取消
+              </button>
+              {futurePreview ? (
+                <div data-testid="future-schedule-preview">
+                  <p data-testid="future-schedule-preview-cutoff">
+                    原始生效切点 {String(futurePreview.cutoffOccurrenceKey)}
+                    {futurePreview.anchor && typeof futurePreview.anchor === 'object'
+                      ? `；当前实际安排日 ${String((futurePreview.anchor as { scheduledLocalDate?: string }).scheduledLocalDate ?? '')}`
+                      : ''}
+                  </p>
+                  <p data-testid="future-schedule-preview-modified">
+                    将修改 {futureEffectItems(futurePreview, 'modified').length} 个实例
+                    {formatFutureEffectItems(futureEffectItems(futurePreview, 'modified'))}
+                  </p>
+                  <p data-testid="future-schedule-preview-cancelled">
+                    将取消 {futureEffectItems(futurePreview, 'cancelled').length} 个实例
+                    {formatFutureEffectItems(futureEffectItems(futurePreview, 'cancelled'))}
+                  </p>
+                  <p data-testid="future-schedule-preview-restored">
+                    将恢复 {futureEffectItems(futurePreview, 'restored').length} 个实例
+                    {formatFutureEffectItems(futureEffectItems(futurePreview, 'restored'))}
+                  </p>
+                  <p data-testid="future-schedule-preview-added">
+                    将新增 {futureEffectItems(futurePreview, 'added').length} 个实例
+                    {formatFutureEffectItems(futureEffectItems(futurePreview, 'added'))}
+                  </p>
+                  <p data-testid="future-schedule-preview-preserved">
+                    因历史、终态或单次例外保留 {futurePreservedItems(futurePreview).length} 个实例
+                    {formatFutureEffectItems(futurePreservedItems(futurePreview))}
+                  </p>
+                  {Array.isArray(futurePreview.conflicts) && futurePreview.conflicts.length > 0 ? (
+                    <p data-testid="future-schedule-preview-conflicts">
+                      撞日{' '}
+                      {(futurePreview.conflicts as Array<{ scheduledLocalDate?: string; occupyingStatus?: string; occupyingOccurrenceKey?: string }>)
+                        .map(
+                          (item) =>
+                            `${item.scheduledLocalDate ?? ''}（${item.occupyingOccurrenceKey ?? ''} ${item.occupyingStatus ?? ''}）`,
+                        )
+                        .join('、')}
+                      ，不能覆盖
+                    </p>
+                  ) : null}
+                  <p data-testid="future-schedule-preview-beyond">{String(futurePreview.beyondHorizonNote ?? '')}</p>
+                  <button
+                    type="button"
+                    data-testid="confirm-future-schedule"
+                    disabled={futurePending || (Array.isArray(futurePreview.conflicts) && futurePreview.conflicts.length > 0)}
                     onClick={() => void confirmFutureEdit()}
                   >
                     {futurePending ? '正在确认' : '确认修改'}

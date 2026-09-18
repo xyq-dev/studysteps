@@ -104,22 +104,68 @@ export const futureContentProposalSchema = z
   })
   .strict();
 
-export const futureChangePreviewSchema = z
+export const futureScheduleProposalSchema = z
+  .object({
+    kind: z.literal('SCHEDULE'),
+    repeatKind: z.enum(['ONCE', 'DAILY', 'WEEKLY_DAYS']),
+    weekdays: z.array(isoWeekdaySchema).min(1).max(7).nullable(),
+    endLocalDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+    ongoing: z.boolean(),
+    reason: z.string().min(1).max(120),
+  })
+  .strict();
+
+export const futureChangeProposalSchema = z.discriminatedUnion('kind', [
+  futureContentProposalSchema,
+  futureScheduleProposalSchema,
+]);
+
+function refineFutureScheduleProposal(
+  proposal: z.infer<typeof futureChangeProposalSchema>,
+  ctx: z.RefinementCtx,
+) {
+  if (proposal.kind !== 'SCHEDULE') {
+    return;
+  }
+  if (proposal.repeatKind === 'WEEKLY_DAYS') {
+    if (!proposal.weekdays || new Set(proposal.weekdays).size !== proposal.weekdays.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['proposal', 'weekdays'], message: 'weekdays' });
+    }
+  } else if (proposal.weekdays != null) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['proposal', 'weekdays'], message: 'forbidden' });
+  }
+  if (proposal.ongoing) {
+    if (proposal.endLocalDate != null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['proposal', 'endLocalDate'], message: 'forbidden' });
+    }
+  } else if (proposal.endLocalDate == null) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['proposal', 'endLocalDate'], message: 'required' });
+  }
+}
+
+const futureChangePreviewBaseSchema = z
   .object({
     expectedStudentVersion: z.number().int().positive(),
     expectedPlanVersion: z.number().int().positive(),
     expectedSeriesVersion: z.number().int().positive(),
     expectedOccurrenceVersion: z.number().int().positive(),
-    proposal: futureContentProposalSchema,
+    proposal: futureChangeProposalSchema,
   })
   .strict();
 
-export const futureChangeConfirmSchema = futureChangePreviewSchema
+export const futureChangePreviewSchema = futureChangePreviewBaseSchema.superRefine((value, ctx) =>
+  refineFutureScheduleProposal(value.proposal, ctx),
+);
+
+export const futureChangeConfirmSchema = futureChangePreviewBaseSchema
   .extend({
     previewDigest: z.string().min(16).max(128),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => refineFutureScheduleProposal(value.proposal, ctx));
 
 export type FutureContentProposal = z.infer<typeof futureContentProposalSchema>;
-export type FutureChangePreviewInput = z.infer<typeof futureChangePreviewSchema>;
-export type FutureChangeConfirmInput = z.infer<typeof futureChangeConfirmSchema>;
+export type FutureScheduleProposal = z.infer<typeof futureScheduleProposalSchema>;
+export type FutureChangeProposal = z.infer<typeof futureChangeProposalSchema>;
+export type FutureChangePreviewInput = z.infer<typeof futureChangePreviewBaseSchema>;
+export type FutureChangeConfirmInput = FutureChangePreviewInput & { previewDigest: string };
