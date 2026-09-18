@@ -248,8 +248,66 @@ export function occurrenceRestorableOnResume(input: {
   );
 }
 
-export function canRescheduleOccurrence(planStatus: string, occurrenceStatus: string): boolean {
+export function canAdjustOccurrence(planStatus: string, occurrenceStatus: string): boolean {
   return planStatus === 'ACTIVE' && occurrenceStatus === 'PLANNED';
+}
+
+export function canRescheduleOccurrence(planStatus: string, occurrenceStatus: string): boolean {
+  return canAdjustOccurrence(planStatus, occurrenceStatus);
+}
+
+export type OccurrenceContent = {
+  name: string;
+  subject: string;
+  completionStandard: string;
+  durationMinutes: number | null;
+  steps: string[];
+};
+
+export function occurrenceContentFromSnapshots(row: {
+  nameSnapshot: string;
+  subjectSnapshot: string;
+  completionStandardSnapshot: string;
+  durationMinutesSnapshot: number | null;
+  stepsSnapshotJson: string;
+}): OccurrenceContent {
+  return {
+    name: row.nameSnapshot,
+    subject: row.subjectSnapshot,
+    completionStandard: row.completionStandardSnapshot,
+    durationMinutes: row.durationMinutesSnapshot,
+    steps: JSON.parse(row.stepsSnapshotJson) as string[],
+  };
+}
+
+export function occurrenceContentEquals(left: OccurrenceContent, right: OccurrenceContent): boolean {
+  return (
+    left.name === right.name &&
+    left.subject === right.subject &&
+    left.completionStandard === right.completionStandard &&
+    left.durationMinutes === right.durationMinutes &&
+    JSON.stringify(left.steps) === JSON.stringify(right.steps)
+  );
+}
+
+export function occurrenceContentDiff(from: OccurrenceContent, to: OccurrenceContent) {
+  const fields: Array<{ field: string; from: unknown; to: unknown }> = [];
+  if (from.name !== to.name) {
+    fields.push({ field: 'name', from: from.name, to: to.name });
+  }
+  if (from.subject !== to.subject) {
+    fields.push({ field: 'subject', from: from.subject, to: to.subject });
+  }
+  if (from.completionStandard !== to.completionStandard) {
+    fields.push({ field: 'completionStandard', from: from.completionStandard, to: to.completionStandard });
+  }
+  if (from.durationMinutes !== to.durationMinutes) {
+    fields.push({ field: 'durationMinutes', from: from.durationMinutes, to: to.durationMinutes });
+  }
+  if (JSON.stringify(from.steps) !== JSON.stringify(to.steps)) {
+    fields.push({ field: 'steps', from: from.steps, to: to.steps });
+  }
+  return fields;
 }
 
 export function rescheduleTargetAllowed(todayLocalDate: string, targetLocalDate: string): boolean {

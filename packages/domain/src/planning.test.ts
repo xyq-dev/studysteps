@@ -9,7 +9,11 @@ import {
   localDateInTimeZone,
   manualPreviewCanonicalPayload,
   normalizePreviewTasks,
+  canAdjustOccurrence,
   canRescheduleOccurrence,
+  occurrenceContentDiff,
+  occurrenceContentEquals,
+  occurrenceContentFromSnapshots,
   occurrenceCancellableOnPlanHalt,
   occurrenceRestorableOnResume,
   planAllowsOccurrenceGeneration,
@@ -197,6 +201,8 @@ describe('STP 006 plan status transitions', () => {
   });
 
   it('allows only planned active occurrences to move to a free future date', () => {
+    expect(canAdjustOccurrence('ACTIVE', 'PLANNED')).toBe(true);
+    expect(canAdjustOccurrence('PAUSED', 'PLANNED')).toBe(false);
     expect(canRescheduleOccurrence('ACTIVE', 'PLANNED')).toBe(true);
     expect(canRescheduleOccurrence('PAUSED', 'PLANNED')).toBe(false);
     expect(canRescheduleOccurrence('ACTIVE', 'CANCELLED')).toBe(false);
@@ -215,5 +221,38 @@ describe('STP 006 plan status transitions', () => {
         { id: 'other', scheduledLocalDate: '2026-09-20' },
       ]),
     ).toBe(false);
+  });
+
+  it('compares occurrence content snapshots without treating date as a content field', () => {
+    const current = occurrenceContentFromSnapshots({
+      nameSnapshot: '朗读',
+      subjectSnapshot: '语文',
+      completionStandardSnapshot: '读完一页',
+      durationMinutesSnapshot: 20,
+      stepsSnapshotJson: '["先读","再复述"]',
+    });
+    expect(
+      occurrenceContentEquals(current, {
+        name: '朗读',
+        subject: '语文',
+        completionStandard: '读完一页',
+        durationMinutes: 20,
+        steps: ['先读', '再复述'],
+      }),
+    ).toBe(true);
+    expect(
+      occurrenceContentDiff(current, {
+        name: '朗读加长',
+        subject: '语文',
+        completionStandard: '读完两页',
+        durationMinutes: null,
+        steps: ['先读'],
+      }),
+    ).toEqual([
+      { field: 'name', from: '朗读', to: '朗读加长' },
+      { field: 'completionStandard', from: '读完一页', to: '读完两页' },
+      { field: 'durationMinutes', from: 20, to: null },
+      { field: 'steps', from: ['先读', '再复述'], to: ['先读'] },
+    ]);
   });
 });

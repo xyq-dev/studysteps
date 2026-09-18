@@ -71,6 +71,17 @@ export const rescheduleTaskSchema = z
   })
   .strict();
 
+export const editOccurrenceSchema = z
+  .object({
+    name: z.string().min(1).max(64),
+    subject: z.string().min(1).max(32),
+    standard: z.string().min(1).max(240),
+    durationMinutes: z.number().int().positive().max(24 * 60).nullable(),
+    steps: z.array(z.string().min(1).max(120)).max(12),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
 export type PreviewTemplateInput = z.infer<typeof previewTemplateSchema>;
 export type ImportTemplateConfirmInput = z.infer<typeof importTemplateConfirmSchema>;
 export type PreviewManualPlanInput = z.infer<typeof previewManualPlanSchema>;
@@ -79,3 +90,4 @@ export type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
 export type TaskHorizonInput = z.infer<typeof taskHorizonSchema>;
 export type PatchPlanInput = z.infer<typeof patchPlanSchema>;
 export type RescheduleTaskInput = z.infer<typeof rescheduleTaskSchema>;
+export type EditOccurrenceInput = z.infer<typeof editOccurrenceSchema>;

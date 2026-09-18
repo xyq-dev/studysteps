@@ -202,6 +202,19 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
       .send(body);
   }
 
+  async function patchOccurrence(
+    cookies: CookieJar,
+    studentId: string,
+    occurrenceId: string,
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ) {
+    return agent()
+      .patch(`/v1/students/${studentId}/tasks/${occurrenceId}`)
+      .set(writeHeaders(cookies, idempotencyKey))
+      .send(body);
+  }
+
   async function postReschedule(
     cookies: CookieJar,
     studentId: string,
@@ -1489,5 +1502,223 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
       expiredKey,
     );
     expect(expiredReplay.status).toBe(401);
+  });
+
+  it('edits only the selected occurrence snapshots and keeps series plus siblings', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '本次内容'));
+    const created = await previewAndImport(auth.cookies, student, { attested: true });
+    expect(created.imported.status).toBe(201);
+    const planId = created.imported.body.id as string;
+    const rows = await prisma.taskOccurrence.findMany({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+      include: { series: true },
+    });
+    const seriesId = rows.find((row) => rows.filter((item) => item.seriesId === row.seriesId).length > 1)?.seriesId;
+    const sameSeries = rows.filter((row) => row.seriesId === seriesId);
+    expect(sameSeries.length).toBeGreaterThan(1);
+    const editing = sameSeries[0]!;
+    const sibling = sameSeries[1]!;
+    const seriesBefore = await prisma.taskSeries.findUniqueOrThrow({ where: { id: editing.seriesId } });
+
+    const edited = await patchOccurrence(auth.cookies, student.id, editing.id, {
+      name: '只改今天',
+      subject: '语文',
+      standard: '读完指定页',
+      durationMinutes: 25,
+      steps: ['先读', '再勾选'],
+      expectedVersion: editing.version,
+    });
+    expect(edited.status).toBe(200);
+    expect(edited.body).toMatchObject({
+      id: editing.id,
+      occurrenceKey: editing.occurrenceKey,
+      scheduledLocalDate: editing.scheduledLocalDate,
+      originalLocalDate: editing.originalLocalDate,
+      seriesId: editing.seriesId,
+      name: '只改今天',
+      subject: '语文',
+      completionStandard: '读完指定页',
+      durationMinutes: 25,
+      steps: ['先读', '再勾选'],
+      version: editing.version + 1,
+      gradeLabelSnapshot: editing.gradeLabelSnapshot,
+    });
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: sibling.id } })).toMatchObject({
+      nameSnapshot: sibling.nameSnapshot,
+      subjectSnapshot: sibling.subjectSnapshot,
+      completionStandardSnapshot: sibling.completionStandardSnapshot,
+      durationMinutesSnapshot: sibling.durationMinutesSnapshot,
+      stepsSnapshotJson: sibling.stepsSnapshotJson,
+      scheduledLocalDate: sibling.scheduledLocalDate,
+      occurrenceKey: sibling.occurrenceKey,
+    });
+    expect(await prisma.taskSeries.findUniqueOrThrow({ where: { id: editing.seriesId } })).toMatchObject({
+      name: seriesBefore.name,
+      subject: seriesBefore.subject,
+      completionStandard: seriesBefore.completionStandard,
+      durationMinutes: seriesBefore.durationMinutes,
+      stepsJson: seriesBefore.stepsJson,
+    });
+    const audit = await prisma.planAdjustment.findMany({
+      where: { planId, occurrenceId: editing.id, reasonCode: 'TASK_CONTENT_EDITED' },
+    });
+    expect(audit).toHaveLength(1);
+    expect(JSON.parse(audit[0]!.payloadJson).fields).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: 'name', to: '只改今天' })]),
+    );
+
+    const sameBody = await patchOccurrence(auth.cookies, student.id, editing.id, {
+      name: '只改今天',
+      subject: '语文',
+      standard: '读完指定页',
+      durationMinutes: 25,
+      steps: ['先读', '再勾选'],
+      expectedVersion: edited.body.version,
+    });
+    expect(sameBody.status).toBe(200);
+    expect(sameBody.body.version).toBe(edited.body.version);
+    expect(await prisma.planAdjustment.count({ where: { planId, occurrenceId: editing.id, reasonCode: 'TASK_CONTENT_EDITED' } })).toBe(1);
+
+    const latest = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { seriesId: editing.seriesId },
+      orderBy: { occurrenceKey: 'desc' },
+    });
+    await prisma.taskOccurrence.delete({ where: { id: latest.id } });
+    const horizon = await postHorizon(auth.cookies, student.id);
+    expect(horizon.status).toBe(200);
+    expect(horizon.body.insertedCount).toBeGreaterThan(0);
+    const reinserted = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { seriesId: editing.seriesId, occurrenceKey: latest.occurrenceKey },
+    });
+    expect(reinserted.id).not.toBe(latest.id);
+    expect(reinserted).toMatchObject({
+      nameSnapshot: seriesBefore.name,
+      subjectSnapshot: seriesBefore.subject,
+      completionStandardSnapshot: seriesBefore.completionStandard,
+    });
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: editing.id } })).toMatchObject({
+      nameSnapshot: '只改今天',
+      completionStandardSnapshot: '读完指定页',
+    });
+
+    const paused = await patchPlan(auth.cookies, student.id, planId, { action: 'PAUSE', expectedVersion: 1 });
+    expect(paused.status).toBe(200);
+    const resumed = await patchPlan(auth.cookies, student.id, planId, {
+      action: 'RESUME',
+      expectedVersion: paused.body.version,
+    });
+    expect(resumed.status).toBe(200);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: editing.id } })).toMatchObject({
+      status: 'PLANNED',
+      nameSnapshot: '只改今天',
+      subjectSnapshot: '语文',
+      completionStandardSnapshot: '读完指定页',
+      durationMinutesSnapshot: 25,
+      scheduledLocalDate: editing.scheduledLocalDate,
+      occurrenceKey: editing.occurrenceKey,
+    });
+  });
+
+  it('rejects invalid, unauthorized, stale and paused content edits and keeps idempotency', async () => {
+    const owner = await signIn();
+    const student = await setGrade(owner.cookies, await createStudent(owner.cookies, '内容拒绝'));
+    const created = await previewAndImport(owner.cookies, student, { attested: true });
+    const planId = created.imported.body.id as string;
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const valid = {
+      name: '合法改名',
+      subject: '语文',
+      standard: '读完指定页',
+      durationMinutes: 10,
+      steps: ['先读'],
+    };
+
+    const empty = await patchOccurrence(owner.cookies, student.id, row.id, {
+      ...valid,
+      name: '',
+      expectedVersion: row.version,
+    });
+    expect(empty.status).toBe(400);
+    expect(empty.body.code).toBe('VALIDATION_ERROR');
+
+    const stale = await patchOccurrence(owner.cookies, student.id, row.id, {
+      ...valid,
+      expectedVersion: 999,
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('VERSION_CONFLICT');
+
+    const stranger = await signIn();
+    const missing = await patchOccurrence(stranger.cookies, student.id, row.id, {
+      ...valid,
+      expectedVersion: row.version,
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.body.code).toBe('RESOURCE_NOT_FOUND');
+
+    const key = randomUUID();
+    const first = await patchOccurrence(owner.cookies, student.id, row.id, { ...valid, expectedVersion: row.version }, key);
+    expect(first.status).toBe(200);
+    const replay = await patchOccurrence(owner.cookies, student.id, row.id, { ...valid, expectedVersion: row.version }, key);
+    expect(replay.status).toBe(200);
+    expect(replay.body.name).toBe('合法改名');
+    expect(await prisma.planAdjustment.count({ where: { planId, occurrenceId: row.id, reasonCode: 'TASK_CONTENT_EDITED' } })).toBe(1);
+    const conflict = await patchOccurrence(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...valid, name: '异体', expectedVersion: row.version },
+      key,
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
+
+    const pausedStudent = await setGrade(owner.cookies, await createStudent(owner.cookies, '暂停后编辑'));
+    const pausedPlan = await previewAndImport(owner.cookies, pausedStudent, { attested: true });
+    const pausedId = pausedPlan.imported.body.id as string;
+    const pausedRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: pausedId }, status: 'PLANNED' },
+    });
+    const paused = await patchPlan(owner.cookies, pausedStudent.id, pausedId, { action: 'PAUSE', expectedVersion: 1 });
+    expect(paused.status).toBe(200);
+    const afterPause = await patchOccurrence(owner.cookies, pausedStudent.id, pausedRow.id, {
+      ...valid,
+      expectedVersion: pausedRow.version,
+    });
+    expect(afterPause.status).toBe(409);
+    expect(['PLAN_STATUS_INVALID', 'TASK_NOT_ADJUSTABLE']).toContain(afterPause.body.code);
+
+    const consents = await agent().get(`/v1/students/${student.id}/consents`).set('Cookie', owner.cookies.header());
+    const current = consents.body.items.find((item: { current: boolean }) => item.current);
+    const withdrawn = await agent()
+      .post(`/v1/students/${student.id}/consents/${current.id}/withdraw`)
+      .set(writeHeaders(owner.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    expect(withdrawn.status).toBeLessThan(300);
+    const deniedKey = randomUUID();
+    const latest = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id } });
+    const denied = await patchOccurrence(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...valid, name: '撤回后', expectedVersion: latest.version },
+      deniedKey,
+    );
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(['SESSION_SCOPE_FORBIDDEN', 'LEARNING_ACCESS_BLOCKED', 'CONSENT_REQUIRED']).toContain(denied.body.code);
+    const deniedReplay = await patchOccurrence(
+      owner.cookies,
+      student.id,
+      row.id,
+      { ...valid, name: '撤回后', expectedVersion: latest.version },
+      deniedKey,
+    );
+    expect(deniedReplay.status).toBeGreaterThanOrEqual(400);
+    expect(deniedReplay.status).not.toBe(200);
   });
 });

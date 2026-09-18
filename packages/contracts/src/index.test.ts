@@ -10,6 +10,7 @@ import {
   withdrawConsentSchema,
   createManualPlanSchema,
   patchPlanSchema,
+  editOccurrenceSchema,
   rescheduleTaskSchema,
   taskHorizonSchema,
 } from './index.js';
@@ -163,6 +164,47 @@ describe('request validation', () => {
         reason: '调到周末',
         expectedVersion: 1,
         occurrenceKey: '2026-09-18',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts this-occurrence content edits and rejects date or key fields', () => {
+    expect(
+      editOccurrenceSchema.parse({
+        name: '朗读',
+        subject: '语文',
+        standard: '读完一页',
+        durationMinutes: 15,
+        steps: ['先读'],
+        expectedVersion: 2,
+      }),
+    ).toEqual({
+      name: '朗读',
+      subject: '语文',
+      standard: '读完一页',
+      durationMinutes: 15,
+      steps: ['先读'],
+      expectedVersion: 2,
+    });
+    expect(
+      editOccurrenceSchema.safeParse({
+        name: '朗读',
+        subject: '语文',
+        standard: '读完一页',
+        durationMinutes: 15,
+        steps: ['先读'],
+        expectedVersion: 2,
+        scheduledLocalDate: '2026-10-02',
+      }).success,
+    ).toBe(false);
+    expect(
+      editOccurrenceSchema.safeParse({
+        name: '',
+        subject: '语文',
+        standard: '读完一页',
+        durationMinutes: null,
+        steps: [],
+        expectedVersion: 1,
       }).success,
     ).toBe(false);
   });

@@ -192,6 +192,10 @@ export function App() {
     Array<{
       id: string;
       name: string;
+      subject?: string;
+      completionStandard?: string;
+      durationMinutes?: number | null;
+      steps?: string[];
       scheduledLocalDate: string;
       originalLocalDate?: string;
       version: number;
@@ -207,6 +211,13 @@ export function App() {
   const [rescheduleDate, setRescheduleDate] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('调到合适的一天');
   const [reschedulePending, setReschedulePending] = useState(false);
+  const [editTaskId, setEditTaskId] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editSubject, setEditSubject] = useState('');
+  const [editStandard, setEditStandard] = useState('');
+  const [editDuration, setEditDuration] = useState('');
+  const [editSteps, setEditSteps] = useState('');
+  const [editPending, setEditPending] = useState(false);
   const studentLoadSeq = useRef(0);
   const bootstrapSeq = useRef(0);
 
@@ -237,6 +248,13 @@ export function App() {
     setRescheduleDate('');
     setRescheduleReason('调到合适的一天');
     setReschedulePending(false);
+    setEditTaskId(null);
+    setEditName('');
+    setEditSubject('');
+    setEditStandard('');
+    setEditDuration('');
+    setEditSteps('');
+    setEditPending(false);
     setSessionScope('GUARDIAN');
     setIssuedPairingId('');
     setIssuedPairingCode('');
@@ -945,6 +963,7 @@ export function App() {
       return;
     }
     const today = new Date().toLocaleDateString('en-CA');
+    setEditTaskId(null);
     setRescheduleTaskId(task.id);
     setRescheduleDate(addBrowserLocalDays(task.scheduledLocalDate, 1) >= today ? addBrowserLocalDays(task.scheduledLocalDate, 1) : today);
     setRescheduleReason('调到合适的一天');
@@ -985,6 +1004,70 @@ export function App() {
       setStatus(error instanceof Error ? error.message : '无法改期');
     } finally {
       setReschedulePending(false);
+    }
+  }
+
+  function openEdit(task: {
+    id: string;
+    name: string;
+    subject?: string;
+    completionStandard?: string;
+    durationMinutes?: number | null;
+    steps?: string[];
+    executable?: boolean;
+  }) {
+    if (task.executable === false) {
+      return;
+    }
+    setRescheduleTaskId(null);
+    setEditTaskId(task.id);
+    setEditName(task.name);
+    setEditSubject(task.subject ?? '');
+    setEditStandard(task.completionStandard ?? '');
+    setEditDuration(task.durationMinutes == null ? '' : String(task.durationMinutes));
+    setEditSteps((task.steps ?? []).join('\n'));
+  }
+
+  function cancelEdit() {
+    if (editPending) {
+      return;
+    }
+    setEditTaskId(null);
+  }
+
+  async function confirmEdit() {
+    if (!activeStudentId || !editTaskId || editPending) {
+      return;
+    }
+    const current = tasks.find((item) => item.id === editTaskId);
+    if (!current) {
+      return;
+    }
+    setEditPending(true);
+    setStatus('正在保存本次任务');
+    try {
+      await api(`/v1/students/${activeStudentId}/tasks/${current.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: editName,
+          subject: editSubject,
+          standard: editStandard,
+          durationMinutes: editDuration.trim() === '' ? null : Number(editDuration),
+          steps: editSteps
+            .split('\n')
+            .map((item) => item.trim())
+            .filter(Boolean),
+          expectedVersion: current.version,
+        }),
+      });
+      setEditTaskId(null);
+      await loadTasks([current.scheduledLocalDate]);
+      setStatus('已只改本次任务，其他日期仍用原来的内容。');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法保存本次任务';
+      setStatus(message.includes('任务版本已变化') ? '任务已被其他人改过，请重新加载后再编辑，不会自动覆盖。' : message);
+    } finally {
+      setEditPending(false);
     }
   }
 
@@ -1435,14 +1518,24 @@ export function App() {
                 {item.planStatus ? ` · ${item.planStatus}` : ''}
                 {item.executable === false ? ' · 不可继续执行' : ''}
                 {item.executable !== false ? (
-                  <button
-                    type="button"
-                    data-testid={`reschedule-task-${item.id}`}
-                    disabled={reschedulePending}
-                    onClick={() => openReschedule(item)}
-                  >
-                    改期
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      data-testid={`reschedule-task-${item.id}`}
+                      disabled={reschedulePending || editPending}
+                      onClick={() => openReschedule(item)}
+                    >
+                      改期
+                    </button>
+                    <button
+                      type="button"
+                      data-testid={`edit-task-${item.id}`}
+                      disabled={reschedulePending || editPending}
+                      onClick={() => openEdit(item)}
+                    >
+                      编辑本次
+                    </button>
+                  </>
                 ) : null}
               </li>
             ))}
@@ -1474,6 +1567,37 @@ export function App() {
                 {reschedulePending ? '正在改期' : '确认改期'}
               </button>
               <button type="button" data-testid="cancel-reschedule" disabled={reschedulePending} onClick={() => cancelReschedule()}>
+                取消
+              </button>
+            </div>
+          ) : null}
+          {editTaskId ? (
+            <div data-testid="edit-occurrence">
+              <p data-testid="edit-occurrence-scope">仅影响本次任务，不会改以后重复的任务。</p>
+              <label>
+                名称
+                <input data-testid="edit-occurrence-name" value={editName} onChange={(event) => setEditName(event.target.value)} />
+              </label>
+              <label>
+                科目
+                <input data-testid="edit-occurrence-subject" value={editSubject} onChange={(event) => setEditSubject(event.target.value)} />
+              </label>
+              <label>
+                完成标准
+                <input data-testid="edit-occurrence-standard" value={editStandard} onChange={(event) => setEditStandard(event.target.value)} />
+              </label>
+              <label>
+                预计时长（分钟，可空）
+                <input data-testid="edit-occurrence-duration" value={editDuration} onChange={(event) => setEditDuration(event.target.value)} />
+              </label>
+              <label>
+                步骤（每行一条）
+                <textarea data-testid="edit-occurrence-steps" value={editSteps} onChange={(event) => setEditSteps(event.target.value)} />
+              </label>
+              <button type="button" data-testid="confirm-edit-occurrence" disabled={editPending} onClick={() => void confirmEdit()}>
+                {editPending ? '正在保存' : '保存本次'}
+              </button>
+              <button type="button" data-testid="cancel-edit-occurrence" disabled={editPending} onClick={() => cancelEdit()}>
                 取消
               </button>
             </div>

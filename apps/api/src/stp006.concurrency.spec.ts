@@ -909,4 +909,177 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     await holder.end();
     await observer.end();
   });
+
+  it('edit and reschedule with the same expectedVersion serialize; loser gets VERSION_CONFLICT', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '内容改期竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+      orderBy: { scheduledLocalDate: 'asc' },
+    });
+    const farDate = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Shanghai',
+    });
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const editPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/tasks/${row.id}`)
+        .set(writeHeaders(cookies))
+        .send({
+          name: '并发改名',
+          subject: '语文',
+          standard: '读完指定页',
+          durationMinutes: 12,
+          steps: ['先读'],
+          expectedVersion: row.version,
+        }),
+    );
+    const editWaiter = await waitForWaiterOnHolder(observer, holderPid, 'edit waits on pairing');
+    const blocked = await observer.query<{ pids: number[] }>('SELECT pg_blocking_pids($1::int) AS pids', [
+      editWaiter.waiter_pid,
+    ]);
+    expect(blocked.rows[0]?.pids ?? []).toContain(holderPid);
+    const reschedulePromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/tasks/${row.id}/reschedule`)
+        .set(writeHeaders(cookies))
+        .send({ scheduledLocalDate: farDate, reason: '并发改期', expectedVersion: row.version }),
+    );
+    const rescheduleWaiter = await waitForWaiterOnHolder(observer, editWaiter.waiter_pid, 'reschedule waits on edit');
+    expect(rescheduleWaiter.holder_pid).toBe(editWaiter.waiter_pid);
+    await holder.query('ROLLBACK');
+    const edited = await editPromise;
+    const moved = await reschedulePromise;
+    expect([edited.status, moved.status].sort()).toEqual([200, 409]);
+    const winner = edited.status === 200 ? edited : moved;
+    const loser = edited.status === 409 ? edited : moved;
+    expect(loser.body.code).toBe('VERSION_CONFLICT');
+    const persisted = await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id } });
+    expect(persisted.version).toBe(row.version + 1);
+    if (winner.status === 200 && winner.body.name === '并发改名') {
+      expect(persisted.nameSnapshot).toBe('并发改名');
+      expect(persisted.scheduledLocalDate).toBe(row.scheduledLocalDate);
+    } else {
+      expect(persisted.scheduledLocalDate).toBe(farDate);
+      expect(persisted.nameSnapshot).toBe(row.nameSnapshot);
+    }
+    await holder.end();
+    await observer.end();
+  });
+
+  it('pause-first overlapping content edit is rejected; withdraw waits on edit', async () => {
+    const { cookies } = await signIn();
+    const pauseReady = await readyStudent(cookies, '暂停先编辑');
+    const pausePlan = await importReadyPlan(cookies, pauseReady);
+    const pauseRow = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: pausePlan.id }, status: 'PLANNED' },
+    });
+    const pauseHolder = new pg.Client({ connectionString });
+    const pauseObserver = await observerClient();
+    await pauseHolder.connect();
+    await pauseHolder.query('BEGIN');
+    await pauseHolder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [pauseReady.pairingId]);
+    const pauseHolderPid = await backendPid(pauseHolder);
+    const pausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${pauseReady.studentId}/plans/${pausePlan.id}`)
+        .set(writeHeaders(cookies))
+        .send({ action: 'PAUSE', expectedVersion: pausePlan.version }),
+    );
+    const pauseWaiter = await waitForWaiterOnHolder(pauseObserver, pauseHolderPid, 'pause waits on pairing');
+    const editAfterPausePromise = dispatch(
+      agent()
+        .patch(`/v1/students/${pauseReady.studentId}/tasks/${pauseRow.id}`)
+        .set(writeHeaders(cookies))
+        .send({
+          name: '暂停后不应写入',
+          subject: '语文',
+          standard: '读完指定页',
+          durationMinutes: 10,
+          steps: ['先读'],
+          expectedVersion: pauseRow.version,
+        }),
+    );
+    const editAfterPauseWaiter = await waitForWaiterOnHolder(
+      pauseObserver,
+      pauseWaiter.waiter_pid,
+      'edit waits on pause',
+    );
+    expect(editAfterPauseWaiter.holder_pid).toBe(pauseWaiter.waiter_pid);
+    await pauseHolder.query('ROLLBACK');
+    const paused = await pausePromise;
+    const editAfterPause = await editAfterPausePromise;
+    expect(paused.status).toBe(200);
+    expect(editAfterPause.status).toBe(409);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: pauseRow.id } })).toMatchObject({
+      nameSnapshot: pauseRow.nameSnapshot,
+      status: 'CANCELLED',
+      cancelReason: 'PLAN_PAUSED',
+    });
+    await pauseHolder.end();
+    await pauseObserver.end();
+
+    const ready = await readyStudent(cookies, '编辑同意竞争');
+    const plan = await importReadyPlan(cookies, ready);
+    const row = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { planId: plan.id }, status: 'PLANNED' },
+    });
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM device_pairings WHERE id = $1 FOR UPDATE', [ready.pairingId]);
+    const holderPid = await backendPid(holder);
+    const editPromise = dispatch(
+      agent()
+        .patch(`/v1/students/${ready.studentId}/tasks/${row.id}`)
+        .set(writeHeaders(cookies))
+        .send({
+          name: '撤回前写入',
+          subject: '语文',
+          standard: '读完指定页',
+          durationMinutes: 10,
+          steps: ['先读'],
+          expectedVersion: row.version,
+        }),
+    );
+    const writer = await waitForWaiterOnHolder(observer, holderPid, 'edit waits on pairing');
+    const withdrawPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/consents/${ready.consentId}/withdraw`)
+        .set(writeHeaders(cookies))
+        .send({ reasonCode: 'GUARDIAN_REQUEST' }),
+    );
+    const overlap = await waitForWaiterOnHolder(observer, writer.waiter_pid, 'withdraw waits on edit');
+    expect(overlap.holder_pid).toBe(writer.waiter_pid);
+    await holder.query('ROLLBACK');
+    const edited = await editPromise;
+    expect(edited.status).toBe(200);
+    expect(edited.body.name).toBe('撤回前写入');
+    const withdrawn = await withdrawPromise;
+    expect(withdrawn.status).toBeLessThan(300);
+    const late = await agent()
+      .patch(`/v1/students/${ready.studentId}/tasks/${row.id}`)
+      .set(writeHeaders(cookies))
+      .send({
+        name: '晚到',
+        subject: '语文',
+        standard: '读完指定页',
+        durationMinutes: 10,
+        steps: ['先读'],
+        expectedVersion: edited.body.version,
+      });
+    expect(late.status).toBeGreaterThanOrEqual(400);
+    expect(await prisma.taskOccurrence.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+      nameSnapshot: '撤回前写入',
+    });
+    await holder.end();
+    await observer.end();
+  });
 });

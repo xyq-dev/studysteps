@@ -5,6 +5,7 @@ import {
   patchPlanSchema,
   previewManualPlanSchema,
   previewTemplateSchema,
+  editOccurrenceSchema,
   rescheduleTaskSchema,
   taskHorizonSchema,
 } from '@studysteps/contracts';
@@ -134,6 +135,25 @@ export class PlanningController {
     const session = await this.guardRead(request);
     res.setHeader('Cache-Control', 'no-store');
     return this.planning.getTask(session, studentId, occurrenceId);
+  }
+
+  @Patch('students/:studentId/tasks/:occurrenceId')
+  async editOccurrence(
+    @Param('studentId') studentId: string,
+    @Param('occurrenceId') occurrenceId: string,
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.guardWrite(request);
+    res.setHeader('Cache-Control', 'no-store');
+    return this.planning.editOccurrence(
+      session,
+      studentId,
+      occurrenceId,
+      editOccurrenceSchema.parse(body ?? {}),
+      this.idempotency.readKey(request.headers['idempotency-key']),
+    );
   }
 
   @Post('students/:studentId/tasks/:occurrenceId/reschedule')

@@ -18,7 +18,11 @@ import {
   planAllowsOccurrenceGeneration,
   resolvePlanStatusTransition,
   cancelReasonForPlanAction,
+  canAdjustOccurrence,
   canRescheduleOccurrence,
+  occurrenceContentDiff,
+  occurrenceContentEquals,
+  occurrenceContentFromSnapshots,
   rescheduleTargetAllowed,
   scheduledDateConflicts,
   type SeriesRule,
@@ -29,6 +33,7 @@ import type {
   PatchPlanInput,
   PreviewManualPlanInput,
   PreviewTemplateInput,
+  EditOccurrenceInput,
   RescheduleTaskInput,
   TaskHorizonInput,
 } from '@studysteps/contracts';
@@ -620,6 +625,137 @@ export class PlanningService {
               occurrenceKey: row.occurrenceKey,
               originalLocalDate: row.originalLocalDate,
               reason: input.reason,
+              actorScope: session.scope,
+              actorAccountId: session.accountId ?? null,
+              actorSessionId: session.id,
+            }),
+          },
+        });
+      }
+      await this.idempotency.complete(tx, begun.recordId, 'TaskOccurrence', row.id, 200, now);
+      await this.identity.touchLastSeenLocked(tx, currentSession, now);
+      return this.getTaskInTx(tx, studentId, row.id);
+    }, graph);
+  }
+
+  async editOccurrence(
+    session: DeviceSession,
+    studentId: string,
+    occurrenceId: string,
+    input: EditOccurrenceInput,
+    idempotencyKey: string,
+  ) {
+    if (session.scope === 'GUARDIAN') {
+      this.identity.requireStepUp(session);
+    }
+    await this.students.authorize(session, studentId, 'TASK_ADJUST');
+    const actor =
+      session.scope === 'GUARDIAN'
+        ? { actorScope: 'GUARDIAN' as const, actorId: session.accountId! }
+        : { actorScope: 'STUDENT' as const, actorId: session.id };
+    const requestDigest = this.idempotency.requestDigest({
+      operation: 'tasks.edit',
+      studentId,
+      occurrenceId,
+      input,
+    });
+    const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'tasks.edit', idempotencyKey);
+    const target = await this.prisma.taskOccurrence.findFirst({
+      where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+      include: { series: { include: { plan: true, occurrences: { select: { id: true } } } } },
+    });
+    if (!target) {
+      throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+    }
+    const siblingIds = target.series.occurrences.map((row) => row.id);
+    const graph = await this.students.collectStudentGraph(studentId, {
+      accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
+      sessionIds: [session.id],
+      planIds: [target.series.planId],
+      taskSeriesIds: [target.seriesId],
+      taskOccurrenceIds: siblingIds,
+      idempotencyIds: existingIdem ? [existingIdem] : [],
+    });
+    return runWriteTx(this.prisma, async (tx, extra) => {
+      const locked = mergeLockIds(graph, extra);
+      await acquireLocks(tx, locked);
+      assertLockSetComplete(locked, await this.students.discoverStudentGraph(tx, studentId, session));
+      const now = await readLockedNow(tx);
+      const currentSession = await this.identity.assertSessionCurrent(tx, session, {
+        now,
+        requireStepUp: session.scope === 'GUARDIAN',
+      });
+      const current = await this.students.reauthorize(
+        tx,
+        currentSession,
+        studentId,
+        'TASK_ADJUST',
+        session.scope === 'GUARDIAN',
+        now,
+      );
+      const begun = await this.idempotency.begin(tx, actor, 'tasks.edit', idempotencyKey, requestDigest, now);
+      if (begun.kind === 'REPLAY' && begun.resourceId) {
+        await this.identity.touchLastSeenLocked(tx, currentSession, now);
+        return this.getTaskInTx(tx, studentId, begun.resourceId);
+      }
+      await this.assertPlanWritePrereqs(tx, current);
+      const row = await tx.taskOccurrence.findFirst({
+        where: { id: occurrenceId, series: { plan: { studentProfileId: studentId } } },
+        include: { series: { include: { plan: true, occurrences: true } } },
+      });
+      if (!row) {
+        throw new AppError('RESOURCE_NOT_FOUND', '资源不存在', 404);
+      }
+      if (
+        !lockIdsContain(locked, {
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        })
+      ) {
+        throw new IncompleteLockSetError({
+          planIds: [row.series.planId],
+          taskSeriesIds: [row.seriesId],
+          taskOccurrenceIds: row.series.occurrences.map((item) => item.id),
+        });
+      }
+      if (row.version !== input.expectedVersion) {
+        throw new AppError('VERSION_CONFLICT', '任务版本已变化', 409);
+      }
+      if (row.series.plan.status !== 'ACTIVE') {
+        throw new AppError('PLAN_STATUS_INVALID', '当前计划状态不允许编辑', 409);
+      }
+      if (!canAdjustOccurrence(row.series.plan.status, row.status)) {
+        throw new AppError('TASK_NOT_ADJUSTABLE', '当前任务不能编辑', 409);
+      }
+      const nextContent = {
+        name: input.name,
+        subject: input.subject,
+        completionStandard: input.standard,
+        durationMinutes: input.durationMinutes,
+        steps: input.steps,
+      };
+      const currentContent = occurrenceContentFromSnapshots(row);
+      if (!occurrenceContentEquals(currentContent, nextContent)) {
+        await tx.taskOccurrence.update({
+          where: { id: row.id, version: row.version },
+          data: {
+            nameSnapshot: nextContent.name,
+            subjectSnapshot: nextContent.subject,
+            completionStandardSnapshot: nextContent.completionStandard,
+            durationMinutesSnapshot: nextContent.durationMinutes,
+            stepsSnapshotJson: JSON.stringify(nextContent.steps),
+            version: row.version + 1,
+          },
+        });
+        await tx.planAdjustment.create({
+          data: {
+            planId: row.series.planId,
+            seriesId: row.seriesId,
+            occurrenceId: row.id,
+            reasonCode: 'TASK_CONTENT_EDITED',
+            payloadJson: JSON.stringify({
+              fields: occurrenceContentDiff(currentContent, nextContent),
               actorScope: session.scope,
               actorAccountId: session.accountId ?? null,
               actorSessionId: session.id,

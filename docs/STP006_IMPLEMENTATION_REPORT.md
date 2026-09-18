@@ -232,3 +232,44 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 
 用户可见：S05 可改期并看到确认前后日期。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。范围编辑仍待办。
 
+## 14. 本批：仅本次任务内容编辑（2026-09-18）
+
+实施前 HEAD：`1f3a4df`（基线 `main@1f3a4df`，与 `origin/main` 一致）。保留工作区既有未提交文件；不把 `docs/handoffs/STP004_PG_ISOLATION.md` 的本地 PID 变化纳入提交。
+
+原因：落地「仅本次」内容编辑——只改选中实例的正文快照，不改 series 默认内容与重复规则，不改安排日。未来规则编辑、拆分、worker／Outbox、打卡、计时、通知不做。
+
+撞日 409：核对后**不修正**。`TASK_DATE_CONFLICT` 只在同一 `TaskSeries` 的另一实例已占用目标 `scheduledLocalDate` 时返回；实际安排日不是 `occurrence_key`，也不是全局唯一键。依据 `STP006_DESIGN` §4.2／4.3「同规则已有安排日」。不同系列可以同日并存。
+
+结构：GET 已读 `nameSnapshot`／`subjectSnapshot`／`completionStandardSnapshot`／`durationMinutesSnapshot`／`stepsSnapshotJson`，无需第九条。八条已发布迁移与 test-v2 未改。历史夹具保持各自原范围。
+
+接口：`PATCH /v1/students/:id/tasks/:occurrenceId`。字段与预览同一套长度。沿用 `TASK_ADJUST`、同意、step-up、CSRF、幂等 `tasks.edit`、实例 `expectedVersion`、锁序、锁内重验、成功 heartbeat。与 `plan_adjustments`（`TASK_CONTENT_EDITED`）同一事务。无变化 200 且不写审计。与改期共用实例 version，不得静默覆盖。
+
+页面：S05「编辑本次」；标明仅影响本次；保存中禁用；取消不写库；失败保留输入；版本冲突提示重新加载。不展示「本次及未来」。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 本次编辑后 sibling／series 不变 | 通过 | HTTP：`edits only the selected occurrence snapshots and keeps series plus siblings` |
+| id／key／安排日／年级快照保持 | 通过 | 同上；PATCH 不写 identity／日期／年级／来源列 |
+| horizon 新行用原规则，已编辑行不被覆盖 | 通过 | HTTP 删缺口后再 POST；新行用 series，已编辑快照保留 |
+| 暂停后恢复仍保留内容 | 通过 | HTTP pause／resume 后快照仍为编辑值 |
+| 非法／越权／撤回／非法状态／旧 version | 通过 | HTTP：`rejects invalid, unauthorized, stale and paused content edits` |
+| 幂等与审计数量 | 通过 | 同键同摘要不重复审计；无变化 200 且不写审计 |
+| 编辑与改期同 version 并发；编辑与暂停／撤回 | 通过 | 独立连接 + `pg_blocking_pids`；败者 `VERSION_CONFLICT` 或锁内重验拒绝 |
+| Chromium 编辑、取消、保存、刷新、另一实例不变 | 通过 | `stp006-edit-walkthrough.spec.ts` |
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 12、domain 34、ui／admin／web 各 1、api **164 passed / 0 failed / 0 skipped** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `apps/web` e2e | 0 | **11 passed / 0 failed**（含模板导入、S06、状态、horizon、改期、本次内容 walkthrough） |
+| GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright，不宣称已执行；日志 403 时只写证据边界 |
+
+用户可见：S05 可「编辑本次」。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。未 pack／部署。未来规则编辑仍待办。
+
