@@ -802,3 +802,181 @@ STP 007 接口边界（本轮不实现）：只允许对 `PLANNED`／`IN_PROGRES
 不把子任务留在父 series、不把 SPLIT 做成独立 status、不复制或更换父 series id、不做多级树、不做撤销拆分、不在 GET 自动补齐、不把 `steps` 当子任务。Cursor 实现时不得重新选型。
 
 已知限制（显式阻塞，不是待选架构）：本阶段不能撤销拆分；不能拆过去或非 `PLANNED` 实例；不能对子任务做本次及未来规则编辑。完成态拆分留给 STP 007。
+
+## 17. horizon 后台自动补齐定稿（006-D，本轮只设计）
+
+本节基于 `main@9b180e1a09a1b83ff1811b588277346e1a56c640` 及当前十条迁移定稿，是后台自动补齐的唯一方案。现场没有 worker／Outbox 表、启动入口或配置；现有 `taskHorizon` 是 Cookie／CSRF／step-up／人类幂等与 heartbeat 包装，真正可复用的是其 revision-aware 实例物化逻辑。本节明确取代第 2 节和 11.3 中“之后只允许显式 POST／不设专用持久作业／Outbox 工人调用同一 HTTP POST”的后台传输部分：**公开 POST 和手动按钮保留，新增一个最小专用 standing-job，worker 不调用 HTTP、不伪造人类会话；二者只共享锁内核心。** 不建设通用队列平台，`GET` 继续零业务写。
+
+### 17.1 固定机制与作业单位
+
+只新增一个 planning 专用的 PostgreSQL transactional-Outbox／standing-job 表 `task_horizon_jobs`，**每个 `StudyPlan` 恰好一行**。它同时承担计划创建后的事务信号、下一次本地日补齐时间、租约和失败状态；不建设通用队列，不创建通知／打卡／计时 Outbox，也不引入 Redis、消息中间件或外部 cron。
+
+选择 plan 而不是 student 作为作业单位，原因固定如下：
+
+- `ACTIVE`／`PAUSED`／`ARCHIVED` 是 plan 状态，作业可独立休眠或终止，同一学生的其他 `ACTIVE` plan 不受影响。
+- 一次业务事务只处理一个 plan，避免一个多计划学生形成无界事务；当前创建契约每 plan 最多 20 条初始规则。
+- 显式 HTTP 仍可遍历该学生的全部 plan，但必须逐 plan 调同一个 `TaskHorizonCoreService.reconcilePlanLocked`，不得保留第二套生成算法。
+- worker 只物化任务实例；作业行不保存旧权限、旧规则、教育快照、Cookie、CSRF、session 或用户输入 payload。
+
+迁移回填已有 plan；第十一条迁移的 plan `AFTER INSERT` 触发器保证迁移先于新应用部署时，旧应用新建 plan 也不会漏作业。应用层统一 `signalPlanHorizon` 在恢复、资格修复或规则变化事务的**业务锁之后**递增作业 generation；它不是执行授权，执行时仍完整重验。
+
+状态写路径必须在原业务事务末尾同步作业：`PAUSE → BLOCKED/PLAN_PAUSED`，`ARCHIVE → RETIRED/PLAN_ARCHIVED`，`RESUME → signal READY now`；同意撤回／关系撤销把该学生未退休 plan 作业置相应 BLOCKED，同意重新授予、教育恢复、档案时区改变和未来规则确认 signal。租约态的可恢复 signal 只抬 generation；撤回／PAUSE／ARCHIVE 可清 lease 使旧 token 失效。即使 signal 路径有缺口，worker 每次仍以锁内资格为准，BLOCKED 的下一本地日复查是恢复兜底。
+
+### 17.2 服务身份与持续执行授权
+
+worker 的逻辑主体固定为进程内能力 `SYSTEM/HORIZON_WORKER_V1`，worker 实例另生成随机 `workerInstanceId` 只用于租约和观测。该能力只存在于独立 worker module，不从 HTTP DTO、环境里的 account id 或数据库业务行构造；它不是 `Account`、`GuardianLink` 或 `DeviceSession`，不能调用其他 planning 写能力。
+
+后台持续执行的授权来源是：**用户已合法建立且仍为 `ACTIVE` 的计划，叠加执行时仍成立的当前关系、当前必要同意、档案与教育资格**。启动开关和入队事实都不是业务授权。每次执行在业务事务内取得完整锁后，用数据库 `clock_timestamp()` 重读并同时满足：
+
+1. plan 仍为 `ACTIVE`，并且确实归属于作业 FK 指向的学生；
+2. `StudentProfile.status` 和实时 activation 都为 `ACTIVE`，不是 `ONBOARDING`、`RESTRICTED`、`DELETION_PENDING` 或 `DELETED`；
+3. 年龄段受支持，教育字段完整，不是 leftover，`gradeConfigId／gradeConfigVersionId` 与当前已发布版本真实匹配；
+4. 适用 `ConsentPolicy.currentDocumentVersionId` 已发布，当前未撤回、未 supersede 的 `ConsentRecord` 精确接受该版本，正文 scope 仍覆盖计划／任务实例／年级快照／来源审计；
+5. 该 ConsentRecord 的 `GuardianLink` 仍为 `ACTIVE`，grantor `Account.status=ACTIVE`。现有 `assertFreshRequiredConsent`／`activationFor` 没有覆盖这两项，006-D 必须在共享 planning 资格检查中补齐，不能直接把旧 helper 当完整 worker 授权。
+
+worker 不要求、也不得制造 Cookie、CSRF、step-up、`IdempotencyRecord`、共同制定声明或学生确认；不更新任何 `DeviceSession.lastSeenAt`。公开 POST 继续保留现有 session、`TASK_ADJUST`、Guardian 五分钟 step-up、CSRF、幂等与成功 heartbeat，不能因有 worker 而放宽。
+
+| 当前变化 | 对 worker 的明确影响 |
+| --- | --- |
+| 普通退出登录、session 自然过期、单设备撤销、pairing 撤销或仅 authVersion 轮换 | 不撤销已保存计划的持续指令；worker 可继续。人类请求仍按会话规则失败 |
+| grantor Account 非 `ACTIVE` 或该 ConsentRecord 的 GuardianLink 非 `ACTIVE` | `BLOCKED`，零任务写；有效关系下形成当前同意后唤醒 |
+| 同意撤回／supersede／政策 current version 切换 | `BLOCKED`，直到接受当前版本；旧同意或排队快照无效 |
+| 档案 `ONBOARDING`／`RESTRICTED` | `BLOCKED`；修复资格后立即 signal，并有低频复查兜底 |
+| 档案 `DELETION_PENDING`／`DELETED` | `RETIRED`，不再自动领取 |
+| plan `PAUSED` | 该 plan 作业 `BLOCKED`；`RESUME` 同事务 signal 后立即重获机会 |
+| plan `ARCHIVED` | `RETIRED`；归档不可恢复 |
+| 教育缺失、leftover 或不匹配当前已发布版本 | `BLOCKED`；修复后 signal，不能沿用旧年级快照生成新行 |
+
+`test-v2` 的覆盖依据不是权限动作：`PLAN_PURPOSE_SCOPE` 明列 `taskOccurrence`、`gradeSnapshot`、`actorAudit`，正文也可读地写明“生成并保存任务实例；固化年级快照；记录实际操作者与来源审计”。自动定时只是同一计划实例用途的触发方式，不增加数据类别或通知用途，因此隔离实现可复用当前版本，无需改写或新增 test 文档。它仍是非正式测试告知，不能冒充生产 B04 正文，也**不覆盖通知发送**；006-D 通过不得关闭 T11-D。
+
+### 17.3 唯一共享的物化核心
+
+从 `PlanningService.fillMissingOccurrences` 抽出无 HTTP、无 session、无 heartbeat、无作业领取副作用的 `TaskHorizonCoreService.reconcilePlanLocked(tx, input)`。调用者必须先完成各自授权和统一锁；核心只接收服务端查得的 student、一个 plan、根 series、相关 revisions／occurrences 与锁后 DB now，返回结构化计数和业务阻塞，不接受客户端归属、actor 或时间。
+
+核心语义固定：
+
+- 窗口是执行时档案时区的本地 today 至 today+13，并裁剪 plan／series 日期边界；按原始 `occurrenceKey` 去重，`scheduledLocalDate` 仍是实际安排日。
+- CONTENT／SCHEDULE 按该 key 的最高有效 revision 双轴解析。已有实例不重写单次内容／排期例外、历史、终态或教育快照。
+- 只允许恢复 `CANCELLED/SERIES_RULE_REMOVED` 且无 schedule exception 的原行；`USER_CANCELLED`、`SPLIT`、`PLAN_PAUSED`、`PLAN_ARCHIVED` 及其他原因绝不恢复。
+- 含任一 `sourceOccurrenceId != null` 实例的 ONCE series 明确认定为拆分子 series，整个 series 跳过。不能再依赖“子 key 恰好已存在”来偶然防重；父 `SPLIT` key 继续占位。
+- 新实例取**本次生成时**当前合法教育快照；已有实例包括跨学年旧行保持不变。
+- 查询和锁定只覆盖目标 plan、根 series、14 天候选 key 及候选实际日的占位行，不加载整段历史。单 plan 根 series 超过 100 或本轮候选／冲突锁行超过 5,000 时零业务写并进入 `FAILED/SCOPE_LIMIT`，不得分半批提交。
+- 当前 `createMany({skipDuplicates:true})` 会同时吞掉 key 重复和同 series 实际日冲突，不能继续把返回 count 当“窗口完整”。核心必须先显式分类 `(series_id, scheduled_local_date)` 占位；不同 key 占同日时整 plan 零写，worker 记 `BLOCKED/DATE_OCCUPIED`，人类 POST 仍返回现有 `409 TASK_DATE_CONFLICT`。最终 INSERT 数少于预期视为并发陈旧并整事务重试／回滚，不静默跳过。
+
+### 17.4 调度、领取、generation 与失败恢复
+
+状态只使用 `READY | LEASED | BLOCKED | FAILED | RETIRED`：
+
+- `READY`：`availableAt` 到点可领取。初始回填和新建 `ACTIVE` plan 立即到期；成功后安排到**下一档案本地日 00:05 + `hash(planId) mod 600` 秒**，不得用 UTC 加 24 小时。
+- `LEASED`：一个 worker 已领取。claim 用短事务执行 `FOR UPDATE SKIP LOCKED ORDER BY available_at,plan_id LIMIT :batch`，写随机 `leaseToken` 后立即提交；允许重复执行，不以“领取一次”当业务去重。
+- `BLOCKED`：可恢复的业务资格或同 series 日期占位不满足，不增加技术 attempt；相关业务写同事务 signal 立即唤醒，另排到下一本地日低频复查，避免漏 signal 永久饥饿。
+- `FAILED`：结构超限，或同一 generation 的技术错误完成 8 次指数退避后进入；不再自动热循环，诊断后通过受控 CLI 指定 job requeue。
+- `RETIRED`：plan 已归档或档案进入删除态；不再领取。
+
+每行持有 `requestedGeneration`、`processedGeneration` 和领取时的 `claimedGeneration`。新建／恢复／同意或教育修复／时区改变／未来规则确认调用 `signalPlanHorizon`：READY／BLOCKED 转 `READY now`，LEASED 只递增 requested generation、不抢 lease，FAILED／RETIRED 不被普通 signal 复活。成功结束时若 `requested > claimed`，立即 `READY` 再跑一次；否则建立下一本地日 generation。这样不会丢掉处理期间发生的变更，也不用覆盖另一 worker 状态。
+
+generation 转移不留实现选择：新行从 `requested=1, processed=0, attempt=0` 开始；claim 只取 `processed < requested`，并令 `claimed=requested`。signal 只作用于 `READY／BLOCKED／LEASED`，原子执行 `requested += 1, attempt=0`；LEASED 不被抢占，READY／BLOCKED 转 `READY now`，FAILED／RETIRED 保持不变。成功令 `processed=claimed, attempt=0`；若此时 `requested>claimed` 则保留 requested 并立即 READY，否则令 `requested=claimed+1` 并排下一本地日。业务 BLOCKED 同样先令 `processed=claimed, attempt=0`：已有 `requested>claimed` 时转 `READY now` 消费处理中到达的 signal；否则原子令 `requested=claimed+1`、`state=BLOCKED`、`availableAt=下一本地日复查点`。技术失败不推进 processed：若 `requested>claimed`，说明旧 lease 处理期间已有新 generation，失败／过期回收不得消费其预算，须清 lease 后以 `attempt=0, READY now` 处理新 generation；只有 `requested=claimed` 时才 `attempt += 1`、对该 generation 退避并在第 8 次转 FAILED。FAILED 只能由显式 requeue 清 attempt、递增 requested 并转 READY；RETIRED 不能 requeue。由此 READY／BLOCKED 永远满足 `processed < requested`，每个新 generation 都有完整 8 次预算，也不会出现有 available time 却永远不可 claim 的行。
+
+默认运行参数定死为：poll 30 秒、每轮最多处理 20（硬上限 100）、并发 4（硬上限 16）、lease 300 秒、每 60 秒续租、技术重试最多 8 次，退避从 5 秒指数增长到 15 分钟并加稳定小抖动。每次 claim 子批不得超过当前空闲并发槽，不能先租 20 行再让 16 行在进程内排队。按 `(available_at,plan_id)` 领取且失败行退避到未来，持续失败的前排对象不能饿死后排对象。claim、续租、过期 lease 回收都是 job-only 短事务；续租只按 `planId + leaseToken + state=LEASED` CAS，不接触业务图。
+
+正常处理把“实例变更／无变化结论”和“作业结束状态”放在**同一个业务事务**：先取得业务图锁并处理，最后按仍有效且未过期的 lease token 更新 job，job 是全局锁序的最后一类。条件更新为 0 就抛错，整笔业务事务回滚。因此：
+
+- 提交前进程崩溃：实例与结束状态一起回滚；lease 过期后重领。
+- 数据库提交成功但客户端在收到确认前崩溃／断线：实例与 job 状态已经一起提交，不存在“业务已提交、ack 未提交”的持久中间态。
+- lease 已过期并被其他 worker 领取：旧 worker 最后的 token CAS 失败，其业务写一起回滚；旧 token 不能覆盖新状态。
+- 技术异常导致业务事务回滚后，存活进程用 job-only CAS 增加 attempt 并退避；进程也崩溃则过期 lease 回收做同一处理。
+
+### 17.5 锁序、去重与现有功能竞争
+
+领取 job 时不得持有任何业务锁；业务事务开始前也不得继续持有 claim 行锁。worker 使用现有统一顺序的严格子序列并在锁后重发现完整集合：
+
+`Account → StudentProfile → GradeConfig(FOR SHARE) → ConsentPolicy → GuardianLink → ConsentRecord → StudyPlan → TaskSeries(id升序) → TaskOccurrence(id升序) → TaskHorizonJob`
+
+不可变 `ConsentDocumentVersion`／`GradeConfigVersion` 随锁住的父指针重读。worker 没有 Idempotency／session／challenge／pairing 锁。job-only claim／renew／reaper 绝不再取业务图；所有业务路径的 signal／retire 都在自身既有业务锁之后按 `plan_id` 升序更新，禁止 `job → Account／Student／Plan` 的反向等待。`40P01`／`40001`／`P2034` 只做有上限的整事务重试。
+
+最终业务防重仍是 `UNIQUE(series_id, occurrence_key)`、`UNIQUE(series_id, scheduled_local_date)`、plan／series／occurrence 行锁与锁后重读；租约只是分工优化。竞争结果固定如下：
+
+| 竞争 | 线性化结果 |
+| --- | --- |
+| 双 worker／过期 lease 重领 | plan／series 锁串行；旧 token 不能提交。后者看到既有 key 后为 no-op，不产生第二行 |
+| 显式 horizon POST | 谁先取得业务图锁谁先补；后者重读同一核心并 no-op。HTTP 的幂等和 heartbeat 语义不变 |
+| CONTENT／SCHEDULE FUTURE | FUTURE 先则 worker 使用新 revision；worker 先则 FUTURE 协调刚生成行。处理期间 signal generation 不丢 |
+| 单次改期 | 原始 key 仍存在，worker 不重生；候选实际日被另一 key 占用时显式阻塞，不自动换日或覆盖 |
+| 拆分 | 父 `SPLIT` 永不恢复；子 series 显式跳过，不创建无 `sourceOccurrenceId` 的替代子行 |
+| PAUSE／ARCHIVE 先 | worker 锁后见非 ACTIVE，零任务写并 BLOCKED／RETIRED |
+| worker 先、随后 PAUSE／ARCHIVE | 状态操作在线性化后按既定逻辑取消新建的未来 `PLANNED` 行；父 SPLIT 等受保护原因不改 |
+| 同意／关系／Account 撤销先 | worker 锁后拒绝，零任务写；入队时曾合法不构成授权 |
+| worker 先、随后撤销 | worker 只能提交在撤销响应之前；撤销返回后不会有晚到 worker 提交 |
+| logout／session／设备撤销 | 只影响交互凭证，不与 SYSTEM 作业互相冒充，也不触发 heartbeat |
+
+### 17.6 第十一条迁移（本轮不创建、不执行）
+
+十条已发布迁移与 `test-v2` 一字不改。006-D 需要第十一条纯增量迁移，新建 `task_horizon_jobs`，不新增通用 `OutboxEvent`：
+
+1. `plan_id UUID PRIMARY KEY REFERENCES study_plans(id) ON DELETE RESTRICT`；不另造冗余 job id，也不存一份可错配 `student_profile_id`。主键就是每 plan 唯一约束和 FK 查找索引，触发器直接使用 `NEW.id`，无需额外 UUID 扩展。
+2. `state TEXT NOT NULL`、`available_at timestamptz`、`requested_generation bigint NOT NULL default 1`、`processed_generation bigint NOT NULL default 0`、`claimed_generation bigint null`、`attempt_count int NOT NULL default 0`。
+3. `lease_token UUID`、`lease_owner`、`lease_started_at`、`lease_expires_at`；`state_reason`、`last_outcome`、`last_error_code`、`last_inserted_count int NOT NULL default 0`、`last_started_at`、`last_finished_at`、`last_success_at`、`last_success_local_date date`、`last_executor_key`；`created_at`／`updated_at` 均 `timestamptz NOT NULL`。除已明确 nullable 的调度／lease／结果字段外，核心状态列不得依赖 CHECK 代替 `NOT NULL`。
+4. 全部 CHECK 使用显式 `IS NULL／IS NOT NULL` 的 null-safe 形状：state 仅五值；generation 正数且 `0 <= processed <= requested`；READY／BLOCKED 强制 `processed < requested`；attempt／inserted 非负；`LEASED` 当且仅当四个 lease 字段和 claimed generation 齐全、`processed < claimed <= requested`、expiry > started、available 为空；非 LEASED 的 lease／claimed 全空；READY／BLOCKED 必须有 available，FAILED／RETIRED 的 available 为空。`state_reason` 联合约束固定为：BLOCKED 仅 `PLAN_PAUSED／PROFILE_NOT_ACTIVE／AGE_NOT_SUPPORTED／ACCOUNT_NOT_ACTIVE／GUARDIAN_LINK_NOT_ACTIVE／CONSENT_REQUIRED／CONSENT_SCOPE_MISSING／EDUCATION_INVALID／DATE_OCCUPIED`，FAILED 仅 `SCOPE_LIMIT／RETRY_EXHAUSTED`，RETIRED 仅 `PLAN_ARCHIVED／PROFILE_DELETION`，READY／LEASED 必须为空。`last_outcome` 仅 `GENERATED／RESTORED／NOOP／BLOCKED／FAILED／RETIRED／REQUEUED` 或空；`last_executor_key` 仅空或 `HORIZON_WORKER_V1`；error／owner／reason 长度受限。
+5. 索引：主键 `plan_id`；partial claim index `(available_at,plan_id) WHERE state IN ('READY','BLOCKED')`；partial expired-lease index `(lease_expires_at,plan_id) WHERE state='LEASED'`；非空 `lease_token` 唯一；观测用 `(state,state_reason,updated_at)`。
+6. plan `AFTER INSERT` 触发器原子创建 job；回填所有既有 plan：ACTIVE=`READY/due now`，PAUSED=`BLOCKED/PLAN_PAUSED`，ARCHIVED=`RETIRED/PLAN_ARCHIVED`。只新增作业行，不改 plan、series、revision、exception、occurrence、取消原因或教育快照。
+
+兼容顺序固定为：先 migration 11，再部署仍默认关闭 worker 的新 API，再在隔离库运行 bounded once，最后单独启 worker。应用回退先停 worker，旧 API 与手动 POST 继续可用，作业表保留，已有数据后不 drop table 回滚。
+
+新增 `scripts/stp006-ten-to-eleven.mjs`：构造合法非空第十态，必须含 ACTIVE／PAUSED／ARCHIVED plan、CONTENT／SCHEDULE revision、两类单次 exception、`USER_CANCELLED`、`SERIES_RULE_REMOVED`、`SPLIT` 父子与不同年级快照；只应用第十一条并比较全部既有业务行 digest 不变。实际反例验证 FK、每 plan 唯一、state／lease／generation CHECK、partial index claim、双连接 `SKIP LOCKED`、过期 lease、旧 token CAS 与 insert trigger。fresh 预期改为 11；八→九仍只到 9、九→十仍只到 10，并断言九→十库不存在 job 表，不能用 `migrate deploy` 自动追到 11。
+
+### 17.7 独立运行、配置与健康观测
+
+独立入口为 `apps/api/src/horizon-worker/main.ts`，用 `NestFactory.createApplicationContext(HorizonWorkerModule)`，不监听 HTTP。`HorizonWorkerModule` 只装配 config、Prisma、共享 eligibility／horizon core 和 job repository；**不得 import `AppModule` 或现有 `StudentsModule`**，后者含 `PolicySeedService.OnModuleInit`，worker 启动不能顺带发布测试政策或装载控制器。
+
+实现后唯一命令形状：
+
+```bash
+pnpm build
+# 以下 worker 命令的进程环境必须已有 HORIZON_WORKER_ENABLED=true
+pnpm worker:horizon -- --continuous
+pnpm worker:horizon -- --once --max-jobs=20 --max-ms=60000
+pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_DIAGNOSIS
+```
+
+`HORIZON_WORKER_ENABLED` 默认 `false`；只有独立命令、显式 `true` 且 mode 为 `--continuous`、`--once` 或 `--requeue-failed` 才运行，缺 mode 以非零退出。requeue 只接受合法 plan UUID 和固定 reason，只允许 `state=FAILED` 且 observed generation 未变化的 job：job-only CAS 清 attempt／error／reason、`requested += 1`、置 `READY`／DB now 并记录 `lastOutcome=REQUEUED`；不直接写 occurrence，后续领取仍做完整锁内资格。成功退出 0，不存在退出 3，存在但非 FAILED／CAS 冲突退出 4，输入／配置错误退出 2。普通 `main.ts`、`AppModule`、`pnpm dev`、单元测试、历史升级夹具和 import module 都不得启动循环。CI／隔离验证只用 `--once`；`max-ms` 是停止新 claim 的硬截止，已开始的事务最多再等现有 30 秒事务超时后取消／回滚，因此进程最迟在 `max-ms + 35 秒` 内 `finally` 关闭 Nest context 与 Prisma，不留常驻进程。
+
+RuntimeConfig／`.env.example` 的键固定为 `HORIZON_WORKER_ENABLED`、`HORIZON_WORKER_POLL_MS=30000`、`HORIZON_WORKER_MAX_JOBS_PER_CYCLE=20`、`HORIZON_WORKER_CONCURRENCY=4`、`HORIZON_WORKER_LEASE_MS=300000`、`HORIZON_WORKER_RENEW_MS=60000`、`HORIZON_WORKER_MAX_ATTEMPTS=8`、`HORIZON_WORKER_MAX_ROOT_SERIES=100`、`HORIZON_WORKER_MAX_LOCK_ROWS=5000`。启动时校验正数、cycle ≤ 100、concurrency ≤ 16、renew < lease/2，且 lease 大于现有一次完整重试序列的最坏业务事务预算；非法配置在领取前退出。
+
+continuous 接收 `SIGTERM／SIGINT` 后停止 claim，等待当前业务事务至现有 30 秒超时边界，随后关闭；强杀留下的 lease 自动过期。worker 不开新的公开 health 端口：进程监督负责 liveness，启动 DB probe 和作业表统计负责 readiness；结构化日志／指标只含 planId、runId、count 和受控 code，不含儿童正文、token 或 consent 内容。至少观测 due 数、oldest due、expired lease、BLOCKED／FAILED reason、成功时间和 inserted／restored 数。
+
+### 17.8 实施文件入口与内部契约
+
+实施批只进入：
+
+- `prisma/schema.prisma`、第十一条 migration、`scripts/stp006-ten-to-eleven.mjs`、fresh／CI migration gate；旧迁移和旧夹具上界不改。
+- `apps/api/src/planning/task-horizon-core.service.ts`、`task-horizon-job.repository.ts`、共享 `planning-eligibility.service.ts`／`horizon-signal.service.ts` 与无 controller 的 `planning-core.module.ts`；现有 `planning.service.ts` 改为 HTTP adapter，`students.service.ts` 只接入同意／关系／教育／时区变化后的 signal／block，`students.module.ts` 负责 provider 装配，controller 路径／响应保持兼容。
+- `apps/api/src/common/lock-order.ts` 及其 spec 增加全序最后一类 `TaskHorizonJob`；`apps/api/src/horizon-worker/{main,module,service}.ts` 只 import `PlanningCoreModule`、config 和 Prisma。RuntimeConfig、`.env.example` 和根／API package scripts同步增加；AppModule 不导入 worker。
+- `packages/domain` 仅放日期／revision／状态分类的纯规则，`packages/contracts` 只在现有公开错误契约确有缺口时改；不新增 worker 公共 HTTP DTO。
+- API／DB／真实并发测试、bounded worker 集成测试和现有手动 horizon E2E 回归；本批没有新 H5 功能。
+
+内部结果至少为 `{from,to,insertedCount,restoredCount,alreadyPresentCount,protectedCount}`；业务资格返回受控 `BLOCKED_*／RETIRED_*`，技术异常不伪装成业务成功。worker 不使用人类 `Idempotency-Key`；`job generation + lease CAS + 业务唯一约束 + 锁后重读` 构成其可重放边界。
+
+### 17.9 验收矩阵（实现批，本轮不运行）
+
+| 组 | 必须证明 |
+| --- | --- |
+| AUTO | 不调用手动 POST 也实际补出缺失实例；同一本地日重复运行不增加行；GET 仍零写，手动按钮仍可用 |
+| TZ | 至少两个不同时区在各自午夜推进 today..today+13；DST／日期边界按档案时区，不能用服务器本地日或 UTC+24h |
+| REVISION | CONTENT／SCHEDULE 双轴、连续未来编辑、窗口外后续补齐正确；单次内容／排期例外、历史、终态不覆盖 |
+| PROTECTION | `USER_CANCELLED`／`SPLIT` 不恢复；拆分子 series 不补；父 key／原始 key 去重；同 series 日期占位显式阻塞且无半批 |
+| SNAPSHOT | 旧实例年级快照不变；跨学年新实例取执行时当前合法教育；教育失效时零写，恢复后 signal 可补 |
+| AUTH | logout／session 过期／设备撤销不冒充授权也不阻断合法后台；Account／link／同意／政策版本／档案状态逐项失效时执行锁内零写，恢复后重新获得机会；无 heartbeat／假学生确认 |
+| RACE | 双 worker、worker+HTTP、FUTURE、改期、拆分、pause／archive、同意／关系撤销均用独立真实连接制造锁等待并以 `pg_blocking_pids` 证明重叠；不以 `Promise.all` 冒充 |
+| CRASH | claim 后崩溃、业务提交前崩溃、提交结果未知、续租失败、过期重领、旧 token finish；无重复业务行、无部分 plan 批次、无错误 job 覆盖 |
+| RETRY | 临时 DB 错误对同一 generation 退避且最多 8 次；第 7 次退避／LEASED 期间 signal 后，新 generation 的首次失败不能直接 FAILED，必须仍有完整 8 次预算；业务 BLOCKED 不计技术 attempt；FAILED 不无限热重试，显式 requeue 后可恢复；制造超过 batch 的同时到期 job 与最早失败行，证明失败行退避、后排仍领取且单次 claim 不超过空闲并发槽 |
+| MIGRATION | fresh 11；合法非空十→十一既有 digest 保留；job FK／UNIQUE／CHECK／partial index／trigger 实际反例；八→九与九→十上界不变 |
+| PROCESS | `--once` 同时受 max-jobs／max-ms 限制并正常退出、断开 DB、无遗留 timer／进程；普通 API／test／fixture 不启动 worker |
+| SCOPE | 作业日志为 SYSTEM 来源且无敏感正文；test-v2 精确 scope／正文回归；明确 horizon worker 通过不等于通知 worker 或 T11-D 通过 |
+
+本批无 UI 新入口，不删除现有 POST／按钮。完成上述实现与证据前，006-D、worker／Outbox 和整个 STP 006 都不得写成完成。
+
+### 17.10 已关闭冲突与延期项
+
+- **已关闭的设计冲突：** 不再采用“worker 调带 CSRF 的 POST”；采用两个授权 adapter + 一个锁内核心，没有第二套生成算法，也没有无保护公共端点。
+- **实现前必须补的实际缺口：** 当前 worker／表／命令均不存在；当前 consent helper 未验证 ConsentRecord 对应 link／grantor Account 仍有效；当前 `skipDuplicates` 会静默吞同 series 日期冲突；当前核心未显式识别拆分子 series。以上均已落到 006-D 文件范围与验收，不是可选架构。
+- **非本批、不得顺带关闭：** 正式 B04 告知／生产启用、通知真实发送与 T11-D、STP 007 打卡／计时／完成、通用 Outbox 平台、部署。它们不阻塞隔离实现和 CI，但在各自门槛未通过前仍阻塞相应生产声明。

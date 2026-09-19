@@ -18,7 +18,8 @@
     "test:e2e": "pnpm --filter @studysteps/web test:e2e",
     "build": "pnpm -r --if-present build",
     "prisma:validate": "node ./scripts/prisma-validate.mjs",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "worker:horizon": "node apps/api/dist/horizon-worker/main.js"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

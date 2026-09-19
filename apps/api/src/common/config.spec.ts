@@ -43,5 +43,18 @@ describe('runtime config', () => {
       'http://127.0.0.1:5173',
     ]);
     expect(config.cookieNames.session).toBe('stp_session');
+    expect(config.horizon.enabled).toBe(false);
+    expect(config.horizon.maxJobsPerCycle).toBe(20);
+  });
+
+  it('rejects invalid horizon worker configuration before claim', () => {
+    expect(() =>
+      loadAppConfig({
+        NODE_ENV: 'development',
+        APP_ENV: 'local',
+        HORIZON_WORKER_LEASE_MS: '1000',
+        HORIZON_WORKER_RENEW_MS: '100',
+      }),
+    ).toThrow(/LEASE/);
   });
 });

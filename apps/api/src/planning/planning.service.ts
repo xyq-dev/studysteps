@@ -13,7 +13,6 @@ import {
   previewCanonicalPayload,
   manualPreviewCanonicalPayload,
   datesToMaterializeForPlan,
-  datesToMaterializeFromRevisions,
   canAnchorFutureChange,
   canSplitOccurrence,
   classifyFutureContentEffect,
@@ -80,6 +79,9 @@ import { IdentityService } from '../auth/identity.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CatalogService } from '../catalog/catalog.service';
 import { StudentsService } from '../students/students.service';
+import { HorizonSignalService } from './horizon-signal.service';
+import { PlanningEligibilityService } from './planning-eligibility.service';
+import { TaskHorizonCoreService } from './task-horizon-core.service';
 
 type Tx = Prisma.TransactionClient;
 
@@ -123,6 +125,9 @@ export class PlanningService {
     private readonly identity: IdentityService,
     private readonly idempotency: IdempotencyService,
     private readonly catalog: CatalogService,
+    private readonly horizonCore: TaskHorizonCoreService,
+    private readonly horizon: HorizonSignalService,
+    private readonly eligibility: PlanningEligibilityService,
   ) {}
 
   async preview(session: DeviceSession, studentId: string, templateId: string, input: PreviewTemplateInput) {
@@ -373,6 +378,7 @@ export class PlanningService {
       taskSeriesIds: [...new Set(existingRows.map((row) => row.seriesId))],
       taskOccurrenceIds: existingRows.map((row) => row.id),
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      taskHorizonJobPlanIds: [planId],
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -465,6 +471,13 @@ export class PlanningService {
         where: { id: plan.id },
         data: { status: transition.next, version: plan.version + 1 },
       });
+      if (input.action === 'PAUSE') {
+        await this.horizon.blockPlans(tx, [plan.id], 'PLAN_PAUSED', current.timezone);
+      } else if (input.action === 'ARCHIVE') {
+        await this.horizon.retirePlans(tx, [plan.id], 'PLAN_ARCHIVED');
+      } else if (input.action === 'RESUME') {
+        await this.horizon.signalPlans(tx, [plan.id]);
+      }
       await tx.planAdjustment.create({
         data: {
           planId: plan.id,
@@ -1195,6 +1208,7 @@ export class PlanningService {
       taskSeriesIds: [target.seriesId],
       taskOccurrenceIds: siblingIds,
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      taskHorizonJobPlanIds: [target.series.planId],
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -1799,6 +1813,7 @@ export class PlanningService {
         noOp,
       };
       if (begun) {
+        await this.horizon.signalPlans(tx, [row.series.planId]);
         await this.idempotency.complete(tx, begun.recordId, 'TaskSeries', JSON.stringify(result), 200, now);
       }
       await this.identity.touchLastSeenLocked(tx, currentSession, now);
@@ -1866,13 +1881,20 @@ export class PlanningService {
       where: { series: { plan: { studentProfileId: studentId } } },
       select: { id: true, seriesId: true, series: { select: { planId: true } } },
     });
+    const planIds = [
+      ...new Set([
+        ...(await this.horizon.planIdsForStudent(this.prisma, studentId)),
+        ...existingRows.map((row) => row.series.planId),
+      ]),
+    ];
     const graph = await this.students.collectStudentGraph(studentId, {
       accountIds: [...(session.accountId ? [session.accountId] : []), ...(session.issuedByAccountId ? [session.issuedByAccountId] : [])],
       sessionIds: [session.id],
-      planIds: [...new Set(existingRows.map((row) => row.series.planId))],
+      planIds,
       taskSeriesIds: [...new Set(existingRows.map((row) => row.seriesId))],
       taskOccurrenceIds: existingRows.map((row) => row.id),
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      taskHorizonJobPlanIds: planIds,
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -1911,15 +1933,17 @@ export class PlanningService {
           planIds: plans.map((plan) => plan.id),
           taskSeriesIds: seriesIds,
           taskOccurrenceIds: occurrenceIds,
+          taskHorizonJobPlanIds: plans.map((plan) => plan.id),
         })
       ) {
         throw new IncompleteLockSetError({
           planIds: plans.map((plan) => plan.id),
           taskSeriesIds: seriesIds,
           taskOccurrenceIds: occurrenceIds,
+          taskHorizonJobPlanIds: plans.map((plan) => plan.id),
         });
       }
-      const result = await this.fillMissingOccurrences(tx, current, plans, now);
+      const result = await this.reconcilePlansForHttp(tx, current, plans, now);
       await this.idempotency.complete(tx, begun.recordId, 'TaskHorizon', JSON.stringify(result), 200, now);
       await this.identity.touchLastSeenLocked(tx, currentSession, now);
       return result;
@@ -1951,7 +1975,7 @@ export class PlanningService {
       gradeConfigVersionId: string | null;
     },
   ) {
-    await this.students.assertFreshRequiredConsent(tx, current.id, current.ageBand);
+    await this.eligibility.assertFreshRequiredConsent(tx, current.id, current.ageBand);
     const activation = await this.students.activationFor(tx, current);
     if (!activation.learningAccess.allowed) {
       throw new AppError('LEARNING_ACCESS_BLOCKED', '当前学习访问未开通', 403);
@@ -2144,12 +2168,11 @@ export class PlanningService {
         contentRevisionNo: snapshot.contentRevisionNo ?? 1,
         scheduleRevisionNo: snapshot.scheduleRevisionNo ?? 1,
       })),
-      skipDuplicates: true,
     });
     return created.count;
   }
 
-  private async fillMissingOccurrences(
+  private async reconcilePlansForHttp(
     tx: Tx,
     student: {
       id: string;
@@ -2188,6 +2211,7 @@ export class PlanningService {
           scheduleRevisionNo: number;
           contentExceptionAdjustmentId: string | null;
           scheduleExceptionAdjustmentId: string | null;
+          sourceOccurrenceId?: string | null;
           nameSnapshot: string;
           subjectSnapshot: string;
           completionStandardSnapshot: string;
@@ -2214,8 +2238,6 @@ export class PlanningService {
   ): Promise<HorizonResult> {
     const today = localDateInTimeZone(now, student.timezone);
     const window = horizonWindow(today, null);
-    const skipped: HorizonSkip[] = [];
-    let insertedCount = 0;
     if (plans.length === 0) {
       return { from: window.from, to: window.to, insertedCount: 0, skipped: [{ reason: 'NO_PLAN' }] };
     }
@@ -2230,120 +2252,51 @@ export class PlanningService {
     ) {
       throw new AppError('LEARNING_ACCESS_BLOCKED', '尚未配置教育资料，不能生成任务', 403);
     }
-    const gradeVersion = await tx.gradeConfigVersion.findUnique({
-      where: { id: student.gradeConfigVersionId },
-    });
-    const snapshotBase = {
-      timezone: student.timezone,
-      gradeConfigId: student.gradeConfigId,
-      gradeConfigVersionId: student.gradeConfigVersionId,
-      stageCode: student.stageCode,
-      schoolSystemCode: student.schoolSystemCode,
-      gradeCode: student.gradeCode,
-      gradeLabel: student.gradeLabel,
-      termCode: student.termCode,
-      catalogEntryKey: gradeVersion?.catalogEntryKey ?? '',
-    };
+    let insertedCount = 0;
+    const skipped: HorizonSkip[] = [];
     for (const plan of plans) {
-      if (!planAllowsOccurrenceGeneration(plan.status)) {
-        skipped.push({
-          reason: plan.status === 'PAUSED' ? 'PLAN_PAUSED' : 'PLAN_ARCHIVED',
-          planId: plan.id,
-        });
-        continue;
+      const result = await this.horizonCore.reconcilePlanLocked(tx, {
+        student: {
+          id: student.id,
+          timezone: student.timezone,
+          stageCode: student.stageCode,
+          schoolSystemCode: student.schoolSystemCode,
+          gradeCode: student.gradeCode,
+          gradeLabel: student.gradeLabel,
+          termCode: student.termCode,
+          gradeConfigId: student.gradeConfigId,
+          gradeConfigVersionId: student.gradeConfigVersionId,
+        },
+        plan: {
+          id: plan.id,
+          status: plan.status,
+          series: plan.series.map((series) => ({
+            ...series,
+            occurrences: series.occurrences.map((row) => ({
+              ...row,
+              sourceOccurrenceId: row.sourceOccurrenceId ?? null,
+            })),
+          })),
+        },
+        now,
+      });
+      if (result.failed) {
+        throw new AppError('VALIDATION_ERROR', '当前计划超出一次补齐范围', 400);
       }
-      for (const series of plan.series) {
-        const revisions = (series.revisions ?? []).map((item) => this.asRevision(item));
-        const wanted = revisions.length
-          ? datesToMaterializeFromRevisions(plan.status, revisions, today)
-          : datesToMaterializeForPlan(plan.status, this.ruleFromSeries(series), today);
-        if (wanted.length === 0) {
-          const rule = this.ruleFromSeries(series);
-          const ended = rule.endLocalDate != null && rule.endLocalDate < today;
-          skipped.push({
-            reason: ended ? 'SERIES_ENDED' : 'NO_DATES_IN_WINDOW',
-            planId: plan.id,
-            seriesId: series.id,
-          });
-          continue;
-        }
-        const existingByKey = new Map(series.occurrences.map((row) => [row.occurrenceKey, row]));
-        const missing = wanted.filter((day) => !existingByKey.has(day));
-        const restorable = wanted
-          .map((day) => existingByKey.get(day))
-          .filter(
-            (row): row is NonNullable<typeof row> =>
-              !!row &&
-              row.status === 'CANCELLED' &&
-              row.cancelReason === 'SERIES_RULE_REMOVED' &&
-              row.scheduleExceptionAdjustmentId == null,
-          );
-        if (missing.length === 0 && restorable.length === 0) {
-          skipped.push({ reason: 'ALREADY_EXISTS', planId: plan.id, seriesId: series.id });
-          continue;
-        }
-        for (const existing of restorable) {
-          const contentRev = revisions.length
-            ? selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], existing.occurrenceKey)
-            : null;
-          const scheduleRev = revisions.length
-            ? selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], existing.occurrenceKey)
-            : null;
-          const content = contentRev
-            ? contentFromRevision(contentRev)
-            : {
-                name: existing.nameSnapshot,
-                subject: existing.subjectSnapshot,
-                completionStandard: existing.completionStandardSnapshot,
-                durationMinutes: existing.durationMinutesSnapshot,
-                steps: JSON.parse(existing.stepsSnapshotJson) as string[],
-              };
-          await tx.taskOccurrence.update({
-            where: { id: existing.id, version: existing.version },
-            data: {
-              status: 'PLANNED',
-              cancelReason: null,
-              scheduleRevisionNo: scheduleRev?.revisionNo ?? existing.scheduleRevisionNo,
-              version: existing.version + 1,
-              ...(existing.contentExceptionAdjustmentId
-                ? {}
-                : {
-                    nameSnapshot: content.name,
-                    subjectSnapshot: content.subject,
-                    completionStandardSnapshot: content.completionStandard,
-                    durationMinutesSnapshot: content.durationMinutes,
-                    stepsSnapshotJson: JSON.stringify(content.steps),
-                    contentRevisionNo: contentRev?.revisionNo ?? existing.contentRevisionNo,
-                  }),
-            },
-          });
-        }
-        for (const localDate of missing) {
-          const contentRev = revisions.length
-            ? selectEffectiveRevision(revisions, ['BASELINE', 'CONTENT'], localDate)
-            : null;
-          const scheduleRev = revisions.length
-            ? selectEffectiveRevision(revisions, ['BASELINE', 'SCHEDULE'], localDate)
-            : null;
-          const content = contentRev ? contentFromRevision(contentRev) : {
-            name: series.name,
-            subject: series.subject,
-            completionStandard: series.completionStandard,
-            durationMinutes: series.durationMinutes,
-            steps: JSON.parse(series.stepsJson) as string[],
-          };
-          insertedCount += await this.insertOccurrenceDates(tx, series.id, [localDate], {
-            ...snapshotBase,
-            name: content.name,
-            subject: content.subject,
-            completionStandard: content.completionStandard,
-            durationMinutes: content.durationMinutes,
-            stepsJson: JSON.stringify(content.steps),
-            contentRevisionNo: contentRev?.revisionNo ?? 1,
-            scheduleRevisionNo: scheduleRev?.revisionNo ?? 1,
-          });
-        }
+      if (result.blocked?.reason === 'DATE_OCCUPIED') {
+        throw new AppError('TASK_DATE_CONFLICT', '同一规则的实际日期已被另一原始任务占用', 409);
       }
+      insertedCount += result.insertedCount;
+      skipped.push(
+        ...result.skipped.filter((item): item is HorizonSkip =>
+          item.reason === 'NO_PLAN' ||
+          item.reason === 'PLAN_PAUSED' ||
+          item.reason === 'PLAN_ARCHIVED' ||
+          item.reason === 'ALREADY_EXISTS' ||
+          item.reason === 'SERIES_ENDED' ||
+          item.reason === 'NO_DATES_IN_WINDOW',
+        ),
+      );
     }
     return { from: window.from, to: window.to, insertedCount, skipped };
   }

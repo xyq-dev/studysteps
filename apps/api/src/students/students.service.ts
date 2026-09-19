@@ -4,8 +4,6 @@ import {
   asProfileStatus,
   decideAgeBand,
   encodeCrockford,
-  applyConsentProbeFailure,
-  consentCurrentFromVerifiedProbe,
   evaluateActivation,
   evaluateEducationChange,
   formatPairingCode,
@@ -54,6 +52,8 @@ import {
 } from './student-authorization';
 import { collectForwardLineageIds, issueReplacementSession, revokeActiveLineage } from '../auth/session-lineage';
 import { CatalogService } from '../catalog/catalog.service';
+import { HorizonSignalService } from '../planning/horizon-signal.service';
+import { PlanningEligibilityService } from '../planning/planning-eligibility.service';
 
 @Injectable()
 export class StudentsService {
@@ -64,6 +64,8 @@ export class StudentsService {
     private readonly idempotency: IdempotencyService,
     private readonly rateLimit: RateLimitService,
     private readonly catalog: CatalogService,
+    private readonly eligibility: PlanningEligibilityService,
+    private readonly horizon: HorizonSignalService,
   ) {}
 
   private get config() {
@@ -249,11 +251,14 @@ export class StudentsService {
       ...(input.kind === 'EDUCATION' && input.gradeConfigId ? [input.gradeConfigId] : []),
       ...(preview?.gradeConfigId ? [preview.gradeConfigId] : []),
     ];
+    const planIds = await this.horizon.planIdsForStudent(this.prisma, studentId);
     const graph = await this.collectStudentGraph(studentId, {
       accountIds: [session.accountId!],
       sessionIds: [session.id],
       idempotencyIds: existingIdem ? [existingIdem] : [],
       gradeConfigIds,
+      planIds,
+      taskHorizonJobPlanIds: planIds,
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -333,6 +338,11 @@ export class StudentsService {
         await this.applyEducation(tx, session, student, input, now);
       }
       const latest = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
+      if (input.kind === 'AGE' && latest.status === 'RESTRICTED') {
+        await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', latest.timezone);
+      } else if (input.kind === 'BASIC' || input.kind === 'EDUCATION' || input.kind === 'AGE') {
+        await this.horizon.signalPlans(tx, planIds);
+      }
       await this.idempotency.complete(tx, begun.recordId, 'StudentProfile', latest.id, 200, now);
       const presented = await this.present(latest, tx);
       await this.identity.touchLastSeenLocked(tx, session, now);
@@ -403,11 +413,14 @@ export class StudentsService {
       input,
     });
     const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'consents.withdraw', idempotencyKey);
+    const planIds = await this.horizon.planIdsForStudent(this.prisma, studentId);
     const graph = await this.collectStudentGraph(studentId, {
       accountIds: [session.accountId!],
       consentIds: [consentId],
       sessionIds: [session.id],
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      planIds,
+      taskHorizonJobPlanIds: planIds,
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -447,6 +460,7 @@ export class StudentsService {
         }
       }
       const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
+      await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', student.timezone);
       await this.idempotency.complete(tx, begun.recordId, 'ConsentRecord', consentId, 200, now);
       await this.identity.touchLastSeenLocked(tx, session, now);
       return { consentId, status: student.status };
@@ -474,11 +488,14 @@ export class StudentsService {
     const actor = this.actor(session);
     const requestDigest = this.idempotency.requestDigest({ operation: 'consents.grant', studentId, input });
     const existingIdem = await this.idempotency.peekId(this.prisma, actor, 'consents.grant', idempotencyKey);
+    const planIds = await this.horizon.planIdsForStudent(this.prisma, studentId);
     const graph = await this.collectStudentGraph(studentId, {
       accountIds: [session.accountId!],
       policies: [{ id: policy.id, policyKey: policy.policyKey, locale: policy.locale }],
       sessionIds: [session.id],
       idempotencyIds: existingIdem ? [existingIdem] : [],
+      planIds,
+      taskHorizonJobPlanIds: planIds,
     });
     return runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
@@ -537,6 +554,7 @@ export class StudentsService {
           data: { status: activation.status },
         });
       }
+      await this.horizon.signalPlans(tx, planIds);
       await this.idempotency.complete(tx, begun.recordId, 'ConsentRecord', created.id, 200, now);
       const presented = await this.present(
         await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } }),
@@ -951,7 +969,12 @@ export class StudentsService {
   }
 
   async revokeGuardianLink(accountId: string, studentId: string, reasonCode: string) {
-    const graph = await this.collectStudentGraph(studentId, { accountIds: [accountId] });
+    const planIds = await this.horizon.planIdsForStudent(this.prisma, studentId);
+    const graph = await this.collectStudentGraph(studentId, {
+      accountIds: [accountId],
+      planIds,
+      taskHorizonJobPlanIds: planIds,
+    });
     await runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(graph, extra);
       await acquireLocks(tx, locked);
@@ -982,6 +1005,8 @@ export class StudentsService {
           data: { status: 'RESTRICTED', restrictedAt: now },
         });
       }
+      const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
+      await this.horizon.blockPlans(tx, planIds, 'GUARDIAN_LINK_NOT_ACTIVE', student.timezone);
     }, graph);
   }
 
@@ -1071,24 +1096,7 @@ export class StudentsService {
     studentId: string,
     ageBand: string,
   ): Promise<void> {
-    const age = decideAgeBand(ageBand as 'UNDER_14' | 'AGE_14_TO_17' | 'AGE_18_PLUS');
-    if (!age.ok) {
-      throw new AppError(age.code, '当前年龄段不能使用', 422);
-    }
-    const policy = await db.consentPolicy.findUnique({
-      where: { policyKey_locale: { policyKey: age.policyKey, locale: 'zh-CN' } },
-    });
-    const consent = await db.consentRecord.findFirst({
-      where: {
-        studentProfileId: studentId,
-        consentPolicyId: policy?.id,
-        withdrawnAt: null,
-        supersededAt: null,
-      },
-    });
-    if (!policy?.currentDocumentVersionId || !consent || consent.documentVersionId !== policy.currentDocumentVersionId) {
-      throw new AppError('CONSENT_REQUIRED', '需要接受当前测试政策', 422);
-    }
+    await this.eligibility.assertFreshRequiredConsent(db, studentId, ageBand);
   }
 
   private async missingRequiredConsent(
@@ -1104,12 +1112,7 @@ export class StudentsService {
     studentId: string,
     ageBand: string,
   ): Promise<boolean> {
-    try {
-      await this.assertFreshRequiredConsent(db, studentId, ageBand);
-      return consentCurrentFromVerifiedProbe();
-    } catch (error) {
-      return applyConsentProbeFailure(error);
-    }
+    return this.eligibility.consentIsCurrent(db, studentId, ageBand);
   }
 
   private localDate(now: Date, timeZone: string): string {

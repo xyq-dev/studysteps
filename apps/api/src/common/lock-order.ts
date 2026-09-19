@@ -25,6 +25,7 @@ export type LockIds = {
   planIds?: string[];
   taskSeriesIds?: string[];
   taskOccurrenceIds?: string[];
+  taskHorizonJobPlanIds?: string[];
 };
 
 export class IncompleteLockSetError extends Error {
@@ -70,6 +71,7 @@ export function normalizeLockIds(ids: LockIds): {
   planIds: string[];
   taskSeriesIds: string[];
   taskOccurrenceIds: string[];
+  taskHorizonJobPlanIds: string[];
 } {
   return {
     idempotencyIds: uniqSorted(ids.idempotencyIds),
@@ -89,6 +91,7 @@ export function normalizeLockIds(ids: LockIds): {
     planIds: uniqSorted(ids.planIds),
     taskSeriesIds: uniqSorted(ids.taskSeriesIds),
     taskOccurrenceIds: uniqSorted(ids.taskOccurrenceIds),
+    taskHorizonJobPlanIds: uniqSorted(ids.taskHorizonJobPlanIds),
   };
 }
 
@@ -111,6 +114,7 @@ export function mergeLockIds(left: LockIds, right: LockIds): LockIds {
     planIds: [...(left.planIds ?? []), ...(right.planIds ?? [])],
     taskSeriesIds: [...(left.taskSeriesIds ?? []), ...(right.taskSeriesIds ?? [])],
     taskOccurrenceIds: [...(left.taskOccurrenceIds ?? []), ...(right.taskOccurrenceIds ?? [])],
+    taskHorizonJobPlanIds: [...(left.taskHorizonJobPlanIds ?? []), ...(right.taskHorizonJobPlanIds ?? [])],
   };
 }
 
@@ -141,7 +145,8 @@ export function lockIdsContain(planned: LockIds, discovered: LockIds): boolean {
     includesAll(left.challengeIds, right.challengeIds) &&
     includesAll(left.planIds, right.planIds) &&
     includesAll(left.taskSeriesIds, right.taskSeriesIds) &&
-    includesAll(left.taskOccurrenceIds, right.taskOccurrenceIds)
+    includesAll(left.taskOccurrenceIds, right.taskOccurrenceIds) &&
+    includesAll(left.taskHorizonJobPlanIds, right.taskHorizonJobPlanIds)
   );
 }
 
@@ -273,6 +278,12 @@ export async function acquireLocks(tx: Prisma.TransactionClient, raw: LockIds): 
       Prisma.sql`SELECT id FROM task_occurrences WHERE id IN (${uuidIn(ids.taskOccurrenceIds)}) ORDER BY id FOR UPDATE`,
     );
   }
+  if (ids.taskHorizonJobPlanIds.length > 0) {
+    await lockTable(
+      tx,
+      Prisma.sql`SELECT plan_id FROM task_horizon_jobs WHERE plan_id IN (${uuidIn(ids.taskHorizonJobPlanIds)}) ORDER BY plan_id FOR UPDATE`,
+    );
+  }
 }
 
 export function isRetryableTx(error: unknown): boolean {
@@ -282,7 +293,9 @@ export function isRetryableTx(error: unknown): boolean {
   }
   if (code === 'P2002') {
     const target = JSON.stringify(error);
-    return /auth_identity_lookups|auth_identities|AuthIdentityLookup|AuthIdentity/.test(target);
+    return /auth_identity_lookups|auth_identities|AuthIdentityLookup|AuthIdentity|task_occurrences|TaskOccurrence/.test(
+      target,
+    );
   }
   const message = error instanceof Error ? error.message : String(error);
   return /deadlock detected|could not serialize|serialization failure/i.test(message);

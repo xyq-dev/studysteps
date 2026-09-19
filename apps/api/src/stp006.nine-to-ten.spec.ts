@@ -65,6 +65,10 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 nine-to-ten leftover upgra
       SELECT COUNT(*)::int AS n FROM task_occurrences WHERE source_occurrence_id IS NOT NULL
     `;
     expect(children[0]?.n).toBe(1);
+    const jobs = await prisma!.$queryRaw<Array<{ jobs: string | null }>>`
+      SELECT to_regclass('task_horizon_jobs')::text AS jobs
+    `;
+    expect(jobs[0]?.jobs).toBeNull();
   });
 
   it('rejects cross-plan, one-level and immutable source pointers after the tenth migration', async () => {

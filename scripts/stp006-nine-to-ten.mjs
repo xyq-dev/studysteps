@@ -34,6 +34,7 @@ export const FORBIDDEN = new Set([
   'stp006_seven_to_eight',
   'stp006_eight_to_nine',
   'stp006_fresh',
+  'stp006_ten_to_eleven',
 ]);
 export const FIXTURE_DATABASE = 'stp006_nine_to_ten';
 const originalName = 'stp004_identity';
@@ -351,6 +352,16 @@ if (isDirectRun()) {
   `);
   if (applied.rows[0].n !== 10) {
     throw new Error(`expected 10 applied migrations, found ${applied.rows[0].n}`);
+  }
+  const jobs = await after.query(`SELECT to_regclass('task_horizon_jobs') AS jobs`);
+  if (jobs.rows[0]?.jobs) {
+    throw new Error('nine-to-ten fixture must not receive task_horizon_jobs');
+  }
+  const eleventh = await after.query(
+    `SELECT migration_name FROM _prisma_migrations WHERE migration_name = '20260919120000_stp006_task_horizon_jobs'`,
+  );
+  if (eleventh.rowCount !== 0) {
+    throw new Error('nine-to-ten fixture must not apply eleventh migration');
   }
   const tenth = await after.query(`SELECT migration_name FROM _prisma_migrations WHERE migration_name = $1`, [TENTH]);
   if (tenth.rowCount !== 1) {

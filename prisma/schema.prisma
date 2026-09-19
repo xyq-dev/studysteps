@@ -487,9 +487,39 @@ model StudyPlan {
   sourceTemplate              PlanTemplateVersion? @relation(fields: [sourceTemplateVersionId], references: [id], onDelete: Restrict)
   series                      TaskSeries[]
   adjustments                 PlanAdjustment[]
+  horizonJob                  TaskHorizonJob?
 
   @@index([studentProfileId, status])
   @@map("study_plans")
+}
+
+model TaskHorizonJob {
+  planId                String    @id @map("plan_id") @db.Uuid
+  state                 String
+  availableAt           DateTime? @map("available_at") @db.Timestamptz(3)
+  requestedGeneration   BigInt    @default(1) @map("requested_generation")
+  processedGeneration   BigInt    @default(0) @map("processed_generation")
+  claimedGeneration     BigInt?   @map("claimed_generation")
+  attemptCount          Int       @default(0) @map("attempt_count")
+  leaseToken            String?   @unique @map("lease_token") @db.Uuid
+  leaseOwner            String?   @map("lease_owner")
+  leaseStartedAt        DateTime? @map("lease_started_at") @db.Timestamptz(3)
+  leaseExpiresAt        DateTime? @map("lease_expires_at") @db.Timestamptz(3)
+  stateReason           String?   @map("state_reason")
+  lastOutcome           String?   @map("last_outcome")
+  lastErrorCode         String?   @map("last_error_code")
+  lastInsertedCount     Int       @default(0) @map("last_inserted_count")
+  lastStartedAt         DateTime? @map("last_started_at") @db.Timestamptz(3)
+  lastFinishedAt        DateTime? @map("last_finished_at") @db.Timestamptz(3)
+  lastSuccessAt         DateTime? @map("last_success_at") @db.Timestamptz(3)
+  lastSuccessLocalDate  DateTime? @map("last_success_local_date") @db.Date
+  lastExecutorKey       String?   @map("last_executor_key")
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  plan                  StudyPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([state, stateReason, updatedAt])
+  @@map("task_horizon_jobs")
 }
 
 model TaskSeries {

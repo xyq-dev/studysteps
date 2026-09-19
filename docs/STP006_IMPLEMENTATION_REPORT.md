@@ -409,6 +409,91 @@ P05 刷新回填、A02 只读目录、STP 005 walkthrough／browser evidence、`
 | Playwright `apps/web` e2e | 0 | **14 passed**（含 split walkthrough） |
 | GitHub Actions | push 后按完整 SHA 跟踪 | CI 未配置 Playwright；日志 403 时不编造远端测试数量 |
 
-未执行：撤销拆分、多级拆分、worker／Outbox、打卡、计时、通知、运营发布、远端 E2E。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。
+未执行：撤销拆分、多级拆分、通知 worker／T11-D、打卡、计时、运营发布、远端 E2E。STP 006 **整个阶段仍未完成**。STP 004／005 完成状态不变。
 
+## 18. STP 006-D：horizon 后台自动补齐（standing-job）
+
+日期：2026-09-19  
+授权：用户持续授权实现 006-D、第十一条隔离迁移、普通 commit／push 及该 SHA 的 Actions。  
+基线：`main@9b180e1a09a1b83ff1811b588277346e1a56c640`
+
+### 目录与 Git
+
+| 项 | 结果 |
+| --- | --- |
+| 工作目录 | `D:\Program Files\PycharmProjects\studysteps` |
+| origin | `https://github.com/xyq-dev/studysteps.git` |
+| 分支 | `main` 跟踪 `origin/main` |
+| 实施前 HEAD | `9b180e1a09a1b83ff1811b588277346e1a56c640` |
+| 本轮提交 | `feat: add persistent task horizon worker`；完整 SHA 见提交后 `git log` |
+| 保留未提交 | `docs/handoffs/STP004_PG_ISOLATION.md` 的本地 PID 变化不提交 |
+
+### 改动原因与共享核心
+
+原因：按 `STP006_DESIGN` 第 17 节补齐独立后台生成，使 ACTIVE 计划不再依赖用户点击 POST；同时修合同意校验、日期冲突被吞和拆分子 series 识别缺口。
+
+共享核心只维护一套 `TaskHorizonCoreService.reconcilePlanLocked`：
+
+- 锁后数据库时间；档案本地今日至今日+13，受计划边界限制。
+- CONTENT／SCHEDULE 双轴；新实例用当前教育快照，旧实例保持。
+- 原始 `occurrenceKey` 去重；显式识别拆分子 series（`sourceOccurrenceId`），不把普通 ONCE 当拆分。
+- 不同原始 key 占同系列实际日整 plan 零写；不再 `skipDuplicates` 或笼统吞唯一键。
+- 不复活 `USER_CANCELLED`／`SPLIT` 等受保护行，不重生拆分父任务。
+
+HTTP `taskHorizon` 仍走人类会话、CSRF、step-up、幂等和成功 heartbeat；worker 走内部 `SYSTEM/HORIZON_WORKER_V1`。共享核心不等于共享或绕过两种授权入口。GET 仍不生成。
+
+### 后台授权与失败恢复
+
+worker 不伪造 Cookie／CSRF／step-up／学生确认／共同制定，不刷新人类 `lastSeenAt`。锁后重验 ACTIVE plan、档案与当前合法教育、当前必要 policy／document／consent，以及每条有效 ConsentRecord 对应的准确 GuardianLink 与 grantor Account ACTIVE。logout／会话过期／设备撤销不终止合法持续计划；账号、关系、同意、教育、档案或计划资格失效则 `BLOCKED`／`RETIRED` 且零写。未知查询错误继续失败。
+
+standing-job 每 plan 一行。短事务 `FOR UPDATE SKIP LOCKED` 领取后提交，再开业务事务；job 是统一锁序最后一类。租约 + token CAS；处理中 generation 变化不会被完成清掉。八次有界技术退避后 `FAILED/RETRY_EXHAUSTED`，须 `--requeue-failed` 且固定 reason；业务阻断不计 attempt。旧 token 在租约接管后不能提交。
+
+### 第十一条迁移
+
+`20260919120000_stp006_task_horizon_jobs`。前十条与 `test-v2` 未改写。只读预检后建实际 UNIQUE／FK／CHECK／partial due 与 expired-lease 索引及状态一致性约束。既有计划回填 job，不生成任务、不激活旧计划。fresh 上界 11；九→十冻结在 10 且无 job 表；十→十一独立夹具 `stp006_ten_to_eleven`。原库与历史污染库只读。
+
+### worker 命令
+
+```bash
+pnpm build
+# 进程环境必须已有 HORIZON_WORKER_ENABLED=true
+pnpm worker:horizon -- --continuous
+pnpm worker:horizon -- --once --max-jobs=20 --max-ms=60000
+pnpm worker:horizon -- --status
+pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_DIAGNOSIS
+```
+
+导入 `AppModule`、启动 API、普通单测和历史升级夹具不启动后台循环。CI 只用有界 `--once`。本批集成测试用独立 `nest start --entryFile horizon-worker/main -- --once` 进程验收，退出码 0，无常驻 worker。
+
+### 验收映射
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 无 HTTP 时独立 worker 生成缺失任务 | 通过 | `stp006.horizon-worker.spec.ts`：删 PLANNED 后 in-process `runOnce` 与真实 nest 进程均插入 |
+| 同日重复、双 worker 不重复 | 通过 | 第二次 runOnce 行数不变；并行两个 worker 的 `(seriesId,occurrenceKey)` 唯一 |
+| GET 不生成；日期冲突不再静默吞 | 通过 | GET 计数不变；不同 key 占同日 HTTP `409 TASK_DATE_CONFLICT` |
+| logout 不终止合法计划；同意撤回阻断、再授后可补 | 通过 | logout 后仍生成；withdraw → `BLOCKED/CONSENT_REQUIRED`；regrant 后生成 |
+| 租约过期旧 token 不能提交；八次后 FAILED 须显式 requeue | 通过 | completeSuccess CAS 拒绝旧 token；第 8 次 `RETRY_EXHAUSTED`，错误 reason 冲突，固定 reason 恢复 READY |
+| generation 处理中变化不丢；锁等待中同意失效零写 | 通过 | signal 后 success 保留 requested=2 且立即 due；consent 行锁等待后撤回，planned=0 |
+| worker 不刷新 heartbeat；API 不启动循环 | 通过 | `lastSeenAt` 不变；`AppModule` 取不到 `HorizonWorkerService` |
+| 新实例当前年级快照 | 通过 | 补出的 PLANNED 行匹配当前档案 `gradeCode`／`gradeConfigVersionId` |
+| 真实锁等待 | 通过 | 独立 pg 连接 + `pg_blocking_pids`：plan 锁与 consent 锁 |
+| 第十一条与历史夹具上界 | 通过 | `stp006.db.spec` expected=11；nine-to-ten 无 job 表；ten-to-eleven digest 保留与约束反例 |
+| HTTP 调用方回归 | 通过 | `stp006.http.spec` 32 与 `stp006.concurrency.spec` 16 全过 |
+
+未在本批单独重跑的历史证据：006-A／B／C 的 FUTURE／拆分 walkthrough 全量、远端 Playwright。本批未弱化断言或 skip。
+
+### 命令与结果
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 14、domain 40、ui／admin／web 各 1、api **206 passed / 0 skipped / 0 failed** |
+| `pnpm build` | 0 | 通过；产物含 `apps/api/dist/horizon-worker/main.js` |
+| `pnpm prisma:validate` | 0 | schema valid |
+| Playwright `stp006-horizon-walkthrough` | 0 | **1 passed**（手动补齐按钮回归）。其余历史 walkthrough 本批未整套重跑；CI 未配置 Playwright |
+| GitHub Actions | push 后按完整 SHA 跟踪 | 不编造远端测试数量；不宣称远程跑过 E2E |
+
+未执行：生产启用、生产迁移、通知 worker、T11-D、打卡、计时、运营发布、pack／部署。006-D 实现通过不代表 STP 006 整体验收完成。STP 004／005 完成状态不变。B04 与生产 worker 仍延期。
 

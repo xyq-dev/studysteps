@@ -8,9 +8,10 @@ import { CatalogController } from '../catalog/catalog.controller';
 import { CatalogService } from '../catalog/catalog.service';
 import { PlanningController } from '../planning/planning.controller';
 import { PlanningService } from '../planning/planning.service';
+import { PlanningCoreModule } from '../planning/planning-core.module';
 
 @Module({
-  imports: [AppConfigModule],
+  imports: [AppConfigModule, PlanningCoreModule],
   controllers: [StudentsController, CatalogController, PlanningController],
   providers: [StudentsService, PolicySeedService, PolicyPublishService, CatalogService, PlanningService],
   exports: [StudentsService, PolicyPublishService, CatalogService, PlanningService],

@@ -7,7 +7,8 @@
     "start": "nest start",
     "build": "prisma generate --schema ../../prisma/schema.prisma && nest build",
     "typecheck": "prisma generate --schema ../../prisma/schema.prisma && tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --config vitest.config.ts",
+    "worker:horizon": "node dist/horizon-worker/main.js"
   },
   "dependencies": {
     "@nestjs/common": "11.1.16",

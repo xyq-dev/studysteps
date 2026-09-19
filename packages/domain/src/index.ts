@@ -11,6 +11,7 @@ export * from './pairing-code.js';
 export * from './consent.js';
 export * from './consent-scope.js';
 export * from './planning.js';
+export * from './horizon-job.js';
 export * from './grade.js';
 export * from './education-transition.js';
 export * from './activation.js';

@@ -33,6 +33,7 @@ export const FORBIDDEN = new Set([
   'stp006_seven_to_eight',
   'stp006_fresh',
   'stp006_nine_to_ten',
+  'stp006_ten_to_eleven',
 ]);
 export const FIXTURE_DATABASE = 'stp006_eight_to_nine';
 const originalName = 'stp004_identity';

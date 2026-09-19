@@ -37,7 +37,57 @@ export type AppConfig = {
     authFailDevicePerMinute: number;
     authFailIpPerMinute: number;
   };
+  horizon: HorizonWorkerConfig;
 };
+
+export type HorizonWorkerConfig = {
+  enabled: boolean;
+  pollMs: number;
+  maxJobsPerCycle: number;
+  concurrency: number;
+  leaseMs: number;
+  renewMs: number;
+  maxAttempts: number;
+  maxRootSeries: number;
+  maxLockRows: number;
+};
+
+export const HORIZON_BUSINESS_TX_WORST_MS = 175_000;
+
+export function loadHorizonWorkerConfig(env: NodeJS.ProcessEnv = process.env): HorizonWorkerConfig {
+  const positive = (name: string, fallback: number) => {
+    const raw = env[name];
+    const value = raw == null || raw === '' ? fallback : Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`${name} must be a positive number`);
+    }
+    return value;
+  };
+  const config: HorizonWorkerConfig = {
+    enabled: env.HORIZON_WORKER_ENABLED === 'true',
+    pollMs: positive('HORIZON_WORKER_POLL_MS', 30_000),
+    maxJobsPerCycle: positive('HORIZON_WORKER_MAX_JOBS_PER_CYCLE', 20),
+    concurrency: positive('HORIZON_WORKER_CONCURRENCY', 4),
+    leaseMs: positive('HORIZON_WORKER_LEASE_MS', 300_000),
+    renewMs: positive('HORIZON_WORKER_RENEW_MS', 60_000),
+    maxAttempts: positive('HORIZON_WORKER_MAX_ATTEMPTS', 8),
+    maxRootSeries: positive('HORIZON_WORKER_MAX_ROOT_SERIES', 100),
+    maxLockRows: positive('HORIZON_WORKER_MAX_LOCK_ROWS', 5000),
+  };
+  if (config.maxJobsPerCycle > 100) {
+    throw new Error('HORIZON_WORKER_MAX_JOBS_PER_CYCLE must be <= 100');
+  }
+  if (config.concurrency > 16) {
+    throw new Error('HORIZON_WORKER_CONCURRENCY must be <= 16');
+  }
+  if (config.renewMs >= config.leaseMs / 2) {
+    throw new Error('HORIZON_WORKER_RENEW_MS must be < HORIZON_WORKER_LEASE_MS / 2');
+  }
+  if (config.leaseMs <= HORIZON_BUSINESS_TX_WORST_MS) {
+    throw new Error('HORIZON_WORKER_LEASE_MS must exceed the worst-case business transaction budget');
+  }
+  return config;
+}
 
 function readKey(env: NodeJS.ProcessEnv, name: string, required: boolean): Buffer {
   const raw = env[name];
@@ -112,6 +162,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       authFailDevicePerMinute: authTestMode ? 200 : 20,
       authFailIpPerMinute: authTestMode ? 600 : 60,
     },
+    horizon: loadHorizonWorkerConfig(env),
   };
 }
 

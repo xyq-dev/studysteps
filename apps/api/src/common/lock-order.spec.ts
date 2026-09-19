@@ -29,6 +29,21 @@ describe('7.7 lock id planning', () => {
     expect(normalizeLockIds(mergeLockIds(planned, discovered)).accountIds).toEqual(['acct-1', 'acct-2']);
   });
 
+  it('sorts horizon jobs last after occurrences', () => {
+    const normalized = normalizeLockIds({
+      taskOccurrenceIds: ['o2', 'o1'],
+      taskHorizonJobPlanIds: ['p2', 'p1'],
+    });
+    expect(normalized.taskOccurrenceIds).toEqual(['o1', 'o2']);
+    expect(normalized.taskHorizonJobPlanIds).toEqual(['p1', 'p2']);
+    expect(
+      lockIdsContain(
+        { taskHorizonJobPlanIds: ['p1'] },
+        { taskHorizonJobPlanIds: ['p1', 'p2'] },
+      ),
+    ).toBe(false);
+  });
+
   it('locks template versions for share after grade configs', () => {
     const normalized = normalizeLockIds({
       gradeConfigIds: ['g1'],

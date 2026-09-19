@@ -93,13 +93,13 @@ if (db.rows[0].name !== freshName) {
 const applied = await verify.query(
   `SELECT COUNT(*)::int AS n FROM _prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL`,
 );
-const tables = await verify.query(`SELECT to_regclass('study_plans') AS plans, to_regclass('task_occurrences') AS occ`);
+const tables = await verify.query(`SELECT to_regclass('study_plans') AS plans, to_regclass('task_occurrences') AS occ, to_regclass('task_horizon_jobs') AS jobs`);
 await verify.end();
-if (applied.rows[0].n !== 10) {
-  throw new Error(`expected 10 applied migrations on ${freshName}, found ${applied.rows[0].n}`);
+if (applied.rows[0].n !== 11) {
+  throw new Error(`expected 11 applied migrations on ${freshName}, found ${applied.rows[0].n}`);
 }
-if (!tables.rows[0].plans || !tables.rows[0].occ) {
-  throw new Error('seventh migration tables missing');
+if (!tables.rows[0].plans || !tables.rows[0].occ || !tables.rows[0].jobs) {
+  throw new Error('seventh or eleventh migration tables missing');
 }
 process.stdout.write(`verified current_database=${freshName} applied=${applied.rows[0].n}\n`);
 
