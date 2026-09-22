@@ -1,7 +1,11 @@
 import 'reflect-metadata';
-import { NestFactory } from '@nestjs/core';
 import { HORIZON_REQUEUE_REASON } from '@studysteps/domain';
 import { loadAppConfig } from '../common/config';
+import {
+  closeHorizonContext,
+  createHorizonContext,
+  markTechnicalFailure,
+} from './cli-runtime';
 import { HorizonWorkerModule } from './module';
 import { HorizonWorkerService } from './service';
 
@@ -10,8 +14,6 @@ type Mode =
   | { kind: 'once'; maxJobs: number; maxMs: number }
   | { kind: 'status' }
   | { kind: 'requeue'; planId: string; reason: string };
-
-type ExitHint = { exitCode?: number };
 
 function parseArgs(argv: string[]): Mode {
   const args = argv.slice(2);
@@ -30,43 +32,26 @@ function parseArgs(argv: string[]): Mode {
     const maxJobs = Number(value('--max-jobs=') ?? '20');
     const maxMs = Number(value('--max-ms=') ?? '60000');
     if (!Number.isFinite(maxJobs) || maxJobs <= 0 || !Number.isFinite(maxMs) || maxMs <= 0) {
-      throw Object.assign(new Error('invalid --once bounds'), { exitCode: 2 });
+      throw new Error('invalid --once bounds');
     }
     return { kind: 'once', maxJobs, maxMs };
   }
   const requeue = value('--requeue-failed=');
   if (requeue) {
     if (!/^[0-9a-fA-F-]{36}$/.test(requeue)) {
-      throw Object.assign(new Error('invalid plan id'), { exitCode: 2 });
+      throw new Error('invalid plan id');
     }
     const reason = value('--reason=') ?? '';
     if (reason !== HORIZON_REQUEUE_REASON) {
-      throw Object.assign(new Error('invalid requeue reason'), { exitCode: 2 });
+      throw new Error('invalid requeue reason');
     }
     return { kind: 'requeue', planId: requeue, reason };
   }
-  throw Object.assign(new Error('missing worker mode'), { exitCode: 2 });
-}
-
-function publicErrorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : 'worker failed';
-  return raw
-    .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, '[redacted]')
-    .replace(/(DATABASE_URL|DIRECT_URL|STP004_[A-Z0-9_]*URL)\s*=\s*\S+/gi, '$1=[redacted]');
-}
-
-function hintedExitCode(error: unknown): number {
-  if (typeof error === 'object' && error && 'exitCode' in error) {
-    const code = Number((error as ExitHint).exitCode);
-    if (Number.isFinite(code) && code > 0) {
-      return code;
-    }
-  }
-  return 2;
+  throw new Error('missing worker mode');
 }
 
 async function main() {
-  let app: Awaited<ReturnType<typeof NestFactory.createApplicationContext>> | undefined;
+  let app: Awaited<ReturnType<typeof createHorizonContext>> | undefined;
   let worker: HorizonWorkerService | undefined;
   try {
     const mode = parseArgs(process.argv);
@@ -76,9 +61,7 @@ async function main() {
       return;
     }
     loadAppConfig();
-    app = await NestFactory.createApplicationContext(HorizonWorkerModule, {
-      logger: ['error', 'warn', 'log'],
-    });
+    app = await createHorizonContext(HorizonWorkerModule);
     const running = app.get(HorizonWorkerService);
     worker = running;
     const stop = () => running.requestStop();
@@ -111,20 +94,10 @@ async function main() {
     await running.runContinuous();
     process.exitCode = 0;
   } catch (error) {
-    process.stderr.write(`${publicErrorMessage(error)}\n`);
-    process.exitCode = hintedExitCode(error);
+    markTechnicalFailure(error);
   } finally {
-    if (worker) {
-      try {
-        await worker.disconnect();
-      } catch {
-        // already closed
-      }
-    }
-    if (app) {
-      await app.close();
-    }
+    await closeHorizonContext(app, worker);
   }
 }
 
-void main();
+void main().catch(markTechnicalFailure);

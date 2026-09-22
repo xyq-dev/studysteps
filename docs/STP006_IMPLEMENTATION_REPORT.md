@@ -549,3 +549,19 @@ pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_D
 
 未执行：独立复审、完整根测试（交 CI）、Playwright、生产迁移、pack／部署、STP 007。STP 006 仍进行中。这不是独立复审通过。
 
+## 21. 2026-09-22 B5 CLI 异常出口
+
+授权：用户持续授权本批普通 commit／push。只修 B5 出口。无 Migration。B6／B7 未改。
+
+| 项 | 结果 |
+| --- | --- |
+| 实施前 HEAD | `4f9c0c9d4d29cbd35216df46d56612c820fe8e31` |
+| 修改 | `horizon-worker/main.ts`、`cli-runtime.ts`、测试专用 `cli-failure.fixture.ts`、worker spec、本报告与复审补记 |
+| Nest 默认初始化失败 | 夹具 `--init-default` 退出 **1**（ExceptionsZone `process.exit(1)`） |
+| 统一处理后初始化／关闭 | `--init`／`--close` 退出 **2**，无未处理 rejection |
+| 根命令配置错误 | `pnpm worker:horizon -- --status` + `HORIZON_WORKER_LEASE_MS=1` 退出 **2** |
+| `--status`／missing／非法 reason | 0／3／2 |
+| lint／typecheck／build | 0 |
+
+未执行：完整根 `pnpm test`（交本 SHA CI）、Playwright（复用原 14 条）、独立复审、STP 007。
+

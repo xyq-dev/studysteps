@@ -363,3 +363,28 @@ HTTP `task-horizon` 在 `planning.service.ts:1880-1897,1925-1944` 仍枚举学�
 | B7 | 预锁 `discoverBusinessLocks` 抛 `VALIDATION_ERROR`，公开 worker 记技术失败 READY／attempt+1 | 超限返回可识别 SCOPE_LIMIT；短事务按锁序＋token／generation CAS 走 `completeFailed`；不锁 5001+ occurrence，不进共享核心 | 公开 `pnpm worker:horizon -- --once`：5002 行计划 → `FAILED/SCOPE_LIMIT`、attempt=0、occurrence／planAdjustment 零增。旧租约迟到 `executeClaimed` 有真实 job 行锁等待，不改 B 的 token；B 随后仍 `SCOPE_LIMIT`。正常规模公开 `--once` 仍 GENERATED |
 
 未改：Web、业务规则、Schema、迁移 1–12、test-v2、HTTP `task-horizon` 全量锁发现。无 Migration。STP 004／005 完成状态不变，未进入 STP 007。
+
+## 13. 2026-09-22 B5 CLI 异常出口补记（不是独立复审）
+
+第 11–12 节原文未改写。本轮只补 Nest 初始化／关闭出口，不重审 B1–B4，不改 B6／B7。这不是独立复审通过，STP 006 仍进行中。
+
+已安装 `@nestjs/core@11.1.16` 源码：`ExceptionsZone.asyncRun` 默认 `teardown = () => process.exit(1)`；`abortOnError !== false` 时初始化失败不会上抛到 CLI try。
+
+动态反例（先于修复、独立子进程、真实 provider 构造失败，不是 mock `createApplicationContext`）：
+
+```text
+node apps/api/dist/horizon-worker/cli-failure.fixture.js --init-default
+exit=1
+ExceptionHandler: horizon fixture provider constructor failed
+```
+
+Prisma `onModuleInit` 连不上库发生在 `context.init()`，已能被现有 try 接到并退出 2；不能把它写成 ExceptionsZone 的 exit 1。
+
+| 路径 | 修复 | 证据 |
+| --- | --- | --- |
+| Nest provider 初始化 | `abortOnError: false`，技术异常统一 `exitCode=2`；`void main().catch(...)` | 同一夹具 `--init` 退出 **2**，无未处理 rejection |
+| 关闭阶段 | `closeHorizonContext` 捕获 `app.close()`，不提前 `process.exit` | 夹具 `OnModuleDestroy` 抛错后 `--close` 退出 **2** |
+| 配置 | 保持 `loadAppConfig` + 统一 catch | 根命令 `HORIZON_WORKER_LEASE_MS=1 --status` 退出 **2** |
+| 业务码 | 仅 requeue 分支写 3／4；catch 不再读取任意 `error.exitCode` | `--status`=0，missing=3，非法 reason=2，READY 冲突=4 |
+
+未改 B6／B7、Web、Schema、迁移 1–12。无 Migration。

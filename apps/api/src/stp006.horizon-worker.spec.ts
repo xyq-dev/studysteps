@@ -234,6 +234,37 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
     publicWorkerDistReady = true;
   }
 
+  function spawnNodeProcess(script: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeoutMs = 45_000) {
+    const child = spawn(process.execPath, [script, ...args], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        DATABASE_URL: connectionString,
+        HORIZON_WORKER_ENABLED: 'true',
+        ...extraEnv,
+      },
+      windowsHide: true,
+    });
+    let stderr = '';
+    child.stderr?.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    return new Promise<{ code: number; stderr: string }>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`process exceeded ${timeoutMs}ms for ${script} ${args.join(' ')}`));
+      }, timeoutMs);
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? 1, stderr });
+      });
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
   function spawnPublicWorker(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeoutMs = 45_000) {
     const child = spawn('pnpm', ['worker:horizon', '--', ...args], {
       cwd: repoRoot,
@@ -1223,7 +1254,28 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
       '--reason=OPERATOR_RETRY_AFTER_DIAGNOSIS',
     ]);
     expect(conflict.code).toBe(4);
+    const status = await spawnPublicWorker(['--status']);
+    expect(status.code).toBe(0);
+    expect(status.stderr).not.toMatch(/postgres(?:ql)?:\/\//i);
   }, 90_000);
+
+  it('maps Nest provider init and close failures to exit 2 without unhandled rejection', async () => {
+    await ensurePublicWorkerDist();
+    const fixture = join(apiRoot, 'dist/horizon-worker/cli-failure.fixture.js');
+    expect(existsSync(fixture)).toBe(true);
+    const nestDefault = await spawnNodeProcess(fixture, ['--init-default']);
+    expect(nestDefault.code).toBe(1);
+    expect(nestDefault.stderr).toMatch(/horizon fixture provider constructor failed/);
+    const init = await spawnNodeProcess(fixture, ['--init']);
+    expect(init.code).toBe(2);
+    expect(init.stderr).toMatch(/horizon fixture provider constructor failed/);
+    expect(init.stderr).not.toMatch(/UnhandledPromiseRejection|UNHANDLED_REJECTION/i);
+    expect(init.stderr).not.toMatch(/postgres(?:ql)?:\/\//i);
+    const closed = await spawnNodeProcess(fixture, ['--close']);
+    expect(closed.code).toBe(2);
+    expect(closed.stderr).toMatch(/horizon fixture close failed/);
+    expect(closed.stderr).not.toMatch(/UnhandledPromiseRejection|UNHANDLED_REJECTION/i);
+  }, 60_000);
 
   it('does not claim more jobs after the monotonic budget even if the wall clock rewinds', async () => {
     const ready = await readyStudent('单调预算');
