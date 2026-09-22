@@ -472,7 +472,7 @@ export class PlanningService {
         data: { status: transition.next, version: plan.version + 1 },
       });
       if (input.action === 'PAUSE') {
-        await this.horizon.blockPlans(tx, [plan.id], 'PLAN_PAUSED', current.timezone);
+        await this.horizon.blockPlans(tx, [plan.id], 'PLAN_PAUSED', current.timezone, now);
       } else if (input.action === 'ARCHIVE') {
         await this.horizon.retirePlans(tx, [plan.id], 'PLAN_ARCHIVED');
       } else if (input.action === 'RESUME') {
@@ -2003,6 +2003,7 @@ export class PlanningService {
     session: DeviceSession,
     current: {
       id: string;
+      version: number;
       timezone: string;
       stageCode: string | null;
       schoolSystemCode: string | null;
@@ -2098,6 +2099,13 @@ export class PlanningService {
         durationMinutes: rule.durationMinutes,
         stepsJson: JSON.stringify(rule.steps),
       });
+    }
+    const consumed = await tx.studentProfile.updateMany({
+      where: { id: current.id, version: current.version },
+      data: { version: { increment: 1 } },
+    });
+    if (consumed.count !== 1) {
+      throw new AppError('VERSION_CONFLICT', '档案版本已变化', 409);
     }
     return plan;
   }

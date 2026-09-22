@@ -339,7 +339,7 @@ export class StudentsService {
       }
       const latest = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
       if (input.kind === 'AGE' && latest.status === 'RESTRICTED') {
-        await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', latest.timezone);
+        await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', latest.timezone, now);
       } else if (input.kind === 'BASIC' || input.kind === 'EDUCATION' || input.kind === 'AGE') {
         await this.horizon.signalPlans(tx, planIds);
       }
@@ -460,7 +460,7 @@ export class StudentsService {
         }
       }
       const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
-      await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', student.timezone);
+      await this.horizon.blockPlans(tx, planIds, 'CONSENT_REQUIRED', student.timezone, now);
       await this.idempotency.complete(tx, begun.recordId, 'ConsentRecord', consentId, 200, now);
       await this.identity.touchLastSeenLocked(tx, session, now);
       return { consentId, status: student.status };
@@ -1006,7 +1006,7 @@ export class StudentsService {
         });
       }
       const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: studentId } });
-      await this.horizon.blockPlans(tx, planIds, 'GUARDIAN_LINK_NOT_ACTIVE', student.timezone);
+      await this.horizon.blockPlans(tx, planIds, 'GUARDIAN_LINK_NOT_ACTIVE', student.timezone, now);
     }, graph);
   }
 

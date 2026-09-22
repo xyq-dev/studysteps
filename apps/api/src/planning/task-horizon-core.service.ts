@@ -106,6 +106,121 @@ type HorizonSeries = {
 
 @Injectable()
 export class TaskHorizonCoreService {
+  async loadPlanGraph(
+    tx: Tx,
+    planId: string,
+    now: Date,
+    timezone: string,
+  ): Promise<
+    | { plan: { id: string; studentProfileId: string; status: string; series: HorizonSeries[] }; failed?: undefined }
+    | { plan?: undefined; failed: { reason: HorizonFailedReason } }
+  > {
+    const window = horizonWindow(localDateInTimeZone(now, timezone), null);
+    const plan = await tx.studyPlan.findUnique({
+      where: { id: planId },
+      include: { series: { orderBy: { id: 'asc' } } },
+    });
+    if (!plan) {
+      throw new Error('horizon plan missing');
+    }
+    const occLimit = HORIZON_MAX_LOCK_ROWS + 1;
+    const occurrences = await tx.taskOccurrence.findMany({
+      where: {
+        series: { planId },
+        OR: [
+          { occurrenceKey: { gte: window.from, lte: window.to } },
+          { scheduledLocalDate: { gte: window.from, lte: window.to } },
+          { sourceOccurrenceId: { not: null } },
+        ],
+      },
+      orderBy: [{ seriesId: 'asc' }, { occurrenceKey: 'asc' }, { id: 'asc' }],
+      take: occLimit,
+    });
+    if (occurrences.length >= occLimit) {
+      return { failed: { reason: 'SCOPE_LIMIT' } };
+    }
+    const seriesIds = plan.series.map((item) => item.id);
+    const loadedRevisions = seriesIds.length
+      ? await tx.taskSeriesRevision.findMany({
+          where: {
+            taskSeriesId: { in: seriesIds },
+            effectiveFromOccurrenceKey: { lte: window.to },
+          },
+          orderBy: [{ taskSeriesId: 'asc' }, { revisionNo: 'asc' }],
+          take: occLimit,
+        })
+      : [];
+    if (loadedRevisions.length >= occLimit) {
+      return { failed: { reason: 'SCOPE_LIMIT' } };
+    }
+    const occBySeries = new Map<string, HorizonSeries['occurrences']>();
+    for (const row of occurrences) {
+      const list = occBySeries.get(row.seriesId) ?? [];
+      list.push({
+        id: row.id,
+        occurrenceKey: row.occurrenceKey,
+        scheduledLocalDate: row.scheduledLocalDate,
+        status: row.status,
+        cancelReason: row.cancelReason,
+        version: row.version,
+        contentRevisionNo: row.contentRevisionNo,
+        scheduleRevisionNo: row.scheduleRevisionNo,
+        contentExceptionAdjustmentId: row.contentExceptionAdjustmentId,
+        scheduleExceptionAdjustmentId: row.scheduleExceptionAdjustmentId,
+        sourceOccurrenceId: row.sourceOccurrenceId,
+        nameSnapshot: row.nameSnapshot,
+        subjectSnapshot: row.subjectSnapshot,
+        completionStandardSnapshot: row.completionStandardSnapshot,
+        durationMinutesSnapshot: row.durationMinutesSnapshot,
+        stepsSnapshotJson: row.stepsSnapshotJson,
+      });
+      occBySeries.set(row.seriesId, list);
+    }
+    const revBySeries = new Map<string, NonNullable<HorizonSeries['revisions']>>();
+    for (const row of loadedRevisions) {
+      const list = revBySeries.get(row.taskSeriesId) ?? [];
+      if (!list.some((item) => item.revisionNo === row.revisionNo)) {
+        list.push({
+          revisionNo: row.revisionNo,
+          changeKind: row.changeKind,
+          effectiveFromOccurrenceKey: row.effectiveFromOccurrenceKey,
+          name: row.name,
+          subject: row.subject,
+          completionStandard: row.completionStandard,
+          durationMinutes: row.durationMinutes,
+          stepsJson: row.stepsJson,
+          repeatKind: row.repeatKind,
+          weekdaysJson: row.weekdaysJson,
+          endLocalDate: row.endLocalDate,
+          ongoing: row.ongoing,
+        });
+      }
+      revBySeries.set(row.taskSeriesId, list);
+    }
+    return {
+      plan: {
+        id: plan.id,
+        studentProfileId: plan.studentProfileId,
+        status: plan.status,
+        series: plan.series.map((series) => ({
+          id: series.id,
+          name: series.name,
+          subject: series.subject,
+          completionStandard: series.completionStandard,
+          durationMinutes: series.durationMinutes,
+          stepsJson: series.stepsJson,
+          repeatKind: series.repeatKind,
+          weekdaysJson: series.weekdaysJson,
+          startLocalDate: series.startLocalDate,
+          endLocalDate: series.endLocalDate,
+          ongoing: series.ongoing,
+          occurrences: occBySeries.get(series.id) ?? [],
+          revisions: revBySeries.get(series.id) ?? [],
+        })),
+      },
+    };
+  }
+
   async reconcilePlanLocked(
     tx: Tx,
     input: {

@@ -79,7 +79,7 @@ async function main() {
         process.exitCode = 0;
         return;
       }
-      process.exitCode = result === 'MISSING' ? 4 : 4;
+      process.exitCode = result === 'MISSING' ? 3 : 4;
       return;
     }
     if (mode.kind === 'once') {

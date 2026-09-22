@@ -3,6 +3,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import {
   addLocalDays,
   HORIZON_EXECUTOR_KEY,
+  HORIZON_MAX_LOCK_ROWS,
   localDateInTimeZone,
 } from '@studysteps/domain';
 import { AppError } from '../common/app-error';
@@ -127,7 +128,12 @@ export class HorizonWorkerService {
         'horizon job technical failure',
       );
       try {
-        await this.jobs.recordTechnicalFailure(job.planId, errorName(error));
+        await this.jobs.recordTechnicalFailure(
+          job.planId,
+          errorName(error),
+          job.leaseToken,
+          job.claimedGeneration,
+        );
       } catch (recordError) {
         this.logger.warn(
           { planId: job.planId, result: 'failure_record_failed', reason: errorName(recordError) },
@@ -144,9 +150,9 @@ export class HorizonWorkerService {
     await runWriteTx(this.prisma, async (tx, extra) => {
       const locked = mergeLockIds(seed, extra);
       await acquireLocks(tx, locked);
-      const discovered = await this.discoverBusinessLocks(job.planId, tx);
-      assertLockSetComplete(locked, discovered);
       const now = await readLockedNow(tx);
+      const discovered = await this.discoverBusinessLocks(job.planId, tx, now);
+      assertLockSetComplete(locked, discovered);
       const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
       if (
         !current ||
@@ -159,14 +165,23 @@ export class HorizonWorkerService {
       ) {
         throw new Error('horizon lease no longer held');
       }
-      const plan = await tx.studyPlan.findUnique({
-        where: { id: job.planId },
-        include: { series: { include: { occurrences: true, revisions: true } } },
-      });
-      if (!plan) {
+      const planRow = await tx.studyPlan.findUnique({ where: { id: job.planId } });
+      if (!planRow) {
         throw new Error('horizon plan missing');
       }
-      const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: plan.studentProfileId } });
+      const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: planRow.studentProfileId } });
+      const loaded = await this.core.loadPlanGraph(tx, planRow.id, now, student.timezone);
+      if (loaded.failed) {
+        await this.jobs.completeFailed(tx, {
+          planId: job.planId,
+          leaseToken: job.leaseToken,
+          claimedGeneration: job.claimedGeneration,
+          reason: loaded.failed.reason,
+        });
+        this.logger.log({ planId: job.planId, result: 'FAILED', reason: loaded.failed.reason });
+        return;
+      }
+      const plan = loaded.plan;
       const eligibility = await this.eligibility.evaluateGenerationEligibility(tx, student, plan);
       if (!eligibility.ok && eligibility.kind === 'RETIRED') {
         await this.jobs.completeRetired(tx, {
@@ -184,6 +199,7 @@ export class HorizonWorkerService {
           leaseToken: job.leaseToken,
           claimedGeneration: job.claimedGeneration,
           timezone: student.timezone,
+          now,
           reason: eligibility.reason,
         });
         this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: eligibility.reason });
@@ -220,6 +236,7 @@ export class HorizonWorkerService {
           leaseToken: job.leaseToken,
           claimedGeneration: job.claimedGeneration,
           timezone: student.timezone,
+          now,
           reason: result.blocked.reason,
         });
         this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: result.blocked.reason });
@@ -230,6 +247,7 @@ export class HorizonWorkerService {
         leaseToken: job.leaseToken,
         claimedGeneration: job.claimedGeneration,
         timezone: student.timezone,
+        now,
         successLocalDate: localDateInTimeZone(now, student.timezone),
         insertedCount: result.insertedCount,
         restoredCount: result.restoredCount,
@@ -246,22 +264,37 @@ export class HorizonWorkerService {
   private async discoverBusinessLocks(
     planId: string,
     db: PrismaService | Parameters<TaskHorizonJobRepository['planIdsForStudent']>[0] = this.prisma,
+    now?: Date,
   ): Promise<LockIds> {
     const plan = await db.studyPlan.findUnique({
       where: { id: planId },
-      include: {
-        series: {
-          include: {
-            occurrences: { select: { id: true, occurrenceKey: true, scheduledLocalDate: true } },
-          },
-        },
-      },
+      include: { series: { select: { id: true } } },
     });
     if (!plan) {
       return { planIds: [planId], taskHorizonJobPlanIds: [planId] };
     }
     const student = await db.studentProfile.findUnique({ where: { id: plan.studentProfileId } });
-    const today = student ? localDateInTimeZone(new Date(), student.timezone) : null;
+    const clock = now ?? new Date();
+    const today = student ? localDateInTimeZone(clock, student.timezone) : null;
+    const to = today ? addLocalDays(today, 13) : null;
+    const occurrences = today && to
+      ? await db.taskOccurrence.findMany({
+          where: {
+            series: { planId },
+            OR: [
+              { occurrenceKey: { gte: today, lte: to } },
+              { scheduledLocalDate: { gte: today, lte: to } },
+              { sourceOccurrenceId: { not: null } },
+            ],
+          },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: HORIZON_MAX_LOCK_ROWS + 1,
+        })
+      : [];
+    if (occurrences.length > HORIZON_MAX_LOCK_ROWS) {
+      throw new AppError('VALIDATION_ERROR', '当前计划超出一次补齐范围', 400);
+    }
     const consents = await db.consentRecord.findMany({
       where: { studentProfileId: plan.studentProfileId, withdrawnAt: null, supersededAt: null },
     });
@@ -280,11 +313,7 @@ export class HorizonWorkerService {
       consentIds: consents.map((item) => item.id),
       planIds: [plan.id],
       taskSeriesIds: plan.series.map((item) => item.id),
-      taskOccurrenceIds: plan.series.flatMap((item) =>
-        item.occurrences
-          .filter((row) => !today || inHorizonLockWindow(row, today))
-          .map((row) => row.id),
-      ),
+      taskOccurrenceIds: occurrences.map((row) => row.id),
       taskHorizonJobPlanIds: [plan.id],
     };
   }
@@ -295,17 +324,6 @@ export class HorizonWorkerService {
       timer.unref?.();
     });
   }
-}
-
-function inHorizonLockWindow(
-  row: { occurrenceKey: string; scheduledLocalDate: string },
-  today: string,
-): boolean {
-  const to = addLocalDays(today, 13);
-  return (
-    (row.occurrenceKey >= today && row.occurrenceKey <= to) ||
-    (row.scheduledLocalDate >= today && row.scheduledLocalDate <= to)
-  );
 }
 
 function errorName(error: unknown): string {

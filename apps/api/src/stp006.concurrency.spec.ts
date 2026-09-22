@@ -1481,4 +1481,53 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 CON-3 plan write vs withdr
     expect(['TASK_NOT_ADJUSTABLE', 'VERSION_CONFLICT', 'TASK_SPLIT_PREVIEW_STALE']).toContain(second.body.code);
     expect(await prisma.taskOccurrence.count({ where: { sourceOccurrenceId: row.id } })).toBe(2);
   });
+
+  it('serializes two confirmations on the same student version and keeps one plan', async () => {
+    const { cookies } = await signIn();
+    const ready = await readyStudent(cookies, '双确认竞争');
+    const holder = new pg.Client({ connectionString });
+    const observer = await observerClient();
+    await holder.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM student_profiles WHERE id = $1 FOR UPDATE', [ready.studentId]);
+    const holderPid = await backendPid(holder);
+    const firstPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/templates/${ready.templateId}/import`)
+        .set(writeHeaders(cookies))
+        .send({
+          expectedStudentVersion: ready.version,
+          previewDigest: ready.preview.previewDigest,
+          templateVersion: ready.preview.template.version,
+          tasks: ready.preview.tasks,
+          coCreationAttested: true,
+        }),
+    );
+    const firstWaiter = await waitForWaiterOnHolder(observer, holderPid, 'first confirm waits on student');
+    const secondPromise = dispatch(
+      agent()
+        .post(`/v1/students/${ready.studentId}/templates/${ready.templateId}/import`)
+        .set(writeHeaders(cookies, randomUUID()))
+        .send({
+          expectedStudentVersion: ready.version,
+          previewDigest: ready.preview.previewDigest,
+          templateVersion: ready.preview.template.version,
+          tasks: ready.preview.tasks,
+          coCreationAttested: true,
+        }),
+    );
+    const secondWaiter = await waitForWaiterOnHolder(observer, firstWaiter.waiter_pid, 'second confirm waits on first');
+    expect(secondWaiter.holder_pid).toBe(firstWaiter.waiter_pid);
+    await holder.query('ROLLBACK');
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([201, 409]);
+    const conflict = first.status === 409 ? first : second;
+    expect(conflict.body.code).toBe('VERSION_CONFLICT');
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: ready.studentId } })).toBe(1);
+    const latest = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.studentId } });
+    expect(latest.version).toBe(ready.version + 1);
+    await holder.end();
+    await observer.end();
+  });
 });

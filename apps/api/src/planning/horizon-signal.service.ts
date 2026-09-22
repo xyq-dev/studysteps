@@ -17,8 +17,8 @@ export class HorizonSignalService {
     return this.jobs.signal(tx, planIds);
   }
 
-  blockPlans(tx: Tx, planIds: string[], reason: HorizonBlockedReason, timezone: string) {
-    return this.jobs.block(tx, planIds, reason, timezone);
+  blockPlans(tx: Tx, planIds: string[], reason: HorizonBlockedReason, timezone: string, now: Date) {
+    return this.jobs.block(tx, planIds, reason, timezone, now);
   }
 
   retirePlans(tx: Tx, planIds: string[], reason: HorizonRetiredReason) {

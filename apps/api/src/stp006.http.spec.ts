@@ -440,6 +440,108 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 first-batch plans and occu
     })).toBe(beforeHorizon);
   });
 
+  it('consumes student version on confirm and rejects a stale second key', async () => {
+    const auth = await signIn();
+    const student = await setGrade(auth.cookies, await createStudent(auth.cookies, '双确认版本'));
+    const beforeVersion = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    const listed = await agent().get(`/v1/templates?studentId=${student.id}`).set('Cookie', auth.cookies.header());
+    const templateId = listed.body.recommendedTemplateIds[0] as string;
+    const preview = await agent()
+      .post(`/v1/students/${student.id}/templates/${templateId}/preview`)
+      .set(writeHeaders(auth.cookies))
+      .send({});
+    expect(preview.status).toBe(200);
+    const afterPreview = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    expect(afterPreview.version).toBe(beforeVersion.version);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(0);
+
+    const first = await agent()
+      .post(`/v1/students/${student.id}/templates/${templateId}/import`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        expectedStudentVersion: student.version,
+        previewDigest: preview.body.previewDigest,
+        templateVersion: preview.body.template.version,
+        tasks: preview.body.tasks,
+        coCreationAttested: true,
+      });
+    expect(first.status).toBe(201);
+    const afterFirst = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    expect(afterFirst.version).toBe(student.version + 1);
+
+    const second = await agent()
+      .post(`/v1/students/${student.id}/templates/${templateId}/import`)
+      .set(writeHeaders(auth.cookies, randomUUID()))
+      .send({
+        expectedStudentVersion: student.version,
+        previewDigest: preview.body.previewDigest,
+        templateVersion: preview.body.template.version,
+        tasks: preview.body.tasks,
+        coCreationAttested: true,
+      });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('VERSION_CONFLICT');
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(1);
+
+    const replayKey = randomUUID();
+    const replayBody = {
+      expectedStudentVersion: afterFirst.version,
+      previewDigest: preview.body.previewDigest,
+      templateVersion: preview.body.template.version,
+      tasks: preview.body.tasks,
+      coCreationAttested: true,
+    };
+    const replayFirst = await agent()
+      .post(`/v1/students/${student.id}/templates/${templateId}/import`)
+      .set(writeHeaders(auth.cookies, replayKey))
+      .send(replayBody);
+    expect(replayFirst.status).toBe(201);
+    const afterSecondPlan = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    expect(afterSecondPlan.version).toBe(afterFirst.version + 1);
+    const replay = await agent()
+      .post(`/v1/students/${student.id}/templates/${templateId}/import`)
+      .set(writeHeaders(auth.cookies, replayKey))
+      .send(replayBody);
+    expect(replay.status).toBe(201);
+    expect(replay.body.id).toBe(replayFirst.body.id);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(2);
+    const afterReplay = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    expect(afterReplay.version).toBe(afterSecondPlan.version);
+
+    const manualPreview = await agent()
+      .post(`/v1/students/${student.id}/plans/preview`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        tasks: [{ name: '自主阅读', subject: '自定义', standard: '读完', repeatKind: 'DAILY' }],
+      });
+    expect(manualPreview.status).toBe(200);
+    const afterManualPreview = await prisma.studentProfile.findUniqueOrThrow({ where: { id: student.id } });
+    expect(afterManualPreview.version).toBe(afterReplay.version);
+    const staleManual = await agent()
+      .post(`/v1/students/${student.id}/plans`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        expectedStudentVersion: student.version,
+        previewDigest: manualPreview.body.previewDigest,
+        tasks: manualPreview.body.tasks,
+        coCreationAttested: true,
+      });
+    expect(staleManual.status).toBe(409);
+    expect(staleManual.body.code).toBe('VERSION_CONFLICT');
+    const currentStudent = await agent().get(`/v1/students/${student.id}`).set('Cookie', auth.cookies.header());
+    const manual = await agent()
+      .post(`/v1/students/${student.id}/plans`)
+      .set(writeHeaders(auth.cookies))
+      .send({
+        expectedStudentVersion: currentStudent.body.version,
+        previewDigest: manualPreview.body.previewDigest,
+        tasks: manualPreview.body.tasks,
+        coCreationAttested: true,
+      });
+    expect(manual.status).toBe(201);
+    expect(await prisma.studyPlan.count({ where: { studentProfileId: student.id } })).toBe(3);
+  });
+
   it('T06-P-STALE-A / consent purpose: v1 is insufficient until re-grant of test-v2', async () => {
     const auth = await signIn();
     const policy = await prisma.consentPolicy.findUniqueOrThrow({

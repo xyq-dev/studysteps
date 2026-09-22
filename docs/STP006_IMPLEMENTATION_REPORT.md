@@ -497,3 +497,31 @@ pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_D
 
 未执行：生产启用、生产迁移、通知 worker、T11-D、打卡、计时、运营发布、pack／部署。006-D 实现通过不代表 STP 006 整体验收完成。STP 004／005 完成状态不变。B04 与生产 worker 仍延期。
 
+## 19. 2026-09-22 七项验收阻塞修复
+
+授权：用户持续授权本批修复、必要隔离迁移、测试、普通 commit／push。不进入 STP 007。
+
+| 项 | 结果 |
+| --- | --- |
+| 实施前 HEAD | `8389a928500a4f1b0707913c13bfd69a67a795ea` |
+| 分支 | `main` 跟踪 `origin/main` |
+| 第十二条 | `20260922120000_stp006_horizon_job_reason_null_safe`；第十一条未改写 |
+| 夹具 | 十→十一仍停 11；十一→十二 `stp006_eleven_to_twelve`；脏基线 `stp006_eleven_dirty` 被预检拒绝 |
+| 目标库 | 仅 `stp006_fresh`／上述夹具；原库与历史污染库只读 |
+
+原因：复审 `docs/handoffs/STP006_FINAL_REVIEW.md` 确认 B1–B7。先固化反例再最小修复。未新增“相同内容永远不能创建第二份”的去重。
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm test` | 0 | contracts 14、domain 40、ui／admin／web 各 1、api **220 passed / 0 skipped / 0 failed** |
+| `pnpm build` | 0 | 通过 |
+| `pnpm prisma:validate` | 0 | schema valid |
+| 公开 `pnpm worker:horizon -- --requeue-failed=…` 不存在 plan | 3 | 定稿 MISSING |
+| 公开 `pnpm worker:horizon -- --reason=WRONG` | 2 | 非法参数 |
+| Playwright 完整套件 | 0 | **14 passed / 0 failed / 0 skipped**（修复后代码）；CI 未配置 Playwright |
+| GitHub Actions | 跟踪本轮完整 SHA | 不以 CI #16 代替；CI 未配置 Playwright |
+
+未执行：独立复审、生产迁移、pack／部署、STP 007。STP 006 仍进行中。STP 004／005 状态不变。
+

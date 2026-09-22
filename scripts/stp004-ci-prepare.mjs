@@ -29,6 +29,12 @@ import {
   FIXTURE_DATABASE as TEN_TO_ELEVEN_DATABASE,
   recordTenToElevenFixtureUrl,
 } from './stp006-ten-to-eleven.mjs';
+import {
+  DIRTY_DATABASE as ELEVEN_DIRTY_DATABASE,
+  FIXTURE_DATABASE as ELEVEN_TO_TWELVE_DATABASE,
+  recordElevenDirtyFixtureUrl,
+  recordElevenToTwelveFixtureUrl,
+} from './stp006-eleven-to-twelve.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'apps/api/package.json'));
@@ -399,6 +405,99 @@ if (process.env.STP006_TEN_TO_ELEVEN_DATABASE_URL !== tenToElevenUrl) {
   throw new Error('STP006_TEN_TO_ELEVEN_DATABASE_URL was not applied in the current prepare step');
 }
 
+const elevenToTwelve = spawnSync(process.execPath, [join(root, 'scripts/stp006-eleven-to-twelve.mjs')], {
+  cwd: root,
+  env: { ...process.env },
+  encoding: 'utf8',
+  windowsHide: true,
+});
+process.stdout.write(elevenToTwelve.stdout || '');
+process.stderr.write(elevenToTwelve.stderr || '');
+if (elevenToTwelve.status !== 0) {
+  process.exit(elevenToTwelve.status ?? 1);
+}
+
+const elevenToTwelveUrl = rewriteDb(adminUrl, ELEVEN_TO_TWELVE_DATABASE);
+const elevenToTwelveDbClient = new pg.Client({ connectionString: elevenToTwelveUrl, connectionTimeoutMillis: 8000 });
+await elevenToTwelveDbClient.connect();
+const elevenToTwelveDb = await elevenToTwelveDbClient.query('SELECT current_database() AS name');
+if (elevenToTwelveDb.rows[0]?.name !== ELEVEN_TO_TWELVE_DATABASE) {
+  await elevenToTwelveDbClient.end();
+  throw new Error('eleven-to-twelve fixture connected to the wrong database');
+}
+const twelveBaseline = await elevenToTwelveDbClient.query(
+  `SELECT COUNT(*)::int AS n FROM student_profiles WHERE nickname = '十一到十二基线'`,
+);
+const twelveApplied = await elevenToTwelveDbClient.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+await elevenToTwelveDbClient.end();
+if (twelveBaseline.rows[0]?.n !== 1) {
+  throw new Error('eleven-to-twelve baseline student missing');
+}
+if (twelveApplied.rows[0]?.n !== 12) {
+  throw new Error('eleven-to-twelve fixture did not apply twelve migrations');
+}
+recordElevenToTwelveFixtureUrl(elevenToTwelveUrl, process.env);
+if (process.env.STP006_ELEVEN_TO_TWELVE_DATABASE_URL !== elevenToTwelveUrl) {
+  throw new Error('STP006_ELEVEN_TO_TWELVE_DATABASE_URL was not applied in the current prepare step');
+}
+
+const elevenDirtyUrl = rewriteDb(adminUrl, ELEVEN_DIRTY_DATABASE);
+const elevenDirtyDbClient = new pg.Client({ connectionString: elevenDirtyUrl, connectionTimeoutMillis: 8000 });
+await elevenDirtyDbClient.connect();
+const elevenDirtyDb = await elevenDirtyDbClient.query('SELECT current_database() AS name');
+if (elevenDirtyDb.rows[0]?.name !== ELEVEN_DIRTY_DATABASE) {
+  await elevenDirtyDbClient.end();
+  throw new Error('eleven dirty fixture connected to the wrong database');
+}
+const dirtyApplied = await elevenDirtyDbClient.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const dirtyTwelfth = await elevenDirtyDbClient.query(
+  `SELECT migration_name FROM _prisma_migrations WHERE migration_name = '20260922120000_stp006_horizon_job_reason_null_safe'`,
+);
+const dirtyNulls = await elevenDirtyDbClient.query(`
+  SELECT COUNT(*)::int AS n FROM task_horizon_jobs
+   WHERE state IN ('BLOCKED', 'FAILED', 'RETIRED') AND state_reason IS NULL
+`);
+await elevenDirtyDbClient.end();
+if (dirtyApplied.rows[0]?.n !== 11) {
+  throw new Error('dirty eleventh fixture must stay at eleven migrations');
+}
+if (dirtyTwelfth.rowCount !== 0) {
+  throw new Error('dirty eleventh fixture must not receive the twelfth migration');
+}
+if (dirtyNulls.rows[0]?.n !== 3) {
+  throw new Error('dirty eleventh fixture must keep three NULL reasons');
+}
+recordElevenDirtyFixtureUrl(elevenDirtyUrl, process.env);
+if (process.env.STP006_ELEVEN_DIRTY_DATABASE_URL !== elevenDirtyUrl) {
+  throw new Error('STP006_ELEVEN_DIRTY_DATABASE_URL was not applied in the current prepare step');
+}
+
+const tenToElevenStill = new pg.Client({ connectionString: tenToElevenUrl, connectionTimeoutMillis: 8000 });
+await tenToElevenStill.connect();
+const tenToElevenStillCount = await tenToElevenStill.query(`
+  SELECT COUNT(*)::int AS n
+    FROM _prisma_migrations
+   WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+`);
+const tenToElevenTwelfth = await tenToElevenStill.query(
+  `SELECT migration_name FROM _prisma_migrations WHERE migration_name = '20260922120000_stp006_horizon_job_reason_null_safe'`,
+);
+await tenToElevenStill.end();
+if (tenToElevenStillCount.rows[0]?.n !== 11) {
+  throw new Error('ten-to-eleven fixture must stay at eleven migrations');
+}
+if (tenToElevenTwelfth.rowCount !== 0) {
+  throw new Error('ten-to-eleven fixture must not receive the twelfth migration');
+}
+
 const sixToSevenStill = new pg.Client({ connectionString: sixToSevenUrl, connectionTimeoutMillis: 8000 });
 await sixToSevenStill.connect();
 const sixToSevenCount = await sixToSevenStill.query(`
@@ -471,5 +570,5 @@ if (nineToTenJobs.rows[0]?.jobs) {
 }
 
 process.stdout.write(
-  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}; eightToNine=${EIGHT_TO_NINE_DATABASE}; nineToTen=${NINE_TO_TEN_DATABASE}; tenToEleven=${TEN_TO_ELEVEN_DATABASE}\n`,
+  `CI isolation ready: app role=${appUser} nosuperuser; migrations=${names.length}; fixture=${FIXTURE_DATABASE}; sixToSeven=${SIX_TO_SEVEN_DATABASE}; sevenToEight=${SEVEN_TO_EIGHT_DATABASE}; eightToNine=${EIGHT_TO_NINE_DATABASE}; nineToTen=${NINE_TO_TEN_DATABASE}; tenToEleven=${TEN_TO_ELEVEN_DATABASE}; elevenToTwelve=${ELEVEN_TO_TWELVE_DATABASE}; elevenDirty=${ELEVEN_DIRTY_DATABASE}\n`,
 );

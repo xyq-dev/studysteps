@@ -14,7 +14,13 @@ import { RuntimeConfig } from './common/runtime-config';
 import { HorizonWorkerService } from './horizon-worker/service';
 import { HorizonWorkerModule } from './horizon-worker/module';
 import { TaskHorizonJobRepository } from './planning/task-horizon-job.repository';
-import { HORIZON_REQUEUE_REASON, addLocalDays, localDateInTimeZone } from '@studysteps/domain';
+import { TaskHorizonCoreService } from './planning/task-horizon-core.service';
+import {
+  HORIZON_REQUEUE_REASON,
+  addLocalDays,
+  localDateInTimeZone,
+  nextHorizonLocalReviewAt,
+} from '@studysteps/domain';
 import {
   assertStp004IntegrationReady,
   loadStp004Env,
@@ -333,6 +339,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
           leaseToken: '11111111-1111-1111-1111-111111111111',
           claimedGeneration: 1n,
           timezone: 'Asia/Shanghai',
+          now: new Date('2026-09-19T04:00:00.000Z'),
           successLocalDate: '2026-09-19',
           insertedCount: 1,
           restoredCount: 0,
@@ -360,7 +367,12 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
       },
     });
     const jobs = new TaskHorizonJobRepository(prisma as never);
-    await jobs.recordTechnicalFailure(ready.planId, 'TEST_FAIL');
+    await jobs.recordTechnicalFailure(
+      ready.planId,
+      'TEST_FAIL',
+      '22222222-2222-2222-2222-222222222222',
+      1n,
+    );
     const failed = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
     expect(failed.state).toBe('FAILED');
     expect(failed.stateReason).toBe('RETRY_EXHAUSTED');
@@ -483,6 +495,7 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
         leaseToken: '33333333-3333-3333-3333-333333333333',
         claimedGeneration: 1n,
         timezone: 'Asia/Shanghai',
+        now: new Date('2026-09-19T04:00:00.000Z'),
         successLocalDate: '2026-09-19',
         insertedCount: 1,
         restoredCount: 0,
@@ -530,5 +543,487 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
     expect(blocked.stateReason).toBe('CONSENT_REQUIRED');
     await holder.end();
     await observer.end();
+  });
+
+  it('ignores a delayed failure after another worker takes the lease', async () => {
+    const ready = await readyStudent('迟到失败');
+    const tokenA = '44444444-4444-4444-4444-444444444444';
+    await prisma.taskHorizonJob.update({
+      where: { planId: ready.planId },
+      data: {
+        state: 'LEASED',
+        availableAt: null,
+        requestedGeneration: 2,
+        processedGeneration: 0,
+        claimedGeneration: 1,
+        attemptCount: 0,
+        leaseToken: tokenA,
+        leaseOwner: 'worker-a',
+        leaseStartedAt: new Date(Date.now() - 400_000),
+        leaseExpiresAt: new Date(Date.now() - 1000),
+        lastExecutorKey: 'HORIZON_WORKER_V1',
+      },
+    });
+    const jobs = new TaskHorizonJobRepository(prisma as never);
+    await jobs.reapExpired(20);
+    await prisma.taskHorizonJob.update({
+      where: { planId: ready.planId },
+      data: { availableAt: new Date(0) },
+    });
+    const claimed = (await jobs.claimReady(20, 60_000, 'worker-b')).filter((row) => row.planId === ready.planId);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.leaseToken).not.toBe(tokenA);
+    const holder = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    const observer = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    await holder.connect();
+    await observer.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT plan_id FROM task_horizon_jobs WHERE plan_id = $1 FOR UPDATE', [ready.planId]);
+    const holderId = await backendPid(holder);
+    const late = jobs.recordTechnicalFailure(ready.planId, 'OLD_WORKER', tokenA, 1n);
+    const overlap = await waitForWaiterOnHolder(observer, holderId, 'old failure waits on new lease');
+    expect(overlap.holder_pid ?? holderId).toBe(holderId);
+    await holder.query('ROLLBACK');
+    await late;
+    const after = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(after.leaseToken).toBe(claimed[0]!.leaseToken);
+    expect(after.state).toBe('LEASED');
+    expect(after.attemptCount).toBe(0);
+    await prisma.$transaction((tx) =>
+      jobs.completeSuccess(tx, {
+        planId: ready.planId,
+        leaseToken: claimed[0]!.leaseToken,
+        claimedGeneration: claimed[0]!.claimedGeneration,
+        timezone: 'Asia/Shanghai',
+        now: new Date('2026-09-21T15:50:00.000Z'),
+        successLocalDate: '2026-09-21',
+        insertedCount: 1,
+        restoredCount: 0,
+      }),
+    );
+    const done = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(done.state).toBe('READY');
+    expect(done.lastOutcome).toBe('GENERATED');
+    await holder.end();
+    await observer.end();
+  });
+
+  it('keeps FAILED through pause resume withdraw and only explicit requeue lifts it', async () => {
+    const ready = await readyStudent('失败不复活');
+    await prisma.taskHorizonJob.update({
+      where: { planId: ready.planId },
+      data: {
+        state: 'FAILED',
+        stateReason: 'RETRY_EXHAUSTED',
+        availableAt: null,
+        attemptCount: 8,
+        leaseToken: null,
+        leaseOwner: null,
+        leaseStartedAt: null,
+        leaseExpiresAt: null,
+        claimedGeneration: null,
+        lastOutcome: 'FAILED',
+        lastErrorCode: 'TEST_FAIL',
+      },
+    });
+    const plan = await prisma.studyPlan.findUniqueOrThrow({ where: { id: ready.planId } });
+    const paused = await agent()
+      .patch(`/v1/students/${ready.student.id}/plans/${ready.planId}`)
+      .set(writeHeaders(ready.cookies))
+      .send({ action: 'PAUSE', expectedVersion: plan.version });
+    expect(paused.status).toBe(200);
+    const afterPause = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(afterPause.state).toBe('FAILED');
+    expect(afterPause.stateReason).toBe('RETRY_EXHAUSTED');
+    expect(afterPause.attemptCount).toBe(8);
+    const resumed = await agent()
+      .patch(`/v1/students/${ready.student.id}/plans/${ready.planId}`)
+      .set(writeHeaders(ready.cookies))
+      .send({ action: 'RESUME', expectedVersion: paused.body.version });
+    expect(resumed.status).toBe(200);
+    const afterResume = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(afterResume.state).toBe('FAILED');
+    expect(afterResume.attemptCount).toBe(8);
+
+    const consent = await prisma.consentRecord.findFirstOrThrow({
+      where: { studentProfileId: ready.student.id, withdrawnAt: null, supersededAt: null },
+    });
+    const withdrawn = await agent()
+      .post(`/v1/students/${ready.student.id}/consents/${consent.id}/withdraw`)
+      .set(writeHeaders(ready.cookies))
+      .send({ reasonCode: 'GUARDIAN_REQUEST' });
+    expect(withdrawn.status).toBeLessThan(300);
+    const afterWithdraw = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(afterWithdraw.state).toBe('FAILED');
+    const docs = await agent()
+      .get('/v1/consent-documents?ageBand=UNDER_14')
+      .set('Origin', ORIGIN)
+      .set('Cookie', ready.cookies.header());
+    const latest = await agent().get(`/v1/students/${ready.student.id}`).set('Cookie', ready.cookies.header());
+    const granted = await agent()
+      .post(`/v1/students/${ready.student.id}/consents`)
+      .set(writeHeaders(ready.cookies))
+      .send({
+        expectedStudentVersion: latest.body.version,
+        acceptances: [{ policyKey: docs.body.policyKey, version: docs.body.version }],
+      });
+    expect(granted.status).toBeLessThan(300);
+    const afterGrant = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(afterGrant.state).toBe('FAILED');
+    expect(afterGrant.attemptCount).toBe(8);
+    await prisma.studentProfile.update({
+      where: { id: ready.student.id },
+      data: { status: 'ACTIVE' },
+    });
+
+    const jobs = new TaskHorizonJobRepository(prisma as never);
+    expect(await jobs.requeueFailed(ready.planId, HORIZON_REQUEUE_REASON)).toBe('OK');
+    const requeued = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(requeued.state).toBe('READY');
+    expect(requeued.attemptCount).toBe(0);
+    await prisma.taskOccurrence.deleteMany({
+      where: { series: { planId: ready.planId }, status: 'PLANNED' },
+    });
+    await wakeJob(ready.planId);
+    const ran = await runWorkerOnce();
+    expect(ran.processed).toBeGreaterThan(0);
+    const generated = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    expect(generated.lastOutcome).toBe('GENERATED');
+  });
+
+  it('exits 3 for a missing requeue plan and keeps other CLI codes', async () => {
+    async function runWorkerCli(args: string[]) {
+      const child = spawn(
+        'pnpm',
+        ['exec', 'nest', 'start', '--entryFile', 'horizon-worker/main', '--', ...args],
+        {
+          cwd: apiRoot,
+          env: {
+            ...process.env,
+            HORIZON_WORKER_ENABLED: 'true',
+            DATABASE_URL: connectionString,
+          },
+          windowsHide: true,
+          shell: true,
+        },
+      );
+      return new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.kill();
+          reject(new Error(`worker cli exceeded 45s for ${args.join(' ')}`));
+        }, 45_000);
+        child.on('exit', (code) => {
+          clearTimeout(timer);
+          resolve(code ?? 1);
+        });
+      });
+    }
+    expect(
+      await runWorkerCli([
+        '--requeue-failed=00000000-0000-4000-8000-000000000099',
+        '--reason=OPERATOR_RETRY_AFTER_DIAGNOSIS',
+      ]),
+    ).toBe(3);
+    expect(
+      await runWorkerCli([
+        '--requeue-failed=00000000-0000-4000-8000-000000000099',
+        '--reason=WRONG',
+      ]),
+    ).toBe(2);
+    const ready = await readyStudent('退出码冲突');
+    expect(
+      await runWorkerCli([
+        `--requeue-failed=${ready.planId}`,
+        '--reason=OPERATOR_RETRY_AFTER_DIAGNOSIS',
+      ]),
+    ).toBe(4);
+  });
+
+  it('schedules the next review from the locked database clock', async () => {
+    const ready = await readyStudent('跨日时钟');
+    const jobs = new TaskHorizonJobRepository(prisma as never);
+    const lockedNow = new Date('2026-09-21T15:50:00.000Z');
+    await prisma.taskHorizonJob.update({
+      where: { planId: ready.planId },
+      data: {
+        state: 'LEASED',
+        availableAt: null,
+        requestedGeneration: 1,
+        processedGeneration: 0,
+        claimedGeneration: 1,
+        leaseToken: '55555555-5555-5555-5555-555555555555',
+        leaseOwner: 'clock',
+        leaseStartedAt: new Date(),
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+        lastExecutorKey: 'HORIZON_WORKER_V1',
+      },
+    });
+    await prisma.$transaction((tx) =>
+      jobs.completeSuccess(tx, {
+        planId: ready.planId,
+        leaseToken: '55555555-5555-5555-5555-555555555555',
+        claimedGeneration: 1n,
+        timezone: 'Asia/Shanghai',
+        now: lockedNow,
+        successLocalDate: '2026-09-21',
+        insertedCount: 1,
+        restoredCount: 0,
+      }),
+    );
+    const job = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId: ready.planId } });
+    const expected = nextHorizonLocalReviewAt(lockedNow, 'Asia/Shanghai', ready.planId);
+    const appClock = nextHorizonLocalReviewAt(new Date(), 'Asia/Shanghai', ready.planId);
+    expect(job.availableAt?.toISOString()).toBe(expected.toISOString());
+    expect(localDateInTimeZone(job.availableAt!, 'Asia/Shanghai')).toBe('2026-09-22');
+    expect(appClock.getTime()).not.toBe(expected.getTime());
+  });
+
+  it('loads out-of-window occupants and revisions at the database and bounds reaping', async () => {
+    const ready = await readyStudent('有界加载');
+    const series = await prisma.taskSeries.findFirstOrThrow({ where: { planId: ready.planId } });
+    const today = localDateInTimeZone(new Date(), 'Asia/Shanghai');
+    const occupantKey = '2018-01-01';
+    await prisma.taskOccurrence.deleteMany({
+      where: { seriesId: series.id, occurrenceKey: today },
+    });
+    const template = await prisma.taskOccurrence.findFirstOrThrow({ where: { seriesId: series.id } });
+    await prisma.taskOccurrence.create({
+      data: {
+        seriesId: series.id,
+        occurrenceKey: occupantKey,
+        originalLocalDate: occupantKey,
+        scheduledLocalDate: today,
+        timezoneSnapshot: template.timezoneSnapshot,
+        status: 'PLANNED',
+        nameSnapshot: template.nameSnapshot,
+        subjectSnapshot: template.subjectSnapshot,
+        completionStandardSnapshot: template.completionStandardSnapshot,
+        durationMinutesSnapshot: template.durationMinutesSnapshot,
+        stepsSnapshotJson: template.stepsSnapshotJson,
+        gradeConfigId: template.gradeConfigId,
+        gradeConfigVersionId: template.gradeConfigVersionId,
+        stageCodeSnapshot: template.stageCodeSnapshot,
+        schoolSystemCodeSnapshot: template.schoolSystemCodeSnapshot,
+        gradeCodeSnapshot: template.gradeCodeSnapshot,
+        gradeLabelSnapshot: template.gradeLabelSnapshot,
+        termCodeSnapshot: template.termCodeSnapshot,
+        catalogEntryKeySnapshot: template.catalogEntryKeySnapshot,
+        contentRevisionNo: template.contentRevisionNo,
+        scheduleRevisionNo: template.scheduleRevisionNo,
+      },
+    });
+    const windowRevisionFrom = addLocalDays(today, 1);
+    const windowOcc = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { seriesId: series.id, occurrenceKey: windowRevisionFrom },
+    });
+    const cutoffAdj = await prisma.planAdjustment.create({
+      data: {
+        planId: ready.planId,
+        seriesId: series.id,
+        occurrenceId: (await prisma.taskOccurrence.findFirstOrThrow({
+          where: { seriesId: series.id, occurrenceKey: occupantKey },
+        })).id,
+        reasonCode: 'SERIES_FUTURE_CONTENT_CHANGED',
+        payloadJson: '{"name":"切点前名称"}',
+      },
+    });
+    const windowAdj = await prisma.planAdjustment.create({
+      data: {
+        planId: ready.planId,
+        seriesId: series.id,
+        occurrenceId: windowOcc.id,
+        reasonCode: 'SERIES_FUTURE_CONTENT_CHANGED',
+        payloadJson: '{"name":"窗口内名称"}',
+      },
+    });
+    await prisma.$transaction(async (tx) => {
+      await tx.taskSeriesRevision.create({
+        data: {
+          taskSeriesId: series.id,
+          revisionNo: 2,
+          changeKind: 'CONTENT',
+          effectiveFromOccurrenceKey: occupantKey,
+          name: '切点前名称',
+          subject: template.subjectSnapshot,
+          completionStandard: template.completionStandardSnapshot,
+          durationMinutes: template.durationMinutesSnapshot,
+          stepsJson: template.stepsSnapshotJson,
+          sourceAdjustmentId: cutoffAdj.id,
+        },
+      });
+      await tx.taskSeriesRevision.create({
+        data: {
+          taskSeriesId: series.id,
+          revisionNo: 3,
+          changeKind: 'CONTENT',
+          effectiveFromOccurrenceKey: windowRevisionFrom,
+          name: '窗口内名称',
+          subject: template.subjectSnapshot,
+          completionStandard: template.completionStandardSnapshot,
+          durationMinutes: template.durationMinutesSnapshot,
+          stepsJson: template.stepsSnapshotJson,
+          sourceAdjustmentId: windowAdj.id,
+        },
+      });
+      await tx.taskSeries.update({
+        where: { id: series.id },
+        data: { version: 3 },
+      });
+    });
+    const core = new TaskHorizonCoreService();
+    const loaded = await prisma.$transaction((tx) =>
+      core.loadPlanGraph(tx, ready.planId, new Date(), 'Asia/Shanghai'),
+    );
+    expect(loaded.failed).toBeUndefined();
+    const graphSeries = loaded.plan!.series.find((item) => item.id === series.id);
+    expect(graphSeries?.occurrences.some((row) => row.occurrenceKey === occupantKey && row.scheduledLocalDate === today)).toBe(true);
+    expect(graphSeries?.revisions?.some((row) => row.revisionNo === 2 && row.name === '切点前名称')).toBe(true);
+    expect(graphSeries?.revisions?.some((row) => row.revisionNo === 3 && row.name === '窗口内名称')).toBe(true);
+    const studentRow = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.student.id } });
+    const result = await prisma.$transaction((tx) =>
+      core.reconcilePlanLocked(tx, {
+        student: {
+          id: studentRow.id,
+          timezone: studentRow.timezone,
+          stageCode: studentRow.stageCode!,
+          schoolSystemCode: studentRow.schoolSystemCode!,
+          gradeCode: studentRow.gradeCode!,
+          gradeLabel: studentRow.gradeLabel!,
+          termCode: studentRow.termCode!,
+          gradeConfigId: studentRow.gradeConfigId!,
+          gradeConfigVersionId: studentRow.gradeConfigVersionId!,
+        },
+        plan: loaded.plan!,
+        now: new Date(),
+      }),
+    );
+    expect(result.blocked?.reason).toBe('DATE_OCCUPIED');
+
+    const jobs = new TaskHorizonJobRepository(prisma as never);
+    await jobs.reapExpired(20);
+    const extraPlan = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: ready.student.id,
+        status: 'ACTIVE',
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Asia/Shanghai',
+      },
+    });
+    const extraTwo = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: ready.student.id,
+        status: 'ACTIVE',
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Asia/Shanghai',
+      },
+    });
+    for (const planId of [extraPlan.id, extraTwo.id]) {
+      await prisma.taskHorizonJob.update({
+        where: { planId },
+        data: {
+          state: 'LEASED',
+          availableAt: null,
+          claimedGeneration: 1,
+          leaseToken: randomUUID(),
+          leaseOwner: 'expired',
+          leaseStartedAt: new Date(Date.now() - 400_000),
+          leaseExpiresAt: new Date(Date.now() - 1000),
+          lastExecutorKey: 'HORIZON_WORKER_V1',
+        },
+      });
+    }
+    expect(await jobs.reapExpired(1)).toBe(1);
+    const leftover = await prisma.taskHorizonJob.count({
+      where: { planId: { in: [extraPlan.id, extraTwo.id] }, state: 'LEASED' },
+    });
+    expect(leftover).toBe(1);
+
+    const over = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: ready.student.id,
+        status: 'ACTIVE',
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Asia/Shanghai',
+      },
+    });
+    const overSeries = await prisma.taskSeries.create({
+      data: {
+        planId: over.id,
+        name: series.name,
+        subject: series.subject,
+        completionStandard: series.completionStandard,
+        durationMinutes: series.durationMinutes,
+        stepsJson: series.stepsJson,
+        repeatKind: 'ONCE',
+        startLocalDate: occupantKey,
+        endLocalDate: occupantKey,
+        effectiveFromLocalDate: occupantKey,
+        effectiveToLocalDate: occupantKey,
+        ongoing: false,
+      },
+    });
+    const parent = await prisma.taskOccurrence.create({
+      data: {
+        seriesId: overSeries.id,
+        occurrenceKey: occupantKey,
+        originalLocalDate: occupantKey,
+        scheduledLocalDate: occupantKey,
+        timezoneSnapshot: template.timezoneSnapshot,
+        status: 'CANCELLED',
+        cancelReason: 'SPLIT',
+        nameSnapshot: template.nameSnapshot,
+        subjectSnapshot: template.subjectSnapshot,
+        completionStandardSnapshot: template.completionStandardSnapshot,
+        durationMinutesSnapshot: template.durationMinutesSnapshot,
+        stepsSnapshotJson: template.stepsSnapshotJson,
+        gradeConfigId: template.gradeConfigId,
+        gradeConfigVersionId: template.gradeConfigVersionId,
+        stageCodeSnapshot: template.stageCodeSnapshot,
+        schoolSystemCodeSnapshot: template.schoolSystemCodeSnapshot,
+        gradeCodeSnapshot: template.gradeCodeSnapshot,
+        gradeLabelSnapshot: template.gradeLabelSnapshot,
+        termCodeSnapshot: template.termCodeSnapshot,
+        catalogEntryKeySnapshot: template.catalogEntryKeySnapshot,
+      },
+    });
+    await prisma.$executeRaw`
+      INSERT INTO task_occurrences (
+        id, series_id, occurrence_key, original_local_date, scheduled_local_date, timezone_snapshot,
+        status, name_snapshot, subject_snapshot, completion_standard_snapshot, duration_minutes_snapshot,
+        steps_snapshot_json, grade_config_id, grade_config_version_id, stage_code_snapshot,
+        school_system_code_snapshot, grade_code_snapshot, grade_label_snapshot, term_code_snapshot,
+        catalog_entry_key_snapshot, source_occurrence_id, version, content_revision_no, schedule_revision_no,
+        created_at, updated_at
+      )
+      SELECT gen_random_uuid(), ${overSeries.id}::uuid,
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             ${template.timezoneSnapshot},
+             'PLANNED',
+             ${template.nameSnapshot},
+             ${template.subjectSnapshot},
+             ${template.completionStandardSnapshot},
+             ${template.durationMinutesSnapshot},
+             ${template.stepsSnapshotJson},
+             ${template.gradeConfigId}::uuid,
+             ${template.gradeConfigVersionId}::uuid,
+             ${template.stageCodeSnapshot},
+             ${template.schoolSystemCodeSnapshot},
+             ${template.gradeCodeSnapshot},
+             ${template.gradeLabelSnapshot},
+             ${template.termCodeSnapshot},
+             ${template.catalogEntryKeySnapshot},
+             ${parent.id}::uuid,
+             1, 1, 1, clock_timestamp(), clock_timestamp()
+        FROM generate_series(0, 5000) AS g
+    `;
+    const overLoaded = await prisma.$transaction((tx) =>
+      core.loadPlanGraph(tx, over.id, new Date(), 'Asia/Shanghai'),
+    );
+    expect(overLoaded.failed?.reason).toBe('SCOPE_LIMIT');
   });
 });

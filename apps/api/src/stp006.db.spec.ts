@@ -38,13 +38,13 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
     await prisma.$disconnect();
   });
 
-  it('applies eleven migrations and does not publish policy in the structure migration', async () => {
+  it('applies twelve migrations and does not publish policy in the structure migration', async () => {
     const applied = await prisma.$queryRaw<Array<{ n: number }>>`
       SELECT COUNT(*)::int AS n
         FROM _prisma_migrations
        WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    expect(applied[0]?.n).toBe(11);
+    expect(applied[0]?.n).toBe(12);
     const seventh = await prisma.$queryRaw<Array<{ migration_name: string }>>`
       SELECT migration_name FROM _prisma_migrations
        WHERE migration_name = '20260917120000_stp006_study_plans_occurrences'
@@ -79,6 +79,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 seventh migration and cons
       SELECT to_regclass('task_horizon_jobs')::text AS jobs
     `;
     expect(jobs[0]?.jobs).toBeTruthy();
+    const twelfth = await prisma.$queryRaw<Array<{ migration_name: string }>>`
+      SELECT migration_name FROM _prisma_migrations
+       WHERE migration_name = '20260922120000_stp006_horizon_job_reason_null_safe'
+    `;
+    expect(twelfth).toHaveLength(1);
   });
 
   it('keeps test-v1 body/scope and publishes informal test-v2 separately', async () => {

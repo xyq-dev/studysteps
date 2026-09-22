@@ -43,7 +43,7 @@ export class TaskHorizonJobRepository {
       return [];
     }
     return this.prisma.$transaction(async (tx) => {
-      await this.reapExpiredLocked(tx);
+      await this.reapExpiredLocked(tx, limit);
       const due = await tx.$queryRaw<Array<{ plan_id: string }>>`
         SELECT plan_id
           FROM task_horizon_jobs
@@ -110,25 +110,39 @@ export class TaskHorizonJobRepository {
     return updated === 1;
   }
 
-  async reapExpired(): Promise<number> {
-    return this.prisma.$transaction(async (tx) => this.reapExpiredLocked(tx), {
+  async reapExpired(limit = 20): Promise<number> {
+    return this.prisma.$transaction(async (tx) => this.reapExpiredLocked(tx, limit), {
       maxWait: 5_000,
       timeout: 15_000,
     });
   }
 
-  private async reapExpiredLocked(tx: Tx): Promise<number> {
-    const rows = await tx.$queryRaw<Array<{ plan_id: string }>>`
-      SELECT plan_id
+  private async reapExpiredLocked(tx: Tx, limit: number): Promise<number> {
+    if (limit <= 0) {
+      return 0;
+    }
+    const rows = await tx.$queryRaw<Array<{
+      plan_id: string;
+      lease_token: string;
+      claimed_generation: bigint;
+    }>>`
+      SELECT plan_id, lease_token::text, claimed_generation
         FROM task_horizon_jobs
        WHERE state = 'LEASED'
          AND lease_expires_at IS NOT NULL
          AND lease_expires_at <= clock_timestamp()
        ORDER BY lease_expires_at, plan_id
        FOR UPDATE SKIP LOCKED
+       LIMIT ${limit}
     `;
     for (const row of rows) {
-      await this.applyTechnicalFailure(tx, row.plan_id, 'LEASE_EXPIRED');
+      await this.applyTechnicalFailure(
+        tx,
+        row.plan_id,
+        'LEASE_EXPIRED',
+        String(row.lease_token),
+        BigInt(row.claimed_generation),
+      );
     }
     return rows.length;
   }
@@ -140,6 +154,7 @@ export class TaskHorizonJobRepository {
       leaseToken: string;
       claimedGeneration: bigint;
       timezone: string;
+      now: Date;
       successLocalDate: string;
       insertedCount: number;
       restoredCount: number;
@@ -147,7 +162,7 @@ export class TaskHorizonJobRepository {
   ): Promise<void> {
     const outcome: HorizonOutcome =
       input.insertedCount > 0 ? 'GENERATED' : input.restoredCount > 0 ? 'RESTORED' : 'NOOP';
-    const nextAt = nextHorizonLocalReviewAt(new Date(), input.timezone, input.planId);
+    const nextAt = nextHorizonLocalReviewAt(input.now, input.timezone, input.planId);
     const updated = await tx.$executeRaw`
       UPDATE task_horizon_jobs
          SET processed_generation = claimed_generation,
@@ -193,10 +208,11 @@ export class TaskHorizonJobRepository {
       leaseToken: string;
       claimedGeneration: bigint;
       timezone: string;
+      now: Date;
       reason: HorizonBlockedReason;
     },
   ): Promise<void> {
-    const nextAt = nextHorizonLocalReviewAt(new Date(), input.timezone, input.planId);
+    const nextAt = nextHorizonLocalReviewAt(input.now, input.timezone, input.planId);
     const updated = await tx.$executeRaw`
       UPDATE task_horizon_jobs
          SET processed_generation = claimed_generation,
@@ -313,30 +329,46 @@ export class TaskHorizonJobRepository {
     }
   }
 
-  async recordTechnicalFailure(planId: string, errorCode: string): Promise<void> {
+  async recordTechnicalFailure(
+    planId: string,
+    errorCode: string,
+    leaseToken: string,
+    claimedGeneration: bigint,
+  ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`
         SELECT plan_id FROM task_horizon_jobs WHERE plan_id = ${planId}::uuid FOR UPDATE
       `;
-      await this.applyTechnicalFailure(tx, planId, errorCode);
+      await this.applyTechnicalFailure(tx, planId, errorCode, leaseToken, claimedGeneration);
     }, { maxWait: 5_000, timeout: 15_000 });
   }
 
-  private async applyTechnicalFailure(tx: Tx, planId: string, errorCode: string): Promise<void> {
+  private async applyTechnicalFailure(
+    tx: Tx,
+    planId: string,
+    errorCode: string,
+    leaseToken: string,
+    claimedGeneration: bigint,
+  ): Promise<void> {
     const rows = await tx.$queryRaw<Array<{
       requested_generation: bigint;
       claimed_generation: bigint | null;
       attempt_count: number;
+      lease_token: string | null;
     }>>`
-      SELECT requested_generation, claimed_generation, attempt_count
+      SELECT requested_generation, claimed_generation, attempt_count, lease_token::text
         FROM task_horizon_jobs
-       WHERE plan_id = ${planId}::uuid AND state = 'LEASED'
+       WHERE plan_id = ${planId}::uuid
+         AND state = 'LEASED'
+         AND lease_token = ${leaseToken}::uuid
+         AND claimed_generation = ${claimedGeneration}
     `;
     const row = rows[0];
-    if (!row || row.claimed_generation == null) {
+    if (!row || row.claimed_generation == null || row.lease_token !== leaseToken) {
       return;
     }
-    if (row.requested_generation > row.claimed_generation) {
+    const claimed = BigInt(row.claimed_generation);
+    if (row.requested_generation > claimed) {
       await tx.$executeRaw`
         UPDATE task_horizon_jobs
            SET attempt_count = 0,
@@ -352,7 +384,10 @@ export class TaskHorizonJobRepository {
                last_error_code = ${errorCode.slice(0, 64)},
                last_finished_at = clock_timestamp(),
                updated_at = clock_timestamp()
-         WHERE plan_id = ${planId}::uuid AND state = 'LEASED'
+         WHERE plan_id = ${planId}::uuid
+           AND state = 'LEASED'
+           AND lease_token = ${leaseToken}::uuid
+           AND claimed_generation = ${claimed}
       `;
       return;
     }
@@ -373,7 +408,10 @@ export class TaskHorizonJobRepository {
                last_error_code = ${errorCode.slice(0, 64)},
                last_finished_at = clock_timestamp(),
                updated_at = clock_timestamp()
-         WHERE plan_id = ${planId}::uuid AND state = 'LEASED'
+         WHERE plan_id = ${planId}::uuid
+           AND state = 'LEASED'
+           AND lease_token = ${leaseToken}::uuid
+           AND claimed_generation = ${claimed}
       `;
       return;
     }
@@ -393,7 +431,10 @@ export class TaskHorizonJobRepository {
              last_error_code = ${errorCode.slice(0, 64)},
              last_finished_at = clock_timestamp(),
              updated_at = clock_timestamp()
-       WHERE plan_id = ${planId}::uuid AND state = 'LEASED'
+       WHERE plan_id = ${planId}::uuid
+         AND state = 'LEASED'
+         AND lease_token = ${leaseToken}::uuid
+         AND claimed_generation = ${claimed}
     `;
   }
 
@@ -420,10 +461,16 @@ export class TaskHorizonJobRepository {
     }
   }
 
-  async block(tx: Tx, planIds: string[], reason: HorizonBlockedReason, timezone: string): Promise<void> {
+  async block(
+    tx: Tx,
+    planIds: string[],
+    reason: HorizonBlockedReason,
+    timezone: string,
+    now: Date,
+  ): Promise<void> {
     const ids = [...new Set(planIds)].sort();
     for (const planId of ids) {
-      const nextAt = nextHorizonLocalReviewAt(new Date(), timezone, planId);
+      const nextAt = nextHorizonLocalReviewAt(now, timezone, planId);
       await tx.$executeRaw`
         UPDATE task_horizon_jobs
            SET requested_generation = CASE
@@ -444,7 +491,7 @@ export class TaskHorizonJobRepository {
                last_error_code = ${reason},
                updated_at = clock_timestamp()
          WHERE plan_id = ${planId}::uuid
-           AND state <> 'RETIRED'
+           AND state IN ('READY', 'BLOCKED', 'LEASED')
       `;
     }
   }

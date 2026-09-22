@@ -35,6 +35,11 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006 ten-to-eleven leftover upg
        WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
     expect(applied[0]?.n).toBe(11);
+    const twelfth = await prisma!.$queryRaw<Array<{ migration_name: string }>>`
+      SELECT migration_name FROM _prisma_migrations
+       WHERE migration_name = '20260922120000_stp006_horizon_job_reason_null_safe'
+    `;
+    expect(twelfth).toHaveLength(0);
     const kept = await prisma!.$queryRaw<Array<{ nickname: string }>>`
       SELECT nickname FROM student_profiles WHERE nickname = '十到十一基线'
     `;
