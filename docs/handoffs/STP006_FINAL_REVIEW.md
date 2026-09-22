@@ -259,3 +259,107 @@ pnpm worker:horizon -- --once --max-jobs=20 --max-ms=60000
 - HTTP `task-horizon` 为锁完整性仍发现学生下全部 occurrence id；有界加载落在 worker／共享核心。
 - 通知 worker、T11-D、STP 007、B04 生产启用仍延期。
 - 本文件第 1–9 节的原始复审结论保持；本轮不是另一次独立复审已经通过。
+
+## 11. 2026-09-22 七项修复独立定向复审
+
+### 11.1 结论与现场
+
+**结论：仍不可通过。** B1–B4 的原阻塞已关闭；B5、B6、B7 仍有当前提交可复现的功能反例。因此本轮不能给出“STP006 既定范围可通过”，也不能进入 STP007 设计或修改阶段完成状态。
+
+- 实际目录：`D:\Program Files\PycharmProjects\studysteps`。
+- 分支／HEAD／origin：`main@5c7093283ea76de7344867ac8c56988f41ae6aed`，与 `origin/main` 一致；相对报告基线无漂移。
+- 复审开始时工作区仅有既存 `docs/handoffs/STP004_PG_ISOLATION.md` PID 行改动；本节是本轮唯一仓库增量，既存改动未覆盖。
+- GitHub Actions [CI #17](https://github.com/xyq-dev/studysteps/actions/runs/35676234006) 的 API 元数据为当前完整 SHA、`completed/success`；`Prepare isolated PostgreSQL`、Lint、Typecheck、Test、Build、Prisma validate 均成功。CI 未配置 Playwright；本轮复用修复后本地完整 **14 passed / 0 failed / 0 skipped** 证据，没有把它写成远端数量。
+
+### 11.2 B1–B7 结论矩阵
+
+| 项 | 结论 | 本轮依据 |
+| --- | --- | --- |
+| B1 创建版本消耗 | **关闭** | 模板导入和手动创建共用 `persistConfirmedPlan`；`planning.service.ts:2103-2109` 在同一事务以 `id + version` CAS 推进档案版本。定向 HTTP 用例 1 passed；真实锁等待并发用例 1 passed，结果 201+409、仅一份计划、version 只加一。同键重放仍先重新鉴权，且不再推进版本；取得新版本后可有意再建一份。 |
+| B2 旧 worker 延迟失败 | **关闭** | `horizon-worker/service.ts:123-136` 将原 token/generation 传给失败记录；`task-horizon-job.repository.ts:332-438` 的查询及全部失败 UPDATE 均 CAS `state + token + claimedGeneration`，零行直接返回，无按 planId 兜底。定向用例用独立连接和 `pg_blocking_pids` 复现 A 迟到、B 接管，B 的租约／attempt 保持并可完成。 |
+| B3 FAILED 状态 | **关闭** | `signal` 与 `block` 的 WHERE 仅含 READY／BLOCKED／LEASED（repository `:441-495`），故 FAILED 的 state／reason／attempt／requested／processed 均为零行不变；归档可显式 RETIRED，只有 `requeueFailed` 可回 READY。真实 HTTP 暂停／恢复、撤回／重授及 requeue 用例通过。测试没有逐阶段单独打印两个 generation，但生产 SQL 的零行谓词足以确定它们未被更新，记为断言粒度不足而非行为反例。 |
+| B4 第十二条迁移 | **关闭** | 1–11 未改写；合法非空 11→12 物理升级后迁移数 11→12，plan／occurrence／job 数为 4／10／4 且业务 digest 相同。约束 `convalidated=true`；6 个 NULL／非法非空组合均由目标 reason CHECK 拒绝，合法 READY／LEASED 接受。脏十一态迁移以 P3018/P0001 失败，3 条 NULL 行 digest、原约束定义 hash 和 validated 状态均保持，成功账本仍为 11。只读核对十→十一历史夹具仍停在 11。 |
+| B5 公开 CLI | **未关闭** | 根命令实测：不存在=3、READY 冲突=4、非法参数=2，但 bootstrap 配置错误=**1**，契约要求 2。见 11.3。 |
+| B6 锁后时间 | **未关闭** | 生成窗口、`completeSuccess`／`completeBlocked`／业务 `block` 已贯穿同一个锁后 DB `now`；现有午夜证据只是注入时间，不冒充真实跨午夜运行。但 `runOnce` 的进程预算仍用可回拨的 `Date.now()`，不是单调时钟，临时探针已越过 `max-ms` 后继续领取。见 11.4。 |
+| B7 有界执行 | **未关闭** | 窗口 key／实际日／拆分子行和 revision 的数据库查询及 reaper LIMIT 已落地；直接核心测试也能返回 SCOPE_LIMIT。但真实 worker 在预锁发现阶段先抛 `VALIDATION_ERROR`，把结构超限误记为技术失败重试，未进入 `FAILED/SCOPE_LIMIT`。见 11.5。 |
+
+### 11.3 B5 反例：bootstrap 错误未映射为退出码 2
+
+实际公开根命令结果：
+
+```text
+missing plan = 3
+READY/CAS conflict = 4
+invalid argument = 2
+invalid worker configuration = 1   # 预期 2
+```
+
+复现配置错误：
+
+```powershell
+$env:HORIZON_WORKER_ENABLED='true'
+$env:HORIZON_WORKER_LEASE_MS='1'
+pnpm worker:horizon -- --status
+```
+
+实际为 pnpm 退出 1，Nest 报 `HORIZON_WORKER_RENEW_MS must be < HORIZON_WORKER_LEASE_MS / 2`。原因是 `apps/api/src/horizon-worker/main.ts:60` 在 `try` 外执行 `NestFactory.createApplicationContext(...)`；RuntimeConfig 或 Prisma bootstrap 失败不会进入 `:92-94` 的 `process.exitCode = 2`。
+
+最小修复：将 application-context 创建纳入最外层 `try/catch/finally`，app／worker 尚未创建时安全关闭；用准确的根 `pnpm worker:horizon` 命令增加配置失败和数据库初始化失败的进程级退出码测试。
+
+### 11.4 B6 反例：`max-ms` 仍依赖墙钟
+
+业务时间链已修正：worker 在 `horizon-worker/service.ts:153` 锁后读取 DB 时间，并把同一对象传给核心、`completeSuccess`、`completeBlocked`；暂停和同意／关系 block 的调用点也把各自锁后 `now` 传到 repository，repository `:165`、`:215`、`:473` 不再创建应用当前时间。`stp006.horizon-worker.spec.ts:742` 使用注入的 `2026-09-21T15:50:00Z` 验证下一上海本地日调度；它不是一次真实跨午夜等待，本复审不把它描述为后者。
+
+但 `horizon-worker/service.ts:54-56` 仍以 `Date.now()` 建立和检查 `runOnce` 截止时间。对当前编译类做无数据库临时探针，将墙钟保持不前进、每批实际等待约 6ms：
+
+```text
+B6_BUDGET processed=3 claims=3 maxMs=1 monotonicElapsedMs=19.3
+```
+
+这证明墙钟回拨／停滞时会在单调时间已经超过预算后继续 claim，违反 `max-ms` 硬截止。最小修复：只把进程预算改为 `performance.now()` 或 `process.hrtime.bigint()`；业务时间继续使用锁后数据库时间，并增加墙钟回拨的纯进程测试。
+
+### 11.5 B7 反例：真实 worker 将结构超限当技术失败
+
+在独占十二迁移审计库中，复用定向测试产生的计划，确认其有 5,002 条 occurrence（含 5,001 个拆分来源行），把该 plan 的 job 单独置为到期 READY，然后执行对外交付命令：
+
+```text
+pnpm worker:horizon -- --once --max-jobs=20 --max-ms=60000
+
+before: READY | reason=NULL | attempt=0 | requested=1 | processed=0 | occurrences=5002
+log:    technical_failure / VALIDATION_ERROR
+after:  READY | reason=NULL | attempt=1 | requested=1 | processed=0 |
+        last_outcome=FAILED | last_error_code=VALIDATION_ERROR | occurrences=5002
+exit:   0
+```
+
+零 occurrence 写入是正确的，但状态机错误。`horizon-worker/service.ts:280-296` 的预锁 `discoverBusinessLocks` 在 `limit+1` 时抛普通 `AppError`；`processOne` 的 catch（`:123-136`）随后走技术退避。因而直接调用 `TaskHorizonCoreService.loadPlanGraph` 得到 SCOPE_LIMIT 的绿色用例不能代表真实 worker，重复执行最终会是 `FAILED/RETRY_EXHAUSTED`，不是定稿的 `FAILED/SCOPE_LIMIT`。
+
+最小修复：让预锁发现返回明确的 scope-limit 结果，并在 token/generation CAS 下把 job 原子结束为 `FAILED/SCOPE_LIMIT`；不得经过技术 attempt。增加从真实 `HorizonWorkerService.runOnce` 或公开根命令进入的 5,001+ 行测试，断言零业务写、无部分提交、attempt 不增加且最终 reason 精确为 SCOPE_LIMIT。
+
+HTTP `task-horizon` 在 `planning.service.ts:1880-1897,1925-1944` 仍枚举学生全部 occurrence id。它不改变上述真实 worker 反例；按原 B7 的后台 worker／共享核心／reaper 收口范围，本轮将其保留为**非阻塞的显式 HTTP 有界性债务**，不忽略，也不借此扩大为全 planning 性能改造。
+
+### 11.6 实际命令、复用证据与退出
+
+本轮新增定向执行：
+
+- `stp006.http.spec.ts -t "consumes student version..."`：1 passed／32 skipped；
+- `stp006.concurrency.spec.ts -t "serializes two confirmations..."`：1 passed／16 skipped，并含真实 `pg_blocking_pids` 等待；
+- `stp006.horizon-worker.spec.ts -t "ignores a delayed failure|keeps FAILED|schedules...|loads..."`：4 passed／12 skipped；
+- 合法 11→12、脏十一预检和约束组合物理 SQL；
+- B5 四类公开退出码、B6 单调预算临时探针、B7 公开 bounded worker 入口反例。
+
+未重复执行完整 lint／typecheck／test／build／prisma validate 或完整 Playwright；复用当前 SHA 的 CI #17 根检查和修复后 14 条本地 Playwright 证据。通知 worker／T11-D、打卡计时、B04、生产启用仍按既定延期，不是本轮新增阻塞。
+
+本轮没有修改业务代码、Schema、已发布迁移、测试断言、CURRENT_STATUS／TASKS 或完成状态，没有 commit／push／pack／部署。三个本轮审计库均已 drop；worker／API／Vite 无遗留进程或监听。开始时已存在的 PostgreSQL 仍监听 `127.0.0.1:6260`（PID 10204），未停止；`STP004_PG_ISOLATION.md` 的既有 PID 改动保持原样。
+
+## 12. 2026-09-22 B5–B7 修复记录（不是独立复审）
+
+本轮只修第 11 节仍打开的 B5／B6／B7。第 1–9 节与第 11 节原文、B1–B4 关闭结论均未改写。本记录是修复自测，不能代替另一次独立复审，也不能把 STP 006 标为完成。
+
+| 项 | 第 11 节反例 | 最小修复 | 本轮证据 |
+| --- | --- | --- | --- |
+| B5 | `NestFactory.createApplicationContext` 在 try 外，配置错误公开命令退出 1 | 配置加载、Nest context、命令执行纳入同一 try／finally；成功创建后才 close；错误信息不含连接串 | 根命令 `pnpm worker:horizon -- --status` 且 `HORIZON_WORKER_LEASE_MS=1` 退出 **2**；同进程 missing=3、非法 reason=2、READY 冲突=4 |
+| B6 | `runOnce` 用 `Date.now()` 做 max-ms，墙钟回拨后继续领取 | 仅进程预算改 `performance.now()`；业务窗口／`next_due_at` 仍用锁后 DB 时间 | `stp006.horizon-worker.spec`：墙钟每读回拨 10s、`maxMs=1`、concurrency=1；`claimReady` 只 1 次，`processed=1`，另 2 个 job 未启动 |
+| B7 | 预锁 `discoverBusinessLocks` 抛 `VALIDATION_ERROR`，公开 worker 记技术失败 READY／attempt+1 | 超限返回可识别 SCOPE_LIMIT；短事务按锁序＋token／generation CAS 走 `completeFailed`；不锁 5001+ occurrence，不进共享核心 | 公开 `pnpm worker:horizon -- --once`：5002 行计划 → `FAILED/SCOPE_LIMIT`、attempt=0、occurrence／planAdjustment 零增。旧租约迟到 `executeClaimed` 有真实 job 行锁等待，不改 B 的 token；B 随后仍 `SCOPE_LIMIT`。正常规模公开 `--once` 仍 GENERATED |
+
+未改：Web、业务规则、Schema、迁移 1–12、test-v2、HTTP `task-horizon` 全量锁发现。无 Migration。STP 004／005 完成状态不变，未进入 STP 007。

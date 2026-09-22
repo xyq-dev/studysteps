@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { HORIZON_REQUEUE_REASON } from '@studysteps/domain';
+import { loadAppConfig } from '../common/config';
 import { HorizonWorkerModule } from './module';
 import { HorizonWorkerService } from './service';
 
@@ -9,6 +10,8 @@ type Mode =
   | { kind: 'once'; maxJobs: number; maxMs: number }
   | { kind: 'status' }
   | { kind: 'requeue'; planId: string; reason: string };
+
+type ExitHint = { exitCode?: number };
 
 function parseArgs(argv: string[]): Mode {
   const args = argv.slice(2);
@@ -45,36 +48,54 @@ function parseArgs(argv: string[]): Mode {
   throw Object.assign(new Error('missing worker mode'), { exitCode: 2 });
 }
 
+function publicErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : 'worker failed';
+  return raw
+    .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, '[redacted]')
+    .replace(/(DATABASE_URL|DIRECT_URL|STP004_[A-Z0-9_]*URL)\s*=\s*\S+/gi, '$1=[redacted]');
+}
+
+function hintedExitCode(error: unknown): number {
+  if (typeof error === 'object' && error && 'exitCode' in error) {
+    const code = Number((error as ExitHint).exitCode);
+    if (Number.isFinite(code) && code > 0) {
+      return code;
+    }
+  }
+  return 2;
+}
+
 async function main() {
-  let mode: Mode;
+  let app: Awaited<ReturnType<typeof NestFactory.createApplicationContext>> | undefined;
+  let worker: HorizonWorkerService | undefined;
   try {
-    mode = parseArgs(process.argv);
-  } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : 'invalid arguments'}\n`);
-    process.exit(typeof error === 'object' && error && 'exitCode' in error ? Number(error.exitCode) : 2);
-  }
-  if (process.env.HORIZON_WORKER_ENABLED !== 'true') {
-    process.stderr.write('HORIZON_WORKER_ENABLED must be true\n');
-    process.exit(2);
-  }
-  const app = await NestFactory.createApplicationContext(HorizonWorkerModule, { logger: ['error', 'warn', 'log'] });
-  const worker = app.get(HorizonWorkerService);
-  const stop = () => worker.requestStop();
-  process.on('SIGTERM', stop);
-  process.on('SIGINT', stop);
-  try {
-    if (!worker.config.enabled) {
+    const mode = parseArgs(process.argv);
+    if (process.env.HORIZON_WORKER_ENABLED !== 'true') {
+      process.stderr.write('HORIZON_WORKER_ENABLED must be true\n');
+      process.exitCode = 2;
+      return;
+    }
+    loadAppConfig();
+    app = await NestFactory.createApplicationContext(HorizonWorkerModule, {
+      logger: ['error', 'warn', 'log'],
+    });
+    const running = app.get(HorizonWorkerService);
+    worker = running;
+    const stop = () => running.requestStop();
+    process.on('SIGTERM', stop);
+    process.on('SIGINT', stop);
+    if (!running.config.enabled) {
       process.stderr.write('horizon worker config disabled after enable flag\n');
       process.exitCode = 2;
       return;
     }
     if (mode.kind === 'status') {
-      process.stdout.write(`${JSON.stringify(await worker.statusSnapshot())}\n`);
+      process.stdout.write(`${JSON.stringify(await running.statusSnapshot())}\n`);
       process.exitCode = 0;
       return;
     }
     if (mode.kind === 'requeue') {
-      const result = await worker.requeueFailed(mode.planId, mode.reason);
+      const result = await running.requeueFailed(mode.planId, mode.reason);
       if (result === 'OK') {
         process.exitCode = 0;
         return;
@@ -83,22 +104,26 @@ async function main() {
       return;
     }
     if (mode.kind === 'once') {
-      await worker.runOnce(mode.maxJobs, mode.maxMs);
+      await running.runOnce(mode.maxJobs, mode.maxMs);
       process.exitCode = 0;
       return;
     }
-    await worker.runContinuous();
+    await running.runContinuous();
     process.exitCode = 0;
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : 'worker failed'}\n`);
-    process.exitCode = 2;
+    process.stderr.write(`${publicErrorMessage(error)}\n`);
+    process.exitCode = hintedExitCode(error);
   } finally {
-    try {
-      await worker.disconnect();
-    } catch {
-      // already closed
+    if (worker) {
+      try {
+        await worker.disconnect();
+      } catch {
+        // already closed
+      }
     }
-    await app.close();
+    if (app) {
+      await app.close();
+    }
   }
 }
 

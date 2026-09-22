@@ -525,3 +525,27 @@ pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_D
 
 未执行：独立复审、生产迁移、pack／部署、STP 007。STP 006 仍进行中。STP 004／005 状态不变。
 
+## 20. 2026-09-22 独立复审剩余 B5–B7
+
+授权：用户持续授权本批修复、定向验证、普通 commit／push。不进入 STP 007。无 Migration。
+
+| 项 | 结果 |
+| --- | --- |
+| 实施前 HEAD | `5c7093283ea76de7344867ac8c56988f41ae6aed` |
+| 分支 | `main` 跟踪 `origin/main` |
+| 范围 | 仅 worker CLI、进程预算、预锁超限路径与对应测试／证据文档 |
+| 未改 | Web、业务规则、Schema、迁移 1–12、test-v2、HTTP 全量锁发现 |
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm --filter @studysteps/api test -- src/stp006.horizon-worker.spec.ts` | 0 | **19 passed**，含 B2 租约 CAS、B3 FAILED、B5 公开退出码、B6 回拨预算、B7 公开超限 |
+| `pnpm build` | 0 | 公开命令使用修复后 dist |
+| 公开 `pnpm worker:horizon -- --status` 且 `HORIZON_WORKER_LEASE_MS=1` | 2 | 配置错误 |
+| 公开 missing requeue | 3 | 保持 |
+| Playwright | 未执行 | 复用修复后 14 条既有证据；本轮未改前端 |
+| 完整 `pnpm test`／`prisma:validate` | 交给本 SHA 的 CI | 本地未整包重跑 |
+
+未执行：独立复审、完整根测试（交 CI）、Playwright、生产迁移、pack／部署、STP 007。STP 006 仍进行中。这不是独立复审通过。
+

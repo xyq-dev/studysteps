@@ -51,9 +51,12 @@ export class HorizonWorkerService {
   }
 
   async runOnce(maxJobs: number, maxMs: number): Promise<{ processed: number }> {
-    const deadline = Date.now() + maxMs;
+    const started = performance.now();
     let processed = 0;
-    while (!this.stopping && processed < maxJobs && Date.now() < deadline) {
+    while (!this.stopping && processed < maxJobs) {
+      if (performance.now() - started >= maxMs) {
+        break;
+      }
       const remaining = Math.min(maxJobs - processed, this.availableClaimSlots(maxJobs - processed));
       if (remaining <= 0) {
         break;
@@ -147,12 +150,27 @@ export class HorizonWorkerService {
 
   private async executeClaimed(job: ClaimedHorizonJob): Promise<void> {
     const seed = await this.discoverBusinessLocks(job.planId);
+    if (!seed.ok) {
+      await this.finishClaimedAsScopeLimit(job);
+      this.logger.log({ planId: job.planId, result: 'FAILED', reason: 'SCOPE_LIMIT' });
+      return;
+    }
     await runWriteTx(this.prisma, async (tx, extra) => {
-      const locked = mergeLockIds(seed, extra);
+      const locked = mergeLockIds(seed.locks, extra);
       await acquireLocks(tx, locked);
       const now = await readLockedNow(tx);
       const discovered = await this.discoverBusinessLocks(job.planId, tx, now);
-      assertLockSetComplete(locked, discovered);
+      if (!discovered.ok) {
+        await this.jobs.completeFailed(tx, {
+          planId: job.planId,
+          leaseToken: job.leaseToken,
+          claimedGeneration: job.claimedGeneration,
+          reason: 'SCOPE_LIMIT',
+        });
+        this.logger.log({ planId: job.planId, result: 'FAILED', reason: 'SCOPE_LIMIT' });
+        return;
+      }
+      assertLockSetComplete(locked, discovered.locks);
       const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
       if (
         !current ||
@@ -258,20 +276,61 @@ export class HorizonWorkerService {
         insertedCount: result.insertedCount,
         restoredCount: result.restoredCount,
       });
-    }, seed);
+    }, seed.locks);
+  }
+
+  private async finishClaimedAsScopeLimit(job: ClaimedHorizonJob): Promise<void> {
+    const plan = await this.prisma.studyPlan.findUnique({
+      where: { id: job.planId },
+      select: { studentProfileId: true },
+    });
+    const seed: LockIds = {
+      studentIds: plan ? [plan.studentProfileId] : [],
+      planIds: [job.planId],
+      taskHorizonJobPlanIds: [job.planId],
+    };
+    try {
+      await runWriteTx(this.prisma, async (tx) => {
+        await acquireLocks(tx, seed);
+        const now = await readLockedNow(tx);
+        const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
+        if (
+          !current ||
+          current.state !== 'LEASED' ||
+          current.leaseToken !== job.leaseToken ||
+          current.claimedGeneration == null ||
+          BigInt(current.claimedGeneration) !== BigInt(job.claimedGeneration) ||
+          !current.leaseExpiresAt ||
+          current.leaseExpiresAt <= now
+        ) {
+          return;
+        }
+        await this.jobs.completeFailed(tx, {
+          planId: job.planId,
+          leaseToken: job.leaseToken,
+          claimedGeneration: job.claimedGeneration,
+          reason: 'SCOPE_LIMIT',
+        });
+      }, seed);
+    } catch (error) {
+      if (error instanceof Error && /token CAS failed/.test(error.message)) {
+        return;
+      }
+      throw error;
+    }
   }
 
   private async discoverBusinessLocks(
     planId: string,
     db: PrismaService | Parameters<TaskHorizonJobRepository['planIdsForStudent']>[0] = this.prisma,
     now?: Date,
-  ): Promise<LockIds> {
+  ): Promise<{ ok: true; locks: LockIds } | { ok: false; reason: 'SCOPE_LIMIT' }> {
     const plan = await db.studyPlan.findUnique({
       where: { id: planId },
       include: { series: { select: { id: true } } },
     });
     if (!plan) {
-      return { planIds: [planId], taskHorizonJobPlanIds: [planId] };
+      return { ok: true, locks: { planIds: [planId], taskHorizonJobPlanIds: [planId] } };
     }
     const student = await db.studentProfile.findUnique({ where: { id: plan.studentProfileId } });
     const clock = now ?? new Date();
@@ -293,7 +352,7 @@ export class HorizonWorkerService {
         })
       : [];
     if (occurrences.length > HORIZON_MAX_LOCK_ROWS) {
-      throw new AppError('VALIDATION_ERROR', '当前计划超出一次补齐范围', 400);
+      return { ok: false, reason: 'SCOPE_LIMIT' };
     }
     const consents = await db.consentRecord.findMany({
       where: { studentProfileId: plan.studentProfileId, withdrawnAt: null, supersededAt: null },
@@ -305,16 +364,19 @@ export class HorizonWorkerService {
       where: { id: { in: consents.map((item) => item.consentPolicyId) } },
     });
     return {
-      accountIds: [...links.map((item) => item.accountId), ...consents.map((item) => item.grantedByAccountId)],
-      studentIds: student ? [student.id] : [],
-      gradeConfigIds: student?.gradeConfigId ? [student.gradeConfigId] : [],
-      policies: policies.map((item) => ({ id: item.id, policyKey: item.policyKey, locale: item.locale })),
-      linkIds: links.map((item) => item.id),
-      consentIds: consents.map((item) => item.id),
-      planIds: [plan.id],
-      taskSeriesIds: plan.series.map((item) => item.id),
-      taskOccurrenceIds: occurrences.map((row) => row.id),
-      taskHorizonJobPlanIds: [plan.id],
+      ok: true,
+      locks: {
+        accountIds: [...links.map((item) => item.accountId), ...consents.map((item) => item.grantedByAccountId)],
+        studentIds: student ? [student.id] : [],
+        gradeConfigIds: student?.gradeConfigId ? [student.gradeConfigId] : [],
+        policies: policies.map((item) => ({ id: item.id, policyKey: item.policyKey, locale: item.locale })),
+        linkIds: links.map((item) => item.id),
+        consentIds: consents.map((item) => item.id),
+        planIds: [plan.id],
+        taskSeriesIds: plan.series.map((item) => item.id),
+        taskOccurrenceIds: occurrences.map((row) => row.id),
+        taskHorizonJobPlanIds: [plan.id],
+      },
     };
   }
 
