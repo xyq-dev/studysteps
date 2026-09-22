@@ -388,3 +388,145 @@ Prisma `onModuleInit` 连不上库发生在 `context.init()`，已能被现有 t
 | 业务码 | 仅 requeue 分支写 3／4；catch 不再读取任意 `error.exitCode` | `--status`=0，missing=3，非法 reason=2，READY 冲突=4 |
 
 未改 B6／B7、Web、Schema、迁移 1–12。无 Migration。
+
+## 14. 2026-09-22 B5–B7 定向收尾独立复审
+
+### 14.1 结论与现场
+
+**结论：仍不可通过。** B5 仍有关闭异常被吞后错误退出 0 的真实进程反例；B6 的单调预算子项已经修正，但“业务窗口使用锁后数据库时间”的要求在 B7 提前结束分支仍不成立；B7 可在锁后当前范围已从 5,001 降为 4,999 时仍错误提交 `FAILED/SCOPE_LIMIT`。因此不能给出“STP006 既定范围可通过，可进入 STP007 设计”，也不修改阶段完成状态。
+
+- 实际目录：`D:\Program Files\PycharmProjects\studysteps`。
+- 分支／HEAD／origin：`main@79d5e56ffcd1fce551f714203693f1bc58ae7ae7`，与 `origin/main` 一致；相对报告基线无漂移。
+- 重点增量为 `5c70932 → 4f9c0c9 → 79d5e56`；迁移、Schema、Web 与 B1–B4 代码没有进入该增量。B1–B4 沿用第 11 节已关闭结论，未因本轮无反例地重复展开。
+- 复审开始时工作区仅有既存 `docs/handoffs/STP004_PG_ISOLATION.md` PID 行改动；本节是本轮唯一仓库增量，既存改动未覆盖。
+- GitHub Actions [CI #19](https://github.com/xyq-dev/studysteps/actions/runs/35682234694) 对应当前 SHA，页面显示 `Success`，总时长 4m42s、`check` 4m37s。CI 绿灯只复用为根检查证据，不代替以下进程与数据库反例。
+
+### 14.2 B5–B7 结论矩阵
+
+| 项 | 结论 | 本轮依据 |
+| --- | --- | --- |
+| B5 CLI 完整异常出口 | **未关闭** | `abortOnError:false`、配置／Nest 初始化／命令执行统一 catch，以及 0／2／3／4 业务出口均已落地；现有真实 provider 夹具也得到 default=1、init=2、close=2。但 `cli-runtime.ts:31-36` 无条件吞掉 `worker.disconnect()` 的任何异常。真实 `HorizonWorkerModule`／`HorizonWorkerService` 进程中让实际 Prisma provider 第一次 disconnect 失败、Nest close 第二次成功，实际退出 **0**，契约要求技术异常 **2**。 |
+| B6 单调预算与业务时钟 | **未关闭** | `runOnce` 已全程使用 `performance.now()`；定向数据库用例实际只有 1 次 claim／1 个处理完成／2 个未启动，墙钟回拨没有突破预算。正常生成、租约和 `next_due_at` 也使用 DB clock。但是预锁超限分支以应用 `new Date()`／锁前时区决定是否进入终态，并在取得锁后 DB now 后不重验当前业务窗口；14.5 的真实等待反例使该子要求仍未满足。 |
+| B7 真实 worker 超限路径 | **未关闭** | 固定 5,002 行计划已能经公开根命令得到 `FAILED/SCOPE_LIMIT`、attempt=0、零 occurrence／adjustment 增量；旧 token 真实等待后未覆盖新租约，正常规模仍能 GENERATED。可是 `service.ts:152-155,282-314` 的提前失败路径只重验 token／generation／lease，不重验锁后当前时区与范围；本轮实际得到锁前 5,001、锁后 4,999，worker 仍写 `FAILED/SCOPE_LIMIT`。 |
+
+### 14.3 B5 反例：显式 disconnect 异常仍被静默吞掉
+
+`apps/api/src/horizon-worker/main.ts:56-101` 已把参数、配置、context 创建、命令和 finally 纳入统一外壳；`cli-runtime.ts:4-8` 也确实设置 `abortOnError:false`。当前构建产物的真实子进程结果为：
+
+```text
+--init-default = 1   # Nest 默认旧行为对照
+--init         = 2
+--close        = 2
+UnhandledPromiseRejection = false
+```
+
+定向测试还从根 `pnpm worker:horizon` 启动当前构建产物，验证正常 status=0、配置／参数错误=2、不存在=3、状态冲突=4。上述路径本身已关闭。
+
+剩余问题位于 `apps/api/src/horizon-worker/cli-runtime.ts:29-43`：
+
+```ts
+try {
+  await worker.disconnect();
+} catch {
+  // already closed
+}
+```
+
+本轮不是只检查 mock 返回值，而是创建真实 `HorizonWorkerModule` context、取得真实 `HorizonWorkerService` 和其 Prisma provider；仅让 provider 第一次 `$disconnect()` 抛带 `exitCode=97` 的技术异常，让 `app.close()` 触发的第二次 disconnect 成功。当前 helper 的实际进程结果：
+
+```text
+{"provider":"HorizonWorkerService","disconnectCalls":2,"exitCode":0}
+PROCESS_EXIT=0
+```
+
+预期是即使继续尝试 Nest close，也要保留技术失败退出 2；实际第一次关闭异常被吞，最终退出 0。现有 `--close` 夹具只覆盖 `OnModuleDestroy`／`app.close()` 抛错，不能覆盖这个正式入口先执行的分支。
+
+最小修复：在 `worker.disconnect()` catch 中调用统一的 `markTechnicalFailure(error)` 后继续 `app.close()`；或者删掉重复的显式 disconnect，只由 `app.close()`／`PrismaService.onModuleDestroy` 负责关闭。补真实进程断言，确保第一次 disconnect 失败、后续 close 成功时仍退出 2 且无未处理 rejection。
+
+### 14.4 B6：预算本体已关闭，但锁后业务窗口保障未贯穿
+
+`horizon-worker/service.ts:53-70` 以 `performance.now()` 建立和检查 deadline，每轮 claim 前重新检查；已开始的一批由 `:104-115` 安全收尾。定向数据库用例把 `Date.now()` 每次回拨 10 秒、concurrency／cycle 设为 1，实际断言并得到：
+
+```text
+claimReady calls = 1
+processed        = 1
+finished jobs    = 1
+untouched jobs   = 2
+```
+
+另一个当前 dist 的无数据库探针让在途处理超过 5ms 预算，结果 `claims=1, executions=1, processed=1`；这符合“已开始事务可以收尾，但不得再领取”的边界。租约 claim／renew／reaper／技术退避使用 PostgreSQL `clock_timestamp()`；正常执行在 `service.ts:161` 读取锁后 DB now，并将同一时间传给核心、`completeSuccess`、`completeBlocked`，repository 再据此计算 `next_due_at`。现有午夜证据仍只是注入边界值和真实传参链，不描述成一次真实跨午夜运行。
+
+但 `discoverBusinessLocks` 在 `service.ts:336` 的第一次调用仍采用 `now ?? new Date()`。当该锁前视图超过 5,000 时，`:152-155` 跳过 `:161-173` 的锁后重新发现，改走 `finishClaimedAsScopeLimit`；后者虽在 `:295` 读取 DB now，却只用它检查租约有效期，然后直接完成失败。14.5 已把这条分支实际跑成错误终态。因此 B6 的**单调预算子项关闭**，但整个 B6 要求仍因锁后业务窗口子项未关闭而判为未关闭。
+
+### 14.5 B7 反例：锁前 5,001 在锁后降为 4,999，仍提交 SCOPE_LIMIT
+
+先复测已声明的修复路径。全新十二迁移专用库上的当前源码／当前构建产物实际通过：
+
+```text
+5002-row public worker: exit=0, FAILED/SCOPE_LIMIT, attempt=0
+occurrences: 5002 -> 5002
+plan adjustments: 0 -> 0
+old worker: pg_blocking_pids real wait, zero overwrite of worker B lease
+worker B: FAILED/SCOPE_LIMIT, attempt=0
+normal public worker: exit=0, lastOutcome=GENERATED, occurrences > 0
+```
+
+这关闭了第 11 节“超限进入技术退避”的原反例，但没有覆盖超限判断与当前锁集变化的竞争。为验证该缺口，本轮在同一可丢弃库构造了满足现有 FK／CHECK／唯一键及每个拆分父 2–8 个子任务的父子形状：622 个 SPLIT 父、4,974 个各自独立 ONCE series 的一级子任务，加一组 key／实际日分离的根 series 行。两个相邻本地日的有界查询结果为：
+
+```text
+锁前旧时区 Pacific/Pago_Pago，本地日 2026-09-21：5001
+锁后新时区 Pacific/Kiritimati，本地日 2026-09-22：4999
+split child series：4974
+```
+
+独立 holder 先锁住 student 行并进行时区更新；公开 worker 在锁外读取旧时区得到 5,001，随后真实等待该 student 锁。观察连接通过 `pg_blocking_pids` 确认重叠。holder 提交后，worker 已能读取新时区和锁后 DB now，但当前实现没有重做范围发现，实际结果为：
+
+```json
+{
+  "lockWaitObserved": true,
+  "workerExit": 0,
+  "oldScopeCount": 5001,
+  "lockedScopeCount": 4999,
+  "final": {
+    "state": "FAILED",
+    "state_reason": "SCOPE_LIMIT",
+    "attempt_count": 0,
+    "requested_generation": "3",
+    "processed_generation": "0",
+    "lease_token": null
+  }
+}
+```
+
+动态探针用同一行级更新隔离了时区变化与等待本身；生产 BASIC 路径在 `students.service.ts:324-345` 更新时区后还会调用 `signalPlans`。`task-horizon-job.repository.ts:441-460` 对 LEASED job 只增加 `requested_generation`，不使当前 token／claimed generation 失效；`:296-329` 的 `completeFailed` 也不比较 requested generation，因此这一步不会消除反例，反而会把处理中到达的新 generation 一并留在 FAILED 终态。
+
+预期是在统一锁后，以当前时区和 DB now 重验；4,999 不应被这个提前分支判成 `SCOPE_LIMIT`。之后共享核心可能得到 NOOP、正常结果或既定日期冲突，但必须由当前锁后图决定，不能提交旧视图的终态。该反例没有依赖 HTTP `task-horizon` 的全量发现，也没有把后者扩成本轮性能改造。
+
+最小修复：提前发现超限后，短事务取得 student→plan→job 锁和 DB now，再以当前 student 时区执行同一个 `limit+1` 发现。只有锁后仍超限才做 token／generation CAS `completeFailed`；若已回到范围内，应通过既有完整锁集重试机制进入共享核心，不得提交旧视图，也不得把它改记为普通技术失败。旧 token 零行时还应避免无条件打印已完成 FAILED 的误导日志。
+
+### 14.6 本轮命令、证据边界与资源
+
+本轮新增实际执行：
+
+- 新建专用 `stp006_b5b7_audit_79d5e56`，实际应用 12 条 migration；没有读取／写入原库和历史污染库。
+- `pnpm --filter @studysteps/api exec vitest run --config vitest.config.ts src/stp006.horizon-worker.spec.ts -t <B5/B6/B7 四个定向名称> --reporter=verbose`：**4 passed／16 skipped／0 failed**。用例先执行 Nest build，公开命令使用当前源码对应产物。
+- 当前 `cli-failure.fixture.js` 三个独立进程、真实 Horizon provider 的 disconnect 失败进程探针，以及 B7 专用独立连接／公开 worker 锁等待探针。
+- B7 运行后物理查询确认固定 5,002 行计划为 `FAILED/SCOPE_LIMIT`、attempt=0、adjustment=0；B6 三个 job 为一条 `NOOP`、两条未处理；正常计划为 `GENERATED`。
+
+未重复执行完整 lint／typecheck／test／build／prisma validate 或完整 Playwright；复用当前 SHA 的 CI #19，以及此前仍有效的本地完整 14 passed Playwright 证据。没有把 CI、自测名称或 passed 总数冒充上述反例的进程／物理数据库结果。
+
+临时 B7 探针已删除，专用数据库在确认连接数为 0 后已 drop，drop 后 catalog 为 0；公开 worker 和 fixture 子进程均已退出。开始前已存在的 PostgreSQL 继续监听 `127.0.0.1:6260`（PID 10204），未停止；没有启动 API／Vite。`STP004_PG_ISOLATION.md` 的既有 PID 改动保持原样。本轮没有修改业务代码、Schema、迁移、测试断言、CURRENT_STATUS／TASKS 或完成状态，没有 commit／push／pack／部署。
+
+通知 worker／T11-D、B04、生产启用和 STP007 实现继续按既定范围延期，不是本轮新增阻塞。下一步只需修复上述 B5 与 B7 代码路径，并同时用 B7 的锁后反例复验 B6 业务时钟子项；不需要重新打开 B1–B4 或扩大为全项目审计。
+
+## 15. 2026-09-22 B5 disconnect／B7 锁后重验修复补记（不是独立复审）
+
+第 1–14 节原文未改写。本轮只修第 14 节仍打开的两个根因：`disconnect` 异常被吞，以及锁前超限未按锁后 DB now／当前时区重验。B1–B4 保持已关闭。B6 的 `performance.now()` 单调预算保持，不再改造计时。无 Migration。这不是独立复审通过，STP 006 仍进行中，不进入 STP 007。
+
+| 项 | 第 14 节反例 | 本轮修复与自测 |
+| --- | --- | --- |
+| B5 | 真实 `HorizonWorkerService` 第一次 `$disconnect()` 失败、Nest close 成功，进程退出 0 | `closeHorizonContext` 在 `worker.disconnect()` catch 调用既有 `markTechnicalFailure` 后继续 `app.close()`。夹具 `--disconnect` 使用真实 `HorizonWorkerModule`／Prisma provider：`disconnectCalls=2`，`exitCode=2`，无未处理 rejection。正常 0／3／4 未改。 |
+| B6 业务时钟 | 预锁超限分支不重验锁后窗口 | 预锁超限只选 student→plan→job 短锁种子。取得锁后读 DB now、当前时区与租约，再跑同一 `limit+1` 发现。5001→4999 的真实 student 锁等待后进入共享核心，不再写旧 `SCOPE_LIMIT`。单调预算用例仍 1 claim／1 processed／2 untouched。 |
+| B7 | 锁前 5001、锁后 4999 仍 `FAILED/SCOPE_LIMIT` | 锁后仍超限才 CAS `FAILED/SCOPE_LIMIT`。锁后回到范围内则 `IncompleteLockSetError`／`runWriteTx` 释放短事务、按锁序重取完整锁集，再重新发现／鉴权／执行核心。公开 5002 行计划仍 `FAILED/SCOPE_LIMIT`、attempt=0、零部分写入。迟到超限与迟到恢复正常路径均未覆盖新租约。 |
+
+本轮实际命令：定向 `stp006.horizon-worker.spec.ts` **22 passed**；`pnpm lint`／`typecheck`／`build` 均为 0。本次构建产物：`--status`=0、非法 lease=2、missing=3、非法 reason=2；`--disconnect` 夹具退出 2。未重跑完整根测试（交新 SHA CI）与 Playwright（复用此前 14 条）。目标库仍为隔离 `stp006_fresh`；原库只读；未覆盖 `runtime.env`；预存 PostgreSQL 未停。

@@ -149,169 +149,176 @@ export class HorizonWorkerService {
   }
 
   private async executeClaimed(job: ClaimedHorizonJob): Promise<void> {
-    const seed = await this.discoverBusinessLocks(job.planId);
-    if (!seed.ok) {
-      await this.finishClaimedAsScopeLimit(job);
-      this.logger.log({ planId: job.planId, result: 'FAILED', reason: 'SCOPE_LIMIT' });
-      return;
-    }
-    await runWriteTx(this.prisma, async (tx, extra) => {
-      const locked = mergeLockIds(seed.locks, extra);
-      await acquireLocks(tx, locked);
-      const now = await readLockedNow(tx);
-      const discovered = await this.discoverBusinessLocks(job.planId, tx, now);
-      if (!discovered.ok) {
-        await this.jobs.completeFailed(tx, {
-          planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          reason: 'SCOPE_LIMIT',
+    const preview = await this.discoverBusinessLocks(job.planId);
+    const seed = preview.ok ? preview.locks : await this.minimalJobLocks(job.planId);
+    await runWriteTx(
+      this.prisma,
+      async (tx, extra) => {
+        const locked = mergeLockIds(seed, extra);
+        await acquireLocks(tx, locked);
+        const now = await readLockedNow(tx);
+        if (!(await this.leaseStillHeld(tx, job, now))) {
+          return;
+        }
+        const discovered = await this.discoverBusinessLocks(job.planId, tx, now);
+        if (!discovered.ok) {
+          await this.completeScopeLimit(tx, job);
+          return;
+        }
+        assertLockSetComplete(locked, discovered.locks);
+
+        const execNow = await readLockedNow(tx);
+        if (!(await this.leaseStillHeld(tx, job, execNow))) {
+          return;
+        }
+        const execDiscovered = await this.discoverBusinessLocks(job.planId, tx, execNow);
+        if (!execDiscovered.ok) {
+          await this.completeScopeLimit(tx, job);
+          return;
+        }
+        assertLockSetComplete(locked, execDiscovered.locks);
+
+        const planRow = await tx.studyPlan.findUnique({ where: { id: job.planId } });
+        if (!planRow) {
+          throw new Error('horizon plan missing');
+        }
+        const student = await tx.studentProfile.findUniqueOrThrow({
+          where: { id: planRow.studentProfileId },
         });
-        this.logger.log({ planId: job.planId, result: 'FAILED', reason: 'SCOPE_LIMIT' });
-        return;
-      }
-      assertLockSetComplete(locked, discovered.locks);
-      const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
-      if (
-        !current ||
-        current.state !== 'LEASED' ||
-        current.leaseToken !== job.leaseToken ||
-        current.claimedGeneration == null ||
-        BigInt(current.claimedGeneration) !== BigInt(job.claimedGeneration) ||
-        !current.leaseExpiresAt ||
-        current.leaseExpiresAt <= now
-      ) {
-        throw new Error('horizon lease no longer held');
-      }
-      const planRow = await tx.studyPlan.findUnique({ where: { id: job.planId } });
-      if (!planRow) {
-        throw new Error('horizon plan missing');
-      }
-      const student = await tx.studentProfile.findUniqueOrThrow({ where: { id: planRow.studentProfileId } });
-      const loaded = await this.core.loadPlanGraph(tx, planRow.id, now, student.timezone);
-      if (loaded.failed) {
-        await this.jobs.completeFailed(tx, {
-          planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          reason: loaded.failed.reason,
+        const loaded = await this.core.loadPlanGraph(tx, planRow.id, execNow, student.timezone);
+        if (loaded.failed) {
+          await this.jobs.completeFailed(tx, {
+            planId: job.planId,
+            leaseToken: job.leaseToken,
+            claimedGeneration: job.claimedGeneration,
+            reason: loaded.failed.reason,
+          });
+          this.logger.log({ planId: job.planId, result: 'FAILED', reason: loaded.failed.reason });
+          return;
+        }
+        const plan = loaded.plan;
+        const eligibility = await this.eligibility.evaluateGenerationEligibility(tx, student, plan);
+        if (!eligibility.ok && eligibility.kind === 'RETIRED') {
+          await this.jobs.completeRetired(tx, {
+            planId: job.planId,
+            leaseToken: job.leaseToken,
+            claimedGeneration: job.claimedGeneration,
+            reason: eligibility.reason,
+          });
+          this.logger.log({ planId: job.planId, result: 'RETIRED', reason: eligibility.reason });
+          return;
+        }
+        if (!eligibility.ok) {
+          await this.jobs.completeBlocked(tx, {
+            planId: job.planId,
+            leaseToken: job.leaseToken,
+            claimedGeneration: job.claimedGeneration,
+            timezone: student.timezone,
+            now: execNow,
+            reason: eligibility.reason,
+          });
+          this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: eligibility.reason });
+          return;
+        }
+        const result = await this.core.reconcilePlanLocked(tx, {
+          student: {
+            id: student.id,
+            timezone: student.timezone,
+            stageCode: student.stageCode!,
+            schoolSystemCode: student.schoolSystemCode!,
+            gradeCode: student.gradeCode!,
+            gradeLabel: student.gradeLabel!,
+            termCode: student.termCode!,
+            gradeConfigId: student.gradeConfigId!,
+            gradeConfigVersionId: student.gradeConfigVersionId!,
+          },
+          plan,
+          now: execNow,
         });
-        this.logger.log({ planId: job.planId, result: 'FAILED', reason: loaded.failed.reason });
-        return;
-      }
-      const plan = loaded.plan;
-      const eligibility = await this.eligibility.evaluateGenerationEligibility(tx, student, plan);
-      if (!eligibility.ok && eligibility.kind === 'RETIRED') {
-        await this.jobs.completeRetired(tx, {
-          planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          reason: eligibility.reason,
-        });
-        this.logger.log({ planId: job.planId, result: 'RETIRED', reason: eligibility.reason });
-        return;
-      }
-      if (!eligibility.ok) {
-        await this.jobs.completeBlocked(tx, {
+        if (result.failed) {
+          await this.jobs.completeFailed(tx, {
+            planId: job.planId,
+            leaseToken: job.leaseToken,
+            claimedGeneration: job.claimedGeneration,
+            reason: result.failed.reason,
+          });
+          this.logger.log({ planId: job.planId, result: 'FAILED', reason: result.failed.reason });
+          return;
+        }
+        if (result.blocked) {
+          await this.jobs.completeBlocked(tx, {
+            planId: job.planId,
+            leaseToken: job.leaseToken,
+            claimedGeneration: job.claimedGeneration,
+            timezone: student.timezone,
+            now: execNow,
+            reason: result.blocked.reason,
+          });
+          this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: result.blocked.reason });
+          return;
+        }
+        await this.jobs.completeSuccess(tx, {
           planId: job.planId,
           leaseToken: job.leaseToken,
           claimedGeneration: job.claimedGeneration,
           timezone: student.timezone,
-          now,
-          reason: eligibility.reason,
+          now: execNow,
+          successLocalDate: localDateInTimeZone(execNow, student.timezone),
+          insertedCount: result.insertedCount,
+          restoredCount: result.restoredCount,
         });
-        this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: eligibility.reason });
-        return;
-      }
-      const result = await this.core.reconcilePlanLocked(tx, {
-        student: {
-          id: student.id,
-          timezone: student.timezone,
-          stageCode: student.stageCode!,
-          schoolSystemCode: student.schoolSystemCode!,
-          gradeCode: student.gradeCode!,
-          gradeLabel: student.gradeLabel!,
-          termCode: student.termCode!,
-          gradeConfigId: student.gradeConfigId!,
-          gradeConfigVersionId: student.gradeConfigVersionId!,
-        },
-        plan,
-        now,
-      });
-      if (result.failed) {
-        await this.jobs.completeFailed(tx, {
+        this.logger.log({
           planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          reason: result.failed.reason,
+          result: result.insertedCount > 0 ? 'GENERATED' : result.restoredCount > 0 ? 'RESTORED' : 'NOOP',
+          insertedCount: result.insertedCount,
+          restoredCount: result.restoredCount,
         });
-        this.logger.log({ planId: job.planId, result: 'FAILED', reason: result.failed.reason });
-        return;
-      }
-      if (result.blocked) {
-        await this.jobs.completeBlocked(tx, {
-          planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          timezone: student.timezone,
-          now,
-          reason: result.blocked.reason,
-        });
-        this.logger.log({ planId: job.planId, result: 'BLOCKED', reason: result.blocked.reason });
-        return;
-      }
-      await this.jobs.completeSuccess(tx, {
+      },
+      seed,
+    );
+  }
+
+  private async minimalJobLocks(planId: string): Promise<LockIds> {
+    const plan = await this.prisma.studyPlan.findUnique({
+      where: { id: planId },
+      select: { studentProfileId: true },
+    });
+    return {
+      studentIds: plan ? [plan.studentProfileId] : [],
+      planIds: [planId],
+      taskHorizonJobPlanIds: [planId],
+    };
+  }
+
+  private async leaseStillHeld(
+    tx: Parameters<TaskHorizonJobRepository['planIdsForStudent']>[0],
+    job: ClaimedHorizonJob,
+    now: Date,
+  ): Promise<boolean> {
+    const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
+    return Boolean(
+      current &&
+        current.state === 'LEASED' &&
+        current.leaseToken === job.leaseToken &&
+        current.claimedGeneration != null &&
+        BigInt(current.claimedGeneration) === BigInt(job.claimedGeneration) &&
+        current.leaseExpiresAt &&
+        current.leaseExpiresAt > now,
+    );
+  }
+
+  private async completeScopeLimit(
+    tx: Parameters<TaskHorizonJobRepository['planIdsForStudent']>[0],
+    job: ClaimedHorizonJob,
+  ): Promise<void> {
+    try {
+      await this.jobs.completeFailed(tx, {
         planId: job.planId,
         leaseToken: job.leaseToken,
         claimedGeneration: job.claimedGeneration,
-        timezone: student.timezone,
-        now,
-        successLocalDate: localDateInTimeZone(now, student.timezone),
-        insertedCount: result.insertedCount,
-        restoredCount: result.restoredCount,
+        reason: 'SCOPE_LIMIT',
       });
-      this.logger.log({
-        planId: job.planId,
-        result: result.insertedCount > 0 ? 'GENERATED' : result.restoredCount > 0 ? 'RESTORED' : 'NOOP',
-        insertedCount: result.insertedCount,
-        restoredCount: result.restoredCount,
-      });
-    }, seed.locks);
-  }
-
-  private async finishClaimedAsScopeLimit(job: ClaimedHorizonJob): Promise<void> {
-    const plan = await this.prisma.studyPlan.findUnique({
-      where: { id: job.planId },
-      select: { studentProfileId: true },
-    });
-    const seed: LockIds = {
-      studentIds: plan ? [plan.studentProfileId] : [],
-      planIds: [job.planId],
-      taskHorizonJobPlanIds: [job.planId],
-    };
-    try {
-      await runWriteTx(this.prisma, async (tx) => {
-        await acquireLocks(tx, seed);
-        const now = await readLockedNow(tx);
-        const current = await tx.taskHorizonJob.findUnique({ where: { planId: job.planId } });
-        if (
-          !current ||
-          current.state !== 'LEASED' ||
-          current.leaseToken !== job.leaseToken ||
-          current.claimedGeneration == null ||
-          BigInt(current.claimedGeneration) !== BigInt(job.claimedGeneration) ||
-          !current.leaseExpiresAt ||
-          current.leaseExpiresAt <= now
-        ) {
-          return;
-        }
-        await this.jobs.completeFailed(tx, {
-          planId: job.planId,
-          leaseToken: job.leaseToken,
-          claimedGeneration: job.claimedGeneration,
-          reason: 'SCOPE_LIMIT',
-        });
-      }, seed);
+      this.logger.log({ planId: job.planId, result: 'FAILED', reason: 'SCOPE_LIMIT' });
     } catch (error) {
       if (error instanceof Error && /token CAS failed/.test(error.message)) {
         return;

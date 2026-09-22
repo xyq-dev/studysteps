@@ -245,18 +245,22 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
       },
       windowsHide: true,
     });
+    let stdout = '';
     let stderr = '';
+    child.stdout?.on('data', (chunk) => {
+      stdout += String(chunk);
+    });
     child.stderr?.on('data', (chunk) => {
       stderr += String(chunk);
     });
-    return new Promise<{ code: number; stderr: string }>((resolve, reject) => {
+    return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
       const timer = setTimeout(() => {
         child.kill();
         reject(new Error(`process exceeded ${timeoutMs}ms for ${script} ${args.join(' ')}`));
       }, timeoutMs);
       child.on('exit', (code) => {
         clearTimeout(timer);
-        resolve({ code: code ?? 1, stderr });
+        resolve({ code: code ?? 1, stdout, stderr });
       });
       child.on('error', (error) => {
         clearTimeout(timer);
@@ -396,6 +400,150 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
              1, 1, 1, clock_timestamp(), clock_timestamp()
         FROM generate_series(0, 5000) AS g
     `;
+    return over.id;
+  }
+
+  async function countHorizonScope(planId: string, timezone: string, now: Date) {
+    const today = localDateInTimeZone(now, timezone);
+    const to = addLocalDays(today, 13);
+    return prisma.taskOccurrence.count({
+      where: {
+        series: { planId },
+        OR: [
+          { occurrenceKey: { gte: today, lte: to } },
+          { scheduledLocalDate: { gte: today, lte: to } },
+          { sourceOccurrenceId: { not: null } },
+        ],
+      },
+    });
+  }
+
+  async function plantShrinkableOversizedPlan(studentId: string, pagoToday: string) {
+    const template = await prisma.taskOccurrence.findFirstOrThrow({
+      where: { series: { plan: { studentProfileId: studentId } } },
+    });
+    const over = await prisma.studyPlan.create({
+      data: {
+        studentProfileId: studentId,
+        status: 'ACTIVE',
+        origin: 'STUDENT',
+        importedContentJson: '[]',
+        timezoneSnapshot: 'Pacific/Pago_Pago',
+      },
+    });
+    const overSeries = await prisma.taskSeries.create({
+      data: {
+        planId: over.id,
+        name: template.nameSnapshot,
+        subject: template.subjectSnapshot,
+        completionStandard: template.completionStandardSnapshot,
+        durationMinutes: template.durationMinutesSnapshot,
+        stepsJson: template.stepsSnapshotJson,
+        repeatKind: 'ONCE',
+        startLocalDate: '2000-01-01',
+        endLocalDate: '2000-01-01',
+        effectiveFromLocalDate: '2000-01-01',
+        effectiveToLocalDate: '2000-01-01',
+        ongoing: false,
+      },
+    });
+    const parent = await prisma.taskOccurrence.create({
+      data: {
+        seriesId: overSeries.id,
+        occurrenceKey: '2000-01-01',
+        originalLocalDate: '2000-01-01',
+        scheduledLocalDate: '2000-01-01',
+        timezoneSnapshot: template.timezoneSnapshot,
+        status: 'CANCELLED',
+        cancelReason: 'SPLIT',
+        nameSnapshot: template.nameSnapshot,
+        subjectSnapshot: template.subjectSnapshot,
+        completionStandardSnapshot: template.completionStandardSnapshot,
+        durationMinutesSnapshot: template.durationMinutesSnapshot,
+        stepsSnapshotJson: template.stepsSnapshotJson,
+        gradeConfigId: template.gradeConfigId,
+        gradeConfigVersionId: template.gradeConfigVersionId,
+        stageCodeSnapshot: template.stageCodeSnapshot,
+        schoolSystemCodeSnapshot: template.schoolSystemCodeSnapshot,
+        gradeCodeSnapshot: template.gradeCodeSnapshot,
+        gradeLabelSnapshot: template.gradeLabelSnapshot,
+        termCodeSnapshot: template.termCodeSnapshot,
+        catalogEntryKeySnapshot: template.catalogEntryKeySnapshot,
+      },
+    });
+    await prisma.$executeRaw`
+      INSERT INTO task_occurrences (
+        id, series_id, occurrence_key, original_local_date, scheduled_local_date, timezone_snapshot,
+        status, name_snapshot, subject_snapshot, completion_standard_snapshot, duration_minutes_snapshot,
+        steps_snapshot_json, grade_config_id, grade_config_version_id, stage_code_snapshot,
+        school_system_code_snapshot, grade_code_snapshot, grade_label_snapshot, term_code_snapshot,
+        catalog_entry_key_snapshot, source_occurrence_id, version, content_revision_no, schedule_revision_no,
+        created_at, updated_at
+      )
+      SELECT gen_random_uuid(), ${overSeries.id}::uuid,
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             to_char(DATE '2000-01-02' + g::int, 'YYYY-MM-DD'),
+             ${template.timezoneSnapshot},
+             'PLANNED',
+             ${template.nameSnapshot},
+             ${template.subjectSnapshot},
+             ${template.completionStandardSnapshot},
+             ${template.durationMinutesSnapshot},
+             ${template.stepsSnapshotJson},
+             ${template.gradeConfigId}::uuid,
+             ${template.gradeConfigVersionId}::uuid,
+             ${template.stageCodeSnapshot},
+             ${template.schoolSystemCodeSnapshot},
+             ${template.gradeCodeSnapshot},
+             ${template.gradeLabelSnapshot},
+             ${template.termCodeSnapshot},
+             ${template.catalogEntryKeySnapshot},
+             ${parent.id}::uuid,
+             1, 1, 1, clock_timestamp(), clock_timestamp()
+        FROM generate_series(0, 4998) AS g
+    `;
+    for (let index = 0; index < 2; index += 1) {
+      const extraSeries = await prisma.taskSeries.create({
+        data: {
+          planId: over.id,
+          name: `${template.nameSnapshot}-pago-${index}`,
+          subject: template.subjectSnapshot,
+          completionStandard: template.completionStandardSnapshot,
+          durationMinutes: template.durationMinutesSnapshot,
+          stepsJson: template.stepsSnapshotJson,
+          repeatKind: 'ONCE',
+          startLocalDate: pagoToday,
+          endLocalDate: pagoToday,
+          effectiveFromLocalDate: pagoToday,
+          effectiveToLocalDate: pagoToday,
+          ongoing: false,
+        },
+      });
+      await prisma.taskOccurrence.create({
+        data: {
+          seriesId: extraSeries.id,
+          occurrenceKey: pagoToday,
+          originalLocalDate: pagoToday,
+          scheduledLocalDate: pagoToday,
+          timezoneSnapshot: 'Pacific/Pago_Pago',
+          status: 'PLANNED',
+          nameSnapshot: template.nameSnapshot,
+          subjectSnapshot: template.subjectSnapshot,
+          completionStandardSnapshot: template.completionStandardSnapshot,
+          durationMinutesSnapshot: template.durationMinutesSnapshot,
+          stepsSnapshotJson: template.stepsSnapshotJson,
+          gradeConfigId: template.gradeConfigId,
+          gradeConfigVersionId: template.gradeConfigVersionId,
+          stageCodeSnapshot: template.stageCodeSnapshot,
+          schoolSystemCodeSnapshot: template.schoolSystemCodeSnapshot,
+          gradeCodeSnapshot: template.gradeCodeSnapshot,
+          gradeLabelSnapshot: template.gradeLabelSnapshot,
+          termCodeSnapshot: template.termCodeSnapshot,
+          catalogEntryKeySnapshot: template.catalogEntryKeySnapshot,
+        },
+      });
+    }
     return over.id;
   }
 
@@ -1275,6 +1423,13 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
     expect(closed.code).toBe(2);
     expect(closed.stderr).toMatch(/horizon fixture close failed/);
     expect(closed.stderr).not.toMatch(/UnhandledPromiseRejection|UNHANDLED_REJECTION/i);
+    const disconnect = await spawnNodeProcess(fixture, ['--disconnect']);
+    expect(disconnect.code).toBe(2);
+    expect(disconnect.stderr).toMatch(/horizon fixture first disconnect failed/);
+    expect(disconnect.stderr).not.toMatch(/UnhandledPromiseRejection|UNHANDLED_REJECTION/i);
+    expect(disconnect.stdout).toMatch(/"provider":"HorizonWorkerService"/);
+    expect(disconnect.stdout).toMatch(/"disconnectCalls":2/);
+    expect(disconnect.stdout).toMatch(/"exitCode":2/);
   }, 60_000);
 
   it('does not claim more jobs after the monotonic budget even if the wall clock rewinds', async () => {
@@ -1341,6 +1496,156 @@ describe.skipIf(shouldSkipStp004Isolation())('STP 006-D horizon standing-job wor
       }
     }
   });
+
+  it('rechecks overflow after a real student lock wait and does not keep a stale SCOPE_LIMIT', async () => {
+    const ready = await readyStudent('锁后回落');
+    await prisma.studentProfile.update({
+      where: { id: ready.student.id },
+      data: { timezone: 'Pacific/Pago_Pago', version: { increment: 1 } },
+    });
+    const nowRows = await prisma.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    const now = nowRows[0]!.now;
+    const pagoToday = localDateInTimeZone(now, 'Pacific/Pago_Pago');
+    const kiriToday = localDateInTimeZone(now, 'Pacific/Kiritimati');
+    expect(pagoToday).not.toBe(kiriToday);
+    const planId = await plantShrinkableOversizedPlan(ready.student.id, pagoToday);
+    const oldScope = await countHorizonScope(planId, 'Pacific/Pago_Pago', now);
+    expect(oldScope).toBe(5001);
+    await parkOtherReadyJobs([planId]);
+    await wakeJob(planId);
+    const holder = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    const observer = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    await holder.connect();
+    await observer.connect();
+    const ctx = await Test.createTestingModule({ imports: [HorizonWorkerModule] }).compile();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM student_profiles WHERE id = $1 FOR UPDATE', [ready.student.id]);
+      await holder.query(
+        `UPDATE student_profiles
+            SET timezone = 'Pacific/Kiritimati',
+                version = version + 1,
+                updated_at = clock_timestamp()
+          WHERE id = $1`,
+        [ready.student.id],
+      );
+      const holderId = await backendPid(holder);
+      const worker = ctx.get(HorizonWorkerService);
+      const workerPromise = worker.runOnce(5, 60_000);
+      const overlap = await waitForWaiterOnHolder(
+        observer,
+        holderId,
+        'overflow preview waits on student',
+        20_000,
+      );
+      expect(overlap.holder_pid ?? holderId).toBe(holderId);
+      await holder.query('COMMIT');
+      await workerPromise;
+      const lockedNowRows = await prisma.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+      const lockedScope = await countHorizonScope(planId, 'Pacific/Kiritimati', lockedNowRows[0]!.now);
+      expect(lockedScope).toBe(4999);
+      expect(lockedScope).toBeLessThan(oldScope);
+      const student = await prisma.studentProfile.findUniqueOrThrow({ where: { id: ready.student.id } });
+      expect(student.timezone).toBe('Pacific/Kiritimati');
+      const job = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId } });
+      expect(job.stateReason).not.toBe('SCOPE_LIMIT');
+      expect(job.lastErrorCode).not.toBe('SCOPE_LIMIT');
+      expect(['GENERATED', 'RESTORED', 'NOOP', 'BLOCKED']).toContain(job.lastOutcome);
+      expect(job.attemptCount).toBe(0);
+    } finally {
+      await ctx.close();
+      await holder.end();
+      await observer.end();
+    }
+  }, 180_000);
+
+  it('does not let a late recovered-normal claim overwrite a taken lease', async () => {
+    const ready = await readyStudent('迟到恢复');
+    await prisma.studentProfile.update({
+      where: { id: ready.student.id },
+      data: { timezone: 'Pacific/Pago_Pago', version: { increment: 1 } },
+    });
+    const nowRows = await prisma.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    const now = nowRows[0]!.now;
+    const pagoToday = localDateInTimeZone(now, 'Pacific/Pago_Pago');
+    const planId = await plantShrinkableOversizedPlan(ready.student.id, pagoToday);
+    const tokenA = '77777777-7777-7777-7777-777777777777';
+    await prisma.taskHorizonJob.update({
+      where: { planId },
+      data: {
+        state: 'LEASED',
+        availableAt: null,
+        requestedGeneration: 2,
+        processedGeneration: 0,
+        claimedGeneration: 1,
+        attemptCount: 0,
+        leaseToken: tokenA,
+        leaseOwner: 'worker-a',
+        leaseStartedAt: new Date(Date.now() - 400_000),
+        leaseExpiresAt: new Date(Date.now() - 1000),
+        lastExecutorKey: 'HORIZON_WORKER_V1',
+      },
+    });
+    const jobs = new TaskHorizonJobRepository(prisma as never);
+    await jobs.reapExpired(20);
+    await prisma.taskHorizonJob.update({
+      where: { planId },
+      data: { availableAt: new Date(0) },
+    });
+    const claimed = (await jobs.claimReady(20, 60_000, 'worker-b')).filter((row) => row.planId === planId);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.leaseToken).not.toBe(tokenA);
+    const holder = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    const observer = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+    await holder.connect();
+    await observer.connect();
+    const ctx = await Test.createTestingModule({ imports: [HorizonWorkerModule] }).compile();
+    const worker = ctx.get(HorizonWorkerService);
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM student_profiles WHERE id = $1 FOR UPDATE', [ready.student.id]);
+      await holder.query(
+        `UPDATE student_profiles
+            SET timezone = 'Pacific/Kiritimati',
+                version = version + 1,
+                updated_at = clock_timestamp()
+          WHERE id = $1`,
+        [ready.student.id],
+      );
+      const holderId = await backendPid(holder);
+      const late = (worker as unknown as WorkerInternals).executeClaimed({
+        planId,
+        leaseToken: tokenA,
+        claimedGeneration: 1n,
+        requestedGeneration: 2n,
+        processedGeneration: 0n,
+        leaseExpiresAt: new Date(Date.now() - 1000),
+      });
+      const overlap = await waitForWaiterOnHolder(
+        observer,
+        holderId,
+        'late recovered-normal waits on student',
+        20_000,
+      );
+      expect(overlap.holder_pid ?? holderId).toBe(holderId);
+      await holder.query('COMMIT');
+      await late;
+      const after = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId } });
+      expect(after.leaseToken).toBe(claimed[0]!.leaseToken);
+      expect(after.state).toBe('LEASED');
+      expect(after.attemptCount).toBe(0);
+      expect(after.stateReason).not.toBe('SCOPE_LIMIT');
+      await (worker as unknown as WorkerInternals).executeClaimed(claimed[0]!);
+      const done = await prisma.taskHorizonJob.findUniqueOrThrow({ where: { planId } });
+      expect(done.leaseToken).not.toBe(tokenA);
+      expect(done.stateReason).not.toBe('SCOPE_LIMIT');
+      expect(['GENERATED', 'RESTORED', 'NOOP', 'BLOCKED']).toContain(done.lastOutcome);
+    } finally {
+      await ctx.close();
+      await holder.end();
+      await observer.end();
+    }
+  }, 180_000);
 
   it('fails oversized plans as SCOPE_LIMIT through the public worker and keeps a later lease', async () => {
     const ready = await readyStudent('公开超限');

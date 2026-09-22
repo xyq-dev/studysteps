@@ -565,3 +565,34 @@ pnpm worker:horizon -- --requeue-failed=<planId> --reason=OPERATOR_RETRY_AFTER_D
 
 未执行：完整根 `pnpm test`（交本 SHA CI）、Playwright（复用原 14 条）、独立复审、STP 007。
 
+## 22. 2026-09-22 B5 disconnect／B7 锁后重验
+
+授权：用户持续授权本批普通 commit／push。只修第 14 节两个剩余根因。无 Migration。不进入 STP 007。这不是独立复审通过。
+
+| 项 | 结果 |
+| --- | --- |
+| 实施前 HEAD | `79d5e56ffcd1fce551f714203693f1bc58ae7ae7` |
+| 修改 | `cli-runtime.ts` disconnect catch；`horizon-worker/service.ts` 统一锁后重验；`--disconnect` 真实 worker 夹具；worker／并发测试；本报告与复审补记 |
+| 未改 | Schema、迁移 1–12、Web、test-v2、业务规则、`STP004_PG_ISOLATION.md` PID |
+| B5 | 真实 `HorizonWorkerService` 首次 disconnect 失败、Nest close 成功 → 退出 **2** |
+| B7 锁前 5001→锁后 4999 | 独立连接持 student 锁 + `pg_blocking_pids`；时区 Pago_Pago→Kiritimati 后进入共享核心，不写旧 `SCOPE_LIMIT` |
+| B7 仍超限 | 公开 bounded worker：5002 行仍 `FAILED/SCOPE_LIMIT`，attempt=0，零部分业务写 |
+| 旧租约 | 迟到超限与迟到恢复正常路径均未覆盖新 token |
+| B2／B3／B6 | 同文件定向回归继续通过 |
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `pnpm lint` | 0 | 通过 |
+| `pnpm typecheck` | 0 | 通过 |
+| `pnpm --filter @studysteps/api exec vitest run --config vitest.config.ts src/stp006.horizon-worker.spec.ts` | 0 | **22 passed** |
+| `pnpm build` | 0 | 公开命令使用本次产物 |
+| 公开 `--status` | 0 | 正常 |
+| 公开 `--status` + `HORIZON_WORKER_LEASE_MS=1` | 2 | 配置错误 |
+| 公开 missing requeue | 3 | 保持 |
+| 公开非法 reason | 2 | 保持 |
+| 夹具 `--disconnect` | 2 | `HorizonWorkerService`，`disconnectCalls=2` |
+| Playwright | 未执行 | 复用此前 14 条 |
+| 完整根 `pnpm test`／`prisma:validate` | 交给本 SHA CI | 本地未整包重跑 |
+
+未执行：独立复审、完整根测试、Playwright、生产迁移、pack／部署、STP 007。STP 006 仍进行中。
+

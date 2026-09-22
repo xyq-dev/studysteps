@@ -35,11 +35,16 @@ const OVERLAP_SQL = `
    WHERE blocker.pid = $1
 `;
 
-export async function waitForWaiterOnHolder(observer: pg.Client, holderPid: number, label: string) {
+export async function waitForWaiterOnHolder(
+  observer: pg.Client,
+  holderPid: number,
+  label: string,
+  timeoutMs = 8000,
+) {
   return waitUntil(async () => {
     const result = await observer.query(OVERLAP_SQL, [holderPid]);
     return result.rows[0] ?? null;
-  }, label);
+  }, label, timeoutMs);
 }
 
 export async function waitForAdvisoryWaiter(observer: pg.Client, holderPid: number, label: string) {

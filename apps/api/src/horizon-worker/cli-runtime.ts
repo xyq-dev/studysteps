@@ -31,8 +31,8 @@ export async function closeHorizonContext(
   if (worker) {
     try {
       await worker.disconnect();
-    } catch {
-      // already closed
+    } catch (error) {
+      markTechnicalFailure(error);
     }
   }
   if (!app) {
